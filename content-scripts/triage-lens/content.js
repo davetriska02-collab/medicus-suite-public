@@ -1,0 +1,7370 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+/* Triage Lens - content script
+ * v0.1.0
+ * Runs entirely client-side. Scrapes the existing Care Record DOM,
+ * computes triage-relevant signals, and renders an overlay HUD.
+ * No network calls. No persistence beyond chrome.storage (not used in v0.1).
+ */
+(() => {
+  'use strict';
+
+  const VERSION = '0.6.0';
+  // Debug logging is off by default; flip it on at runtime from the page console
+  // with: localStorage.setItem('ch-debug','1') then reload. (Content script and
+  // page share localStorage on the same origin.) Lets us trace the queue
+  // result-triage pipeline live without shipping a special build.
+  const DEBUG = (() => {
+    try { return typeof localStorage !== 'undefined' && localStorage.getItem('ch-debug') === '1'; }
+    catch (e) { return false; }
+  })();
+  // Each distinct line is logged ONCE per page, and a page is capped at LOG_PAGE_CAP lines (Clinician A, 2026-10-04): the
+  // queue observer re-fires constantly, and the same few lines used to repeat until the console held 320k characters.
+  // A line whose content changes is new text and prints; navigating to another page starts a fresh set and budget.
+  const LOG_PAGE_CAP = 400;
+  const logSeen = new Set();
+  let logPage = null;
+  let logCount = 0;
+  const logText = (a) => {
+    try {
+      return a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ').slice(0, 2000);
+    } catch (e) {
+      return a.map(String).join(' ').slice(0, 2000);
+    }
+  };
+  const log = (...a) => {
+    if (!DEBUG) return;
+    const page = location.pathname; // not the query string: Medicus rewrites it mid-task, which used to reset the set and repeat lines
+    if (page !== logPage) {
+      logPage = page;
+      logSeen.clear();
+      logCount = 0;
+    }
+    if (logCount > LOG_PAGE_CAP) return;
+    const line = logText(a);
+    if (logSeen.has(line)) return;
+    logSeen.add(line);
+    if (++logCount > LOG_PAGE_CAP) {
+      console.log('[ClinHUD] debug log capped at ' + LOG_PAGE_CAP + ' distinct lines for this page — reload to reset');
+      return;
+    }
+    console.log('[ClinHUD]', ...a);
+  };
+
+  // Inlined hud.css — substituted at build time so PiP can style its detached
+  // window without depending on chrome.runtime.getURL (content_scripts CSS does
+  // NOT appear in document.styleSheets, so we can't copy it back out).
+  const EMBEDDED_CSS = `/* Triage Lens styles
+   Two scopes:
+   1. #medicus-clinical-hud — the floating panel (record + detail pages)
+   2. .ch-queue-chips — chips injected into Medicus DOM (queue page)
+*/
+
+/* ---- Universal chip — usable inside HUD and inline in Medicus DOM ---- */
+.ch-chip {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  white-space: nowrap;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ch-chip-red    { background: #fbe6e7; color: #b8262e; border-color: rgba(184,38,46,0.25); }
+.ch-chip-amber  { background: #fdf3e1; color: #b45309; border-color: rgba(184,119,26,0.25); }
+.ch-chip-green  { background: #e8f4ec; color: #2f8a4a; border-color: rgba(47,138,74,0.25); }
+.ch-chip-info   { background: #e7eef7; color: #2a4d7a; border-color: rgba(42,77,122,0.20); }
+/* Meta/process chips (under-prioritised, unmatched): outline, not filled — */
+/* keeps clinical fills reserved for actual result severity. */
+.ch-q-result .ch-chip-meta { background: transparent; }
+
+/* Clinical result chips (filled, not meta): small leading triangle marker so   */
+/* filled+glyph vs outline+no-glyph is distinguishable beyond colour alone.     */
+.ch-q-result .ch-chip:not(.ch-chip-meta):not(.ch-chip-info)::before {
+  content: "▲ ";
+  font-size: 9px;
+  font-style: normal;
+}
+
+/* ---- Queue triage status bar (item 1.2, TRIAGE-LENS-2026-07-02.md) ---- */
+/* Replaces the old passive legend. This copy is effectively inert (the PiP    */
+/* window only ever renders the HUD panel, never the queue grid), kept only    */
+/* for parity with hud.css so nothing here ever renders as unstyled text if    */
+/* that ever changes. */
+.ch-q-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 4px 6px 4px 8px;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.3;
+  max-width: 420px;
+  position: fixed;
+  top: 56px;
+  right: 16px;
+  z-index: 99990;
+}
+.ch-q-status-btn {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.09);
+  border: 1px solid rgba(37, 99, 235, 0.3);
+}
+.ch-q-status-flash {
+  animation: ch-q-status-flash-pulse 1.3s ease-in-out 2;
+}
+@keyframes ch-q-status-flash-pulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.3); }
+}
+.ch-q-focus-alerts .ag-row:not(.ch-row-sev-red):not(.ch-row-sev-amber):not(.ch-row-pulse-red):not(.ch-row-pulse-amber) {
+  opacity: 0.35;
+}
+
+/* ---- Queue row chips ---- */
+.ch-queue-chips,
+.ch-q-result {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.ch-queue-chips .ch-chip,
+.ch-q-result .ch-chip {
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: 9px;
+}
+
+/* ---- HUD panel ---- */
+#medicus-clinical-hud {
+  position: fixed;
+  top: 88px;
+  right: 16px;
+  width: 340px;
+  max-height: calc(100vh - 110px);
+  z-index: 99999;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #1c2733;
+  background: #ffffff;
+  border: 1px solid #cdd6e0;
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(20, 30, 50, 0.18);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+#medicus-clinical-hud * { box-sizing: border-box; }
+
+#medicus-clinical-hud .ch-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 12px;
+  background: #1f3a5f; color: #fff;
+  border-bottom: 1px solid #15294a;
+}
+#medicus-clinical-hud .ch-title { font-weight: 600; font-size: 12px; letter-spacing: 0.02em; }
+#medicus-clinical-hud .ch-ver { font-weight: 400; opacity: 0.7; font-size: 10px; margin-left: 4px; }
+#medicus-clinical-hud .ch-actions { display: flex; gap: 4px; }
+#medicus-clinical-hud .ch-btn {
+  background: transparent; color: #fff; border: 1px solid rgba(255,255,255,0.25);
+  width: 22px; height: 22px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  padding: 0; display: inline-flex; align-items: center; justify-content: center;
+}
+#medicus-clinical-hud .ch-btn:hover { background: rgba(255,255,255,0.12); }
+
+#medicus-clinical-hud .ch-body { padding: 10px; overflow-y: auto; }
+#medicus-clinical-hud.ch-min .ch-body { display: none; }
+
+#medicus-clinical-hud .ch-patient {
+  display: block; width: 100%; box-sizing: border-box;
+  background: #eef2f7; color: #1f3a5f;
+  border: 1px solid #cdd6e0; border-radius: 4px;
+  padding: 4px 8px; margin-bottom: 8px;
+  font-size: 11px; font-weight: 600; text-align: left; cursor: pointer;
+  font-family: inherit;
+}
+#medicus-clinical-hud .ch-patient:hover { background: #1f3a5f; color: #fff; border-color: #1f3a5f; }
+
+#medicus-clinical-hud .ch-request {
+  border: 1px solid #cdd6e0; border-radius: 6px; background: #f5f7fa;
+  padding: 7px 8px; margin-bottom: 10px;
+}
+#medicus-clinical-hud .ch-request-head {
+  font-weight: 600; font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: #5a6878; margin-bottom: 5px;
+}
+#medicus-clinical-hud .ch-request-row {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px;
+}
+#medicus-clinical-hud .ch-request-row:last-child { margin-bottom: 0; }
+#medicus-clinical-hud .ch-request-snippet {
+  margin-top: 5px; font-size: 11px; color: #4a5568;
+  border-top: 1px dashed #cdd6e0; padding-top: 5px;
+  font-style: italic; max-height: 70px; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+}
+
+#medicus-clinical-hud .ch-chips {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin-bottom: 10px;
+}
+
+#medicus-clinical-hud .ch-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;
+  margin-bottom: 10px;
+}
+#medicus-clinical-hud .ch-tile {
+  background: #f5f7fa; border: 1px solid #dde3eb; border-radius: 6px;
+  padding: 6px 8px; cursor: pointer; transition: transform 0.06s, border-color 0.1s;
+  display: flex; flex-direction: column; gap: 2px;
+}
+#medicus-clinical-hud .ch-tile:hover { border-color: #1f3a5f; transform: translateY(-1px); }
+#medicus-clinical-hud .ch-tile.ch-tile-sel { border-color: #1f3a5f; box-shadow: 0 0 0 2px rgba(31,58,95,0.15); }
+#medicus-clinical-hud .ch-tile-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #5a6878; }
+#medicus-clinical-hud .ch-tile-status { font-size: 13px; font-weight: 700; }
+#medicus-clinical-hud .ch-tile-count { font-size: 10px; color: #5a6878; }
+
+#medicus-clinical-hud .ch-tile.ch-red { background: #fbe6e7; border-color: rgba(184,38,46,0.4); }
+#medicus-clinical-hud .ch-tile.ch-red .ch-tile-status { color: #b8262e; }
+#medicus-clinical-hud .ch-tile.ch-amber { background: #fdf3e1; border-color: rgba(184,119,26,0.4); }
+#medicus-clinical-hud .ch-tile.ch-amber .ch-tile-status { color: #b8771a; }
+#medicus-clinical-hud .ch-tile.ch-green { background: #e8f4ec; border-color: rgba(47,138,74,0.3); }
+#medicus-clinical-hud .ch-tile.ch-green .ch-tile-status { color: #2f8a4a; }
+#medicus-clinical-hud .ch-tile.ch-not-assessed { background: #eef1f4; border-color: #c5ced6; }
+#medicus-clinical-hud .ch-tile.ch-not-assessed .ch-tile-status { color: #5a6878; font-size: 11px; }
+
+#medicus-clinical-hud .ch-detail {
+  border: 1px solid #e2e7ee; border-radius: 6px;
+  background: #fafbfd; padding: 8px; margin-bottom: 8px;
+  min-height: 60px;
+}
+#medicus-clinical-hud .ch-detail-head {
+  font-weight: 600; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.03em; color: #1f3a5f; margin-bottom: 6px;
+}
+#medicus-clinical-hud .ch-detail-row {
+  border-left: 3px solid #dde3eb; padding: 4px 8px;
+  margin-bottom: 4px; background: #fff; border-radius: 0 4px 4px 0;
+}
+#medicus-clinical-hud .ch-detail-row.ch-red { border-left-color: #b8262e; }
+#medicus-clinical-hud .ch-detail-row.ch-amber { border-left-color: #b8771a; }
+#medicus-clinical-hud .ch-detail-row.ch-green { border-left-color: #2f8a4a; }
+#medicus-clinical-hud .ch-detail-text { font-weight: 500; font-size: 11.5px; }
+#medicus-clinical-hud .ch-detail-sub { font-size: 10.5px; color: #5a6878; margin-top: 2px; }
+#medicus-clinical-hud .ch-detail-empty { color: #8a96a4; font-style: italic; font-size: 11px; }
+
+#medicus-clinical-hud .ch-foot {
+  font-size: 10px; color: #8a96a4; padding-top: 6px;
+  border-top: 1px dashed #dde3eb; text-align: center;
+}
+
+/* ---- Action menu popover (works for HUD chips and queue chips) ---- */
+.ch-action-menu {
+  background: #ffffff;
+  border: 1px solid #cdd6e0;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(20, 30, 50, 0.22);
+  min-width: 220px;
+  max-width: 320px;
+  max-height: min(70vh, calc(100vh - 16px));
+  overflow-y: auto;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #1c2733;
+}
+.ch-action-menu * { box-sizing: border-box; }
+.ch-action-menu-head {
+  padding: 8px 10px;
+  background: #f5f7fa;
+  border-bottom: 1px solid #e2e7ee;
+  display: flex; align-items: center; gap: 8px;
+}
+.ch-action-note-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: #1f3a5f;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ch-action-back {
+  background: transparent;
+  border: 1px solid #cdd6e0;
+  border-radius: 3px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  color: #1f3a5f;
+}
+.ch-action-back:hover { background: #eef2f7; }
+.ch-action-menu-empty {
+  padding: 10px;
+  color: #8a96a4;
+  font-style: italic;
+  font-size: 11px;
+}
+.ch-action-menu-item {
+  padding: 8px 12px;
+  display: flex; align-items: center; gap: 8px;
+  cursor: pointer;
+  border-bottom: 1px solid #f0f3f7;
+}
+.ch-action-menu-item:last-child { border-bottom: none; }
+.ch-action-menu-item:hover { background: #eef2f7; }
+.ch-action-icon { font-size: 13px; opacity: 0.8; flex-shrink: 0; width: 18px; text-align: center; }
+.ch-action-label { flex: 1; }
+
+.ch-action-menu-note {
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  font-size: 11.5px;
+  max-height: 360px;
+  overflow-y: auto;
+  color: #1c2733;
+}
+
+/* Actionable chip cursor + chevron */
+.ch-chip-actionable { cursor: pointer; }
+.ch-chip-actionable:hover { filter: brightness(0.96); }
+.ch-chev { opacity: 0.55; font-size: 9px; margin-left: 2px; }
+`;
+
+  // ============================================================
+  // 1. DATE HELPERS
+  // ============================================================
+  const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  const NOW = () => new Date();
+
+  const parseDate = (s) => {
+    if (!s) return null;
+    const t = String(s).trim().replace(/\*$/, '');
+    let m;
+    if ((m = t.match(/^(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})$/))) return new Date(+m[3], MONTHS[m[2]], +m[1]);
+    if ((m = t.match(/^([A-Z][a-z]{2})\s+(\d{4})$/))) return new Date(+m[2], MONTHS[m[1]], 1);
+    if ((m = t.match(/^(\d{4})$/))) return new Date(+m[1], 0, 1);
+    return null;
+  };
+
+  const monthsAgo = (d) => {
+    if (!d) return null;
+    const n = NOW();
+    return (n.getFullYear() - d.getFullYear()) * 12 + (n.getMonth() - d.getMonth());
+  };
+
+  const daysAgo = (d) => {
+    if (!d) return null;
+    return Math.floor((NOW() - d) / 86400000);
+  };
+
+  // ============================================================
+  // 1b. CONFIG & RULE ENGINE
+  // ============================================================
+  // Config (rules + thresholds + prefs) is loaded from chrome.storage.local
+  // on init and re-loaded when chrome.storage.onChanged fires. In demo mode
+  // (no chrome.storage), falls back to EMBEDDED_DEFAULTS substituted at build.
+
+  const EMBEDDED_DEFAULTS = `{"version":27,"rules":[{"id":"mh-crisis","enabled":true,"label":"MH crisis","kind":"red","patterns":["suicid\\\\w*","self.?harm\\\\w*","kill myself","kill him\\\\w*self","kill her\\\\w*self","end my life","end it all","want to die","wanting to die","don.?t want to be here","don.?t want to live","no longer want to live","not want to live","harm myself","hurt myself","hurting myself","take my (own )?life","taking my (own )?life","overdos\\\\w*","took too many (pills|tablets|medication)","taken too many (pills|tablets|medication)","swallowed too many","cutting myself","hang\\\\w* myself","jump\\\\w* off","throw myself (off|under|in front)","feel like (i want to )?die","feeling suicid\\\\w*","active suicid\\\\w*","passive suicid\\\\w*","life not worth","not worth living","can.?t go on","cannot go on","crisis (team|line|referral)","mental health crisis","psychiatric emergency","(postpartum|puerperal) psychosis","thoughts of (harming|hurting) (my |the )?baby","thoughts of (harming|hurting) (my |the )?(children|kids)","want to (hurt|harm) (my |the )?baby"],"regex":true,"fields":["request","banner"],"pages":["queue","detail","record"],"bumpsTile":"safeguarding","builtin":true,"actions":[{"type":"link","label":"Samaritans","url":"https://www.samaritans.org/"},{"type":"link","label":"NHS 111 mental health","url":"https://111.nhs.uk/"},{"type":"snippet","label":"Risk assessment","text":"MH risk assessment:\\n- Current intent / plan / means:\\n- Recent triggers:\\n- Protective factors:\\n- Past attempts / hospital admissions:\\n- Substance use:\\n- MH services involvement:\\n- Capacity:\\n\\nAction:\\n- Same-day F2F vs phone vs crisis team\\n- Safety plan documented\\n- Safeguarding referral if children in household\\n- Follow-up timeframe agreed"},{"type":"note","label":"Safeguarding check","text":"Always consider:\\n\\u2022 Children / dependents in household \\u2192 safeguarding referral threshold\\n\\u2022 Mental Capacity Assessment\\n\\u2022 Document risk assessment in full\\n\\u2022 Crisis team contact readily available\\n\\u2022 Clear follow-up plan with named clinician"}]},{"id":"safeguarding","enabled":true,"label":"Safeguarding","kind":"red","patterns":["safeguarding","abuse","abused","abusing","neglect","neglected","domestic violence","domestic abuse","coercive control","coercive behaviour","controlling partner","controlling relationship","controlling behaviour","hit me","hits me","hitting me","punch","kicked me","kicks me","slap","strangl","afraid at home","scared at home","scared of my partner","scared of my husband","scared of my wife","scared of my boyfriend","scared of my girlfriend","frightened at home","frightened of my partner","fear at home","unsafe at home","not safe at home","partner hurts me","partner hits me","husband hits me","husband hurts me","my partner beats me","being beaten","physical abuse","emotional abuse","psychological abuse","sexual abuse","sexual assault","assaulted","rape","financial abuse","forced marriage","female genital mutilation","fgm","child abuse","child neglect","child at risk","at risk child","exploitation","traffick","modern slavery","honour","forced into","threatened me","threatening me","threats at home","violence at home","hurt at home"],"regex":false,"fields":["request","banner","problems"],"pages":["queue","detail","record"],"bumpsTile":"safeguarding","builtin":true,"actions":[{"type":"link","label":"Local safeguarding (replace URL)","url":"https://www.gov.uk/government/publications/safeguarding-adults"},{"type":"note","label":"Documentation","text":"Safeguarding considerations:\\n\\u2022 Notify practice safeguarding lead\\n\\u2022 MARAC / DASH risk assessment if DV suspected\\n\\u2022 Code in record (Safeguarding adult / child concern)\\n\\u2022 Document concerns verbatim\\n\\u2022 Information sharing per local policy\\n\\u2022 Children in household \\u2014 separate referral if at risk"}]},{"id":"chest-pain","enabled":true,"label":"Chest pain","kind":"red","patterns":["chest pain","chest tightness","tight chest","tightness in my chest","tightness in chest","crushing","central chest","pain in my chest","pain in the chest","chest pressure","pressure on my chest","pressure in my chest","pressure in chest","heaviness in my chest","heavy chest","chest heaviness","chest discomfort","discomfort in my chest","chest ache","aching chest","ache in my chest","chest squeezing","squeezing chest","squeezing in my chest","heart pain","pain in my heart","angina","heart attack","cardiac","chest burning","burning in my chest","burning chest","chest tightening","tightening in my chest","substernal","retrosternal","radiation to my arm","radiating to my arm","pain down my arm","pain in my left arm","jaw pain with chest","pain in my jaw and chest","chest and arm pain","chest and jaw pain","myocardial","nstemi","stemi","jaw pain and arm","jaw pain with arm","jaw pain and shoulder","jaw pain with shoulder","neck pain and arm","neck pain with arm","neck pain and shoulder","neck pain with shoulder","pain in my left arm and sweat","pain in my left arm with sweat","pain in my left arm and nausea","pain in my left arm with nausea","pain in my right arm and sweat","pain in my right arm with sweat","pain in my left shoulder and sweat","pain in my left shoulder with sweat","indigestion and arm pain","indigestion with arm pain","heartburn and arm pain","heartburn with arm pain","indigestion and jaw pain","indigestion with jaw pain","heartburn and jaw pain","heartburn with jaw pain","indigestion and sweating","indigestion with sweating","heartburn and sweating","heartburn with sweating"],"regex":false,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Acute pathway","text":"If acute / ongoing pain \\u2192 999.\\n\\nIf resolved:\\n\\u2022 Onset, duration, character, radiation, exertion-related?\\n\\u2022 Cardiac risk factors: age, smoker, FH, DM, lipids, BP, prior CVD\\n\\u2022 Associated: SOB, sweating, N&V, syncope\\n\\u2022 Differential: ACS, PE, dissection, pericarditis, GORD, MSK, anxiety\\n\\nThresholds:\\n\\u2022 HEART score for risk stratification\\n\\u2022 Same-day clinical assessment if any concerning features"},{"type":"snippet","label":"HEART score template","text":"HEART score:\\n- History (suspicious 0/1/2):\\n- ECG (normal / non-spec / abnormal 0/1/2):\\n- Age (<45 / 45-64 / >65 = 0/1/2):\\n- Risk factors (count: 0 / 1-2 / 3+ or known CVD = 0/1/2):\\n- Troponin (norm / 1-3x / >3x ULN = 0/1/2):\\n\\nTotal: __\\n0-3 = low risk \\u00b7 4-6 = moderate \\u00b7 7-10 = high"}]},{"id":"cauda-equina","enabled":true,"label":"Cauda equina","kind":"red","patterns":["saddle.?(numb\\\\w*|anaesthe\\\\w*|anesthe\\\\w*|paresthe\\\\w*|parasthe\\\\w*|sensation)","bladder retention","urinary retention","bowel incontinence","perineal numb\\\\w*","perineal anaesthe\\\\w*","perineal anesthe\\\\w*","perineal paresthe\\\\w*","can.?t feel (when I |to |myself )?(wee|urinate|pee|pass urine|empty my bladder)","can.?t empty my bladder","unable to empty (my )?bladder","loss of bladder control","lost bladder control","can.?t feel (my )?(bottom|bum|groin|genitals|between my legs|down below|perineum)","numb (bum|bottom|groin|genitals|perineum|between my legs|between the legs|down below|in my groin|around my back passage|around my anus|around my back\\\\w*)","numbness (in my )?(bum|bottom|groin|genitals|perineum|between (my |the )?legs|down below|around my back passage|saddle area)","tingling (in my )?(bum|bottom|groin|genitals|perineum|between (my |the )?legs|saddle area)","loss of sensation (in my )?(bum|bottom|groin|genitals|perineum|between (my |the )?legs|saddle area|down below)","reduced sensation (in my )?(bum|bottom|groin|genitals|perineum|between (my |the )?legs|saddle area)","no sensation (in my )?(bum|bottom|groin|genitals|perineum|between (my |the )?legs|saddle area)","back passage numb\\\\w*","anal numb\\\\w*","perianal numb\\\\w*","cauda equina","bowel and bladder","bladder and bowel","can.?t pass urine","unable to urinate","unable to pass urine","not passed urine (for|in)","haven.?t (been able to )?wee\\\\w* (for|in)","can.?t wee","retention of urine","faecal incontinence","fecal incontinence","losing control of (my )?bowels","lost control of (my )?bowels","loss of bowel control","leaking (from|stool|bowel)","back pain with (bladder|bowel|numb\\\\w*|incontinence|retention)","leg weakness with (bladder|bowel|numb\\\\w*|incontinence|retention)","sciatica (and|with) (bladder|bowel|incontinence|numb\\\\w*|retention)","lost all (feeling|sensation) down (there|below)","can.?t feel (myself |when I )?(pee|wee|go to the toilet)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Emergency MRI","text":"Suspected cauda equina = same-day emergency MRI.\\n\\nRed flags (any):\\n\\u2022 Bilateral sciatica\\n\\u2022 Saddle anaesthesia / paraesthesia\\n\\u2022 Bladder dysfunction (retention / overflow)\\n\\u2022 Bowel incontinence / loss of anal tone\\n\\u2022 Sexual dysfunction\\n\\nAction:\\n\\u2022 Discuss with on-call neurosurgery / spinal team\\n\\u2022 Direct ED referral if no urgent MRI access\\n\\u2022 Document neuro exam including PR if appropriate"}]},{"id":"thunderclap","enabled":true,"label":"Thunderclap headache","kind":"red","patterns":["worst headache","worst head pain","started instantly","thunderclap","sudden severe headache","sudden onset headache","worst headache of my life","worst headache i have ever","worst headache ever","never had a headache like","headache like a thunderclap","headache came on suddenly","headache came on instantly","headache came on out of nowhere","headache hit me suddenly","headache out of nowhere","headache hit like","headache started suddenly","sudden headache","instantaneous headache","explosive headache","headache like an explosion","bang in my head","worst pain of my life in my head","head pain worst ever","severe sudden head","head felt like it exploded","head like it was going to explode","subarachnoid","brain haemorrhage","brain hemorrhage","bleed in the brain","bleed on the brain","worst pain ever in my head","10 out of 10 headache","10/10 headache","headache ten out of ten","sudden headache and stiff neck","sudden headache with stiff neck","sudden severe headache and stiff neck","sudden severe headache with stiff neck","sudden headache and sore neck","sudden headache with sore neck","sudden headache and painful neck","sudden headache with painful neck","worst headache and neck pain","worst headache with neck pain"],"regex":false,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"SAH pathway","text":"Thunderclap headache \\u2192 consider SAH.\\n\\n\\u2022 Maximum intensity within seconds-minutes\\n\\u2022 Same-day CT head (CT >95% sensitive within 6h)\\n\\u2022 If CT negative & onset <6h, may exclude\\n\\u2022 If onset >6h or symptoms ongoing, LP at 12h\\n\\nOther differentials: cervical artery dissection, RCVS, pituitary apoplexy, venous sinus thrombosis.\\n\\nAction: same-day ED referral."}]},{"id":"gi-bleed","enabled":true,"label":"GI bleed","kind":"red","patterns":["melaena\\\\w*","melena\\\\w*","malaena\\\\w*","haematemesis\\\\w*","hematemesis\\\\w*","vomiting blood","vomited blood","vomit\\\\w* blood","threw up blood","throwing up blood","coffee.?ground\\\\w*","fresh blood per rectum","haematochezia\\\\w*","hematochezia\\\\w*","blood in (my )?(stool|stools|poo|poop|faeces|feces|bowel movement|motion|toilet)","blood (from|in|out of) (my )?(back passage|bottom|anus|rectum|bum)","passing blood (from|per|in|out of|rectum|back passage|bottom|anus|bum|stool|poo|bowel)","rectal bleeding","rectal bleed\\\\w*","bleeding (from|per) rectum","bleeding from (my )?(back passage|bottom|anus|bum)","bright red blood (from|in|per|out of)","dark (red )?blood (in|from|per|out of) (my )?(stool|poo|back passage|bottom|bowel)","black (tarry |and tarry )?(stool|stools|poo|poop|faeces|feces|bowel|motion)","black and tarry","tarry (stool|stools|poo|poop|faeces|feces|bowel|motion)","tar.?like (stool|stools|poo|poop|faeces|feces)","dark stool\\\\w*","dark poo\\\\w*","very dark poo","blood when I wipe","blood on toilet paper","blood in (the )?toilet (bowl|pan|water)?","blood (after|when) (going to the )?toilet","pr bleed\\\\w*","upper gi bleed\\\\w*","lower gi bleed\\\\w*","gastrointestinal bleed\\\\w*","gi bleed\\\\w*","haemorrhage\\\\w* (from|in|into) (bowel|gut|stomach|oesophagus|esophagus|intestine)","hemorrhage\\\\w* (from|in|into) (bowel|gut|stomach|esophagus|intestine)","blood (in|from) (my )?vomit","bloody vomit","bloody stool\\\\w*","bloody diarrhoea","bloody diarrhea"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Acute pathway","text":"Suspected upper / lower GI bleed.\\n\\n\\u2022 Haemodynamics: HR, BP, lying/standing\\n\\u2022 Anticoagulants / antiplatelets / NSAIDs\\n\\u2022 Liver disease / known varices\\n\\u2022 Glasgow-Blatchford for upper GI bleed\\n\\nAction:\\n\\u2022 Acute / unstable \\u2192 999\\n\\u2022 Stable + suspicious \\u2192 same-day medical admission\\n\\u2022 Painless rectal bleeding > 50y \\u2192 2WW colorectal"},{"type":"snippet","label":"Glasgow-Blatchford template","text":"Glasgow-Blatchford:\\n- Urea (mmol/L):\\n- Hb (g/L):\\n- Systolic BP:\\n- Pulse \\u2265100:\\n- Melaena:\\n- Syncope:\\n- Hepatic disease:\\n- Cardiac failure:\\n\\nScore: __\\n0 = consider outpatient \\u00b7 \\u22651 = admit"}]},{"id":"methotrexate","enabled":true,"label":"Methotrexate","kind":"amber","patterns":["methotrexate\\\\w*","methtrexate\\\\w*","methotrexat\\\\b","Maxtrex\\\\w*","Metoject\\\\w*","Nordimet\\\\w*","Jylamvo\\\\w*","\\\\bMTX\\\\b"],"regex":true,"fields":["meds","request","problems"],"pages":["detail","record"],"bumpsTile":"meds","builtin":true,"actions":[{"type":"note","label":"DMARD monitoring","text":"Methotrexate monitoring (NICE / BSR):\\n\\n\\u2022 FBC + U&E + LFT every 12 weeks (or 4-weekly if dose change / new abnormalities)\\n\\u2022 Annual chest X-ray if respiratory symptoms\\n\\u2022 Pneumococcal + annual flu vaccine\\n\\u2022 Folic acid 5mg weekly (\\u226524h after MTX)\\n\\nWarnings:\\n\\u2022 Teratogenic \\u2014 6mo washout F, 3mo M before conception\\n\\u2022 Hepatotoxic \\u2014 alcohol limits\\n\\u2022 Pulmonary toxicity \\u2014 investigate any new SOB / dry cough\\n\\u2022 Drug interactions \\u2014 esp. trimethoprim, NSAIDs (caution)"},{"type":"snippet","label":"Bloods reminder","text":"Methotrexate monitoring bloods:\\n- FBC + film:\\n- U&E:\\n- LFTs:\\n- Date of last MTX dose:\\n- Current dose:\\n- Folic acid:\\n- Symptoms? (SOB, mouth ulcers, infection):\\n\\nNext review due:"}]},{"id":"lithium","enabled":true,"label":"Lithium","kind":"amber","patterns":["lithium\\\\w*","Priadel\\\\w*","Camcolit\\\\w*","Liskonum\\\\w*","Li-Liquid\\\\w*","Li Liquid\\\\w*"],"regex":true,"fields":["meds","request","problems"],"pages":["detail","record"],"bumpsTile":"meds","builtin":true,"actions":[{"type":"note","label":"Lithium monitoring","text":"Lithium monitoring (NICE):\\n\\n\\u2022 Level 12h post-dose, 3-monthly (more often if dose change, illness, drug interaction)\\n\\u2022 U&E + TFT + Ca every 6 months\\n\\u2022 Target range typically 0.6-0.8 mmol/L (0.4-1.0 acceptable)\\n\\u2022 Toxicity above 1.5 mmol/L\\n\\nCommon traps:\\n\\u2022 Dehydration / D&V \\u2192 toxicity\\n\\u2022 NSAIDs, ACEi, thiazides \\u2191 levels\\n\\u2022 Pregnancy considerations \\u2014 specialist advice\\n\\u2022 Hypothyroidism long-term"}]},{"id":"anticoag","enabled":true,"label":"Anticoagulant","kind":"amber","patterns":["warfarin\\\\w*","apixaban\\\\w*","rivaroxaban\\\\w*","edoxaban\\\\w*","dabigatran\\\\w*","acenocoumarol\\\\w*","phenindione\\\\w*","Eliquis\\\\w*","Xarelto\\\\w*","Lixiana\\\\w*","Pradaxa\\\\w*","Coumadin\\\\w*","Marevan\\\\w*","Sinthrome\\\\w*","\\\\bDOAC\\\\b","\\\\bNOAC\\\\b","blood thinners?\\\\b","blood[- ]?thinning tablets?\\\\b","anticoagulant\\\\w*"],"regex":true,"fields":["meds"],"pages":["detail","record"],"bumpsTile":"meds","builtin":true,"actions":[{"type":"note","label":"Anticoag review","text":"Annual anticoagulant review:\\n\\n\\u2022 Indication still valid?\\n\\u2022 Renal function \\u2014 dose adjustment for DOACs\\n\\u2022 Bleeding risk reassessment (HAS-BLED, ORBIT)\\n\\u2022 CHA\\u2082DS\\u2082-VASc for AF (consider stopping if low risk)\\n\\u2022 Patient knows what to do if a dose is missed\\n\\u2022 Has Yellow Book / DOAC alert card\\n\\u2022 Interacting meds review (esp. NSAIDs, antibiotics, antifungals)\\n\\u2022 Bleeding episodes \\u2014 frequency, severity, source\\n\\u2022 Falls risk if elderly"}]},{"id":"uti","enabled":true,"label":"UTI","kind":"amber","patterns":["\\\\bUTI\\\\b","urinary tract inf\\\\w*","burning (when |while )?(passing (water|urine)|pe?e?ing|i (pe?e?|wee)|to (pee|wee))\\\\w*","stinging (when |while )?(passing (water|urine)|pe?e?ing|i (pe?e?|wee)|to (pee|wee))\\\\w*","dysuria\\\\w*","cystitis\\\\w*","water inf\\\\w*","bladder inf\\\\w*","need to (wee|pee|urinate) (all the time|constantly|frequently|a lot)\\\\w*","cloudy (urine|wee|pee)\\\\w*","smelly (urine|wee|pee)\\\\w*","pain (passing|when passing) (water|urine)\\\\w*","frequent urination\\\\w*","urine inf\\\\w*","can.?t (pee|pass water)","unable to (wee|pee|pass water)","nothing comes? out (when I try to )?(wee|pee)","struggling to pass (urine|water)"],"regex":true,"fields":["request","problems"],"pages":["queue","detail","record"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE CKS UTI (women)","url":"https://cks.nice.org.uk/topics/urinary-tract-infection-lower-women/"},{"type":"link","label":"NICE CKS UTI (men)","url":"https://cks.nice.org.uk/topics/urinary-tract-infection-lower-men/"},{"type":"snippet","label":"UTI history & exam","text":"UTI history:\\n- Dysuria / frequency / urgency:\\n- Suprapubic pain / loin pain:\\n- Duration of symptoms:\\n- Fever / rigors / vomiting:\\n- Vaginal discharge:\\n- Sexually active / new partner:\\n- Pregnancy possible:\\n- Catheter / structural abnormality:\\n- Recent abx / hospitalisation:\\n- Recurrence (\\u22653 in 12mo or \\u22652 in 6mo):\\n- Diabetes / immunosuppression:\\n\\nO/E:\\n- Vitals (sepsis screen):\\n- Abdominal exam:\\n- Loin tenderness:\\n- (Dipstick: not for \\u226565y or catheterised):\\n\\nPlan:\\n- 1st line: nitrofurantoin or trimethoprim per local sensitivity\\n- 2nd line: pivmecillinam / fosfomycin\\n- Pyelonephritis features \\u2192 admit / IV abx"},{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (UTI)","text":"Consider Pharmacy First \\u2014 uncomplicated lower UTI, women aged 16\\u201364, not pregnant. If eligible, signpost to community pharmacy.\\n\\nNot suitable / safety-net: pregnant, male, <16 or >64, recurrent UTI, catheter, immunosuppressed, suspected pyelonephritis (fever, loin/back pain, rigors, vomiting), visible haematuria, or not improving in 48h."}]},{"id":"epiglottitis","enabled":true,"label":"Epiglottitis","kind":"red","patterns":["epiglottit\\\\w*","(drooling|can.?t swallow (my )?(own )?(saliva|spit))","(muffled|hot.?potato) voice"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Airway emergency","text":"Suspected adult epiglottitis / supraglottitis \\u2192 999 / same-day ED.\\n\\nRed flags (any): drooling or unable to swallow saliva, muffled \\u201chot potato\\u201d voice, stridor, sitting forward to breathe, severe sore throat with a normal-looking oropharynx, rapid deterioration.\\n\\nAction:\\n\\u2022 Do NOT attempt to examine the throat or use a tongue depressor \\u2014 risk of precipitating airway obstruction\\n\\u2022 Keep the patient sitting upright; do not lie flat\\n\\u2022 999 transfer / immediate ENT-anaesthetics involvement\\n\\u2022 Differential: quinsy, deep neck-space infection, anaphylaxis"}]},{"id":"sore-throat","enabled":true,"label":"Sore throat","kind":"amber","patterns":["sore throat\\\\w*","tonsillitis\\\\w*","throat pain\\\\w*","pharyngitis\\\\w*","painful throat\\\\w*","throat is sore\\\\w*","hurts to swallow\\\\w*","strep throat\\\\w*","quinsy\\\\w*","peritonsillar\\\\w*","tonsils (are |is )?(sore|swollen|infected|inflamed|painful)\\\\w*","swollen tonsils?\\\\w*","throat infection\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE CKS sore throat","url":"https://cks.nice.org.uk/topics/sore-throat-acute/"},{"type":"snippet","label":"FeverPAIN scoring","text":"FeverPAIN score (1 point each):\\n- Fever in last 24h:\\n- Purulence (tonsils):\\n- Attended within 3 days of onset:\\n- Inflamed tonsils (severe):\\n- No cough or coryza:\\n\\nTotal: __\\n0-1: 13-18% strep \\u2014 no abx, self-care\\n2-3: 34-40% strep \\u2014 delayed abx (3d) or no abx\\n4-5: 62-65% strep \\u2014 immediate abx\\n\\nAbx of choice: phenoxymethylpenicillin 500mg QDS 5-10d (clarithromycin if pen-allergic)"},{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (sore throat)","text":"Consider Pharmacy First \\u2014 acute sore throat, age 5+. Pharmacist applies FeverPAIN.\\n\\nSafety-net / urgent: difficulty breathing, difficulty swallowing saliva, drooling, muffled \\u201chot potato\\u201d voice, stridor, neck stiffness, systemically very unwell, or immunosuppressed \\u2192 same-day assessment (?quinsy / epiglottitis)."}]},{"id":"otitis","enabled":true,"label":"Otitis media","kind":"amber","patterns":["otitis\\\\w*","earache\\\\w*","ear[- ]?ache\\\\w*","ear inf\\\\w*","ear pain\\\\w*","ear (is |are )?(really |very |so |getting |bit |a bit )?(hurting|sore|painful|infected|aching)\\\\w*","my ear (is |are )?(really |very |so |getting |bit |a bit )?(sore|hurting|painful|aching)\\\\w*","sore ear\\\\w*","painful ear\\\\w*","pain in (my |the |her |his )?ear\\\\w*","\\\\bAOM\\\\b","\\\\bOME\\\\b","glue ear\\\\w*","ear discharge\\\\w*","discharge from (the |my |her |his )?ear\\\\w*","blocked ear\\\\w*","muffled hearing (in|from) (the |my )?(ear|right ear|left ear)\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE CKS OM","url":"https://cks.nice.org.uk/topics/otitis-media-acute/"},{"type":"snippet","label":"OM history & exam","text":"Otitis media history:\\n- Onset / duration:\\n- Fever / unwell:\\n- Otalgia laterality:\\n- Discharge / hearing loss:\\n- Recent URTI:\\n- Recurrent OM (\\u22653 in 6mo or \\u22654/yr):\\n- Eardrum perforation history:\\n- Grommets:\\n\\nO/E:\\n- TM appearance: bulging / erythematous / dull / perforated / effusion\\n- Mastoid tenderness:\\n- General \\u2014 temp, fluid intake:\\n\\nPlan:\\n- Most resolve in 3 days, paracetamol / ibuprofen\\n- Abx if: <2y bilateral, perforation + discharge, systemically unwell, deteriorating\\n- Amoxicillin 5-7d (clarithromycin if pen-allergic)\\n- Safety net: persistent fever 3-4d, mastoid swelling, hearing loss >2-4w"},{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (otitis media)","text":"Consider Pharmacy First \\u2014 acute otitis media, age 1\\u201317. If eligible, signpost to community pharmacy.\\n\\nNot suitable / safety-net: <1y or >17y, systemically very unwell, immunosuppressed, suspected mastoiditis (swelling/redness behind the ear), or symptoms not improving after 3 days."}]},{"id":"sinusitis","enabled":true,"label":"Sinusitis","kind":"amber","patterns":["sinusit\\\\w*","sinus infection","sinus pain","sinus pressure","blocked sinus\\\\w*","facial pain","facial pressure","pressure (in|around|behind) (my )?(face|cheek|cheeks|eyes)","pain (over|around) (my )?(cheek|cheeks|sinuses)","post.?nasal drip"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (sinusitis)","text":"Consider Pharmacy First \\u2014 acute sinusitis, age 12+. If eligible, signpost to community pharmacy.\\n\\nSafety-net / urgent: symptoms >10 days, swelling or redness around the eye, double vision, severe frontal headache, photophobia, neck stiffness, or systemically very unwell."}]},{"id":"insect-bite","enabled":true,"label":"Insect bite","kind":"amber","patterns":["insect bite\\\\w*","insect sting\\\\w*","bug bite\\\\w*","spider bite\\\\w*","mosquito bite\\\\w*","infected bite\\\\w*","infected sting\\\\w*","bite (that('?s| is| has)? )?(gone )?(red|infected|swollen|hot|spreading)","sting (that('?s| is| has)? )?(gone )?(red|infected|swollen|hot|spreading)","bitten by (an? )?(insect|mosquito|spider|midge|wasp|bee)\\\\w*","tick bite\\\\w*","bitten by a tick","(bull.?s.?eye|circular|ring.?shaped) rash","lyme disease"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (infected insect bite)","text":"Consider Pharmacy First \\u2014 infected insect bite, age 1+. If eligible, signpost to community pharmacy.\\n\\nSafety-net / urgent: rapidly spreading redness, fever or systemic illness, suspected cellulitis, bite near the eye, or breathing difficulty / facial swelling suggesting anaphylaxis \\u2192 emergency."}]},{"id":"impetigo","enabled":true,"label":"Impetigo","kind":"amber","patterns":["impetigo\\\\w*","school sores?","golden crust\\\\w*","honey.?colou?red crust\\\\w*","weeping sore\\\\w*","crusty (sore|sores|rash|spot|spots) (on|around) (the |my )?(face|nose|mouth|chin|lip|lips)","infected (sore|sores) (on|around) (my |the )?(face|nose|mouth)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (impetigo)","text":"Consider Pharmacy First \\u2014 impetigo, age 1+ (non-bullous, localised). If eligible, signpost to community pharmacy.\\n\\nNot suitable / refer: bullous impetigo, widespread or recurrent, systemically unwell, immunosuppressed, or not improving with treatment."}]},{"id":"shingles","enabled":true,"label":"Shingles","kind":"amber","patterns":["shingles","herpes zoster","\\\\bzoster\\\\b","shingle rash","blistering rash","band of blister\\\\w*","painful rash (on )?one side","rash (on )?one side of (my )?(face|body|chest|back|torso)","burning pain (on |down )?(one side|the left|the right)( of my (chest|back|body|face))?"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"snippet","label":"Pharmacy First referral (shingles)","text":"Consider Pharmacy First \\u2014 shingles, age 18+. Antiviral most effective within 72h of rash onset.\\n\\nUrgent / not suitable for PF: eye involvement or rash on the tip of the nose (Hutchinson\\u2019s sign \\u2014 ?ophthalmic zoster), immunocompromised, pregnant, severe / widespread / disseminated rash, or signs of complications."}]},{"id":"back-pain","enabled":true,"label":"Back pain","kind":"amber","patterns":["back pain","lower back","lumbar pain","sciatica","backache","bad back","sore back","back hurt","pain in my back","aching back","back ache","slipped disc","trapped nerve","lumbago","sciatic","pain down my leg","leg pain from my back","back spasm","spine pain","spinal pain","lumbar","coccyx","sacral pain","sacroiliac","degenerative disc","herniated disc","prolapsed disc","disc bulge","facet joint"],"regex":false,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE LBP & sciatica","url":"https://www.nice.org.uk/guidance/ng59"},{"type":"snippet","label":"Back pain assessment","text":"Back pain \\u2014 red flags (refer urgently):\\n- Cauda equina (saddle anaesthesia, bladder/bowel)\\n- Significant trauma\\n- Age <20 or >55 new onset\\n- Progressive neurological deficit\\n- Fever / weight loss / night pain (cancer/infection)\\n- IVDU / immunosuppression\\n- History of malignancy\\n- Severe progressive limb weakness\\n\\nYellow flags (psychosocial):\\n- Belief pain is harmful\\n- Avoidance behaviour\\n- Low mood / withdrawal\\n- Job dissatisfaction\\n- Compensation/legal issues\\n\\nManagement (no red flags):\\n- Stay active, return to normal activities\\n- Analgesia: NSAIDs first-line (with PPI cover if indicated)\\n- Avoid opioids and gabapentinoids for non-specific LBP\\n- Refer to physio / MSK if not improving in 4-6 weeks"}]},{"id":"cough-resp","enabled":true,"label":"Cough/SOB","kind":"amber","patterns":["cough\\\\w*","shortness of breath","short of breath","breathless\\\\w*","wheez\\\\w*","chest infection\\\\w*","phlegm","\\\\bSOB\\\\b","\\\\bCOPD\\\\b","can't catch my breath","cannot catch my breath","cant catch my breath","struggling to breath\\\\w*","difficulty breath\\\\w*","hard to breath\\\\w*","chesty cough\\\\w*","mucus","sputum","tight chest","chest tightness from breath\\\\w*","bronchit\\\\w*","COPD flare\\\\w*","asthma attack\\\\w*","asthma flare\\\\w*","asthma\\\\b","haemoptysis","hemoptysis","coughing up blood","bringing up phlegm","bringing up mucus","winded","out of breath","puffed out","puffed\\\\b","respiratory infection","chest congestion","congested chest","rattly chest","productive cough\\\\w*","dry cough\\\\w*","persistent cough\\\\w*","tickly cough\\\\w*","night cough\\\\w*","asthma (getting|got|much) worse","asthma (not controlled|playing up)","(using|needing) (my )?(blue inhaler|reliever|salbutamol|ventolin) (more|more often|all the time|every (few )?hours)","(blue inhaler|reliever|inhaler) (not lasting|not working|not helping|isn.?t helping)","(waking|woken) (at|in the) night (with )?(wheez\\\\w*|cough\\\\w*|breathless\\\\w*|tight chest)","peak flow (dropping|down|low|worse)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Resp red flags","text":"Cough / breathlessness \\u2014 concerning features:\\n\\u2022 Haemoptysis\\n\\u2022 Weight loss / night sweats\\n\\u2022 Smoker / ex-smoker, esp. age >40\\n\\u2022 Persistent cough >3 weeks\\n\\u2022 Hoarseness >3 weeks\\n\\u2022 Acute onset breathlessness (PE / pneumothorax)\\n\\u2022 Tachypnoea, hypoxia, accessory muscle use\\n\\u2022 Single-lobe / focal signs\\n\\u2022 Failure to respond to abx\\n\\nThresholds:\\n\\u2022 Same-day F2F if any red flag, hypoxia, or systemic unwellness\\n\\u2022 2WW chest if haemoptysis + age >40, or persistent cough + smoker"},{"type":"snippet","label":"Resp assessment","text":"Respiratory presentation:\\n- Onset / duration:\\n- Cough: dry / productive (colour, consistency):\\n- Haemoptysis:\\n- Breathlessness \\u2014 exertional / rest, MRC grade:\\n- Wheeze:\\n- Fever, night sweats, weight loss:\\n- Chest pain \\u2014 pleuritic / cardiac:\\n- PE risk: travel, immobility, surgery, OCP, malignancy, leg swelling:\\n- Smoking pack-years:\\n- Asthma / COPD:\\n\\nO/E:\\n- Vitals: HR, BP, RR, sats, temp:\\n- WOB / accessory muscles:\\n- Chest exam:\\n- PEFR (if asthma):\\n\\nPlan:"},{"type":"note","label":"Asthma control (RCP3Q)","text":"RCP 3 Questions (any \\u201cyes\\u201d = poor control \\u2192 review):\\n1. Recent sleep disturbance from asthma?\\n2. Usual daytime symptoms (cough/wheeze/tight chest)?\\n3. Interference with usual activity?\\n\\nReliever use \\u22653\\u00d7/week or any night waking = uncontrolled \\u2192 inhaler technique + adherence + step-up review.\\n\\nACUTE SEVERE (same-day): PEF 33\\u201350% best, can\\u2019t complete sentences, RR \\u226525, HR \\u2265110.\\nLIFE-THREATENING (999): PEF <33%, silent chest, cyanosis, exhaustion, SpO\\u2082 <92%.\\nAfter any attack: steroid course completed? Follow-up within 48h."}]},{"id":"skin-2ww","enabled":true,"label":"Skin lesion","kind":"amber","patterns":["mole\\\\w*","skin lesion\\\\w*","skin change\\\\w*","changing mole\\\\w*","dark spot\\\\w*","growing lesion\\\\w*","non.?healing","ulcerat\\\\w*","new mole\\\\w*","mole has changed","mole that has changed","irregular mole\\\\w*","bleeding mole\\\\w*","itchy mole\\\\w*","spot that won.?t heal","sore that won.?t heal","wound that won.?t heal","won.?t heal","wont heal","not healing","hasn.?t healed","isn.?t healing","lump on \\\\w*(skin|back|arm|leg|face|neck|scalp|chest|shoulder)","skin growth\\\\w*","pigmented lesion\\\\w*","pigmented spot\\\\w*","melanoma\\\\w*","changing freckle\\\\w*","freckle that has changed","scab that won.?t heal","crusty lesion\\\\w*","crusty spot\\\\w*","suspicious mole\\\\w*","abnormal mole\\\\w*","pearly lump\\\\w*","basal cell\\\\w*","squamous cell\\\\w*","actinic keratosis","solar keratosis","rodent ulcer\\\\w*","lump on skin","skin lump\\\\w*","new lesion\\\\w*","spreading lesion\\\\w*","oozing lesion\\\\w*","bleeding lesion\\\\w*","lesion that bleeds","lesion that ooze\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE 2WW skin","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#skin-cancers"},{"type":"snippet","label":"7-point checklist","text":"Weighted 7-point checklist for pigmented lesion (refer 2WW if score \\u22653 OR any major):\\n\\nMajor (2 points each):\\n- Change in size:\\n- Irregular shape:\\n- Irregular colour:\\n\\nMinor (1 point each):\\n- Largest diameter \\u22657mm:\\n- Inflammation:\\n- Oozing / bleeding:\\n- Change in sensation (itch):\\n\\nTotal: __\\n\\nLesion description:\\n- Site:\\n- Diameter:\\n- Colour:\\n- Border:\\n- Evolution (timeline):\\n- Symptoms:\\n- ABCDE: Asymmetry / Border / Colour / Diameter / Evolving:\\n\\nPhoto on record? Y/N"}]},{"id":"mh-general","enabled":true,"label":"Mental health","kind":"amber","patterns":["anxi\\\\w*","depress\\\\w*","low mood","panic attack\\\\w*","stress\\\\w*","insomnia","mental health","mental wellbeing","therapy","counselling","counseling","feeling down","feel\\\\w* low","feel\\\\w* depressed","feel\\\\w* anxious","feeling hopeless","feeling worthless","feeling overwhelm\\\\w*","overwhelm\\\\w*","tearful","crying all the time","can't sleep","cannot sleep","cant sleep","not sleeping","struggling to sleep","sleep problem\\\\w*","sleep difficult\\\\w*","no motivation","lack of motivation","lost interest","no interest in","can't cope","cannot cope","cant cope","struggling mentally","struggling emotionally","worried all the time","nervous all the time","nervous wreck","constant worry\\\\w*","low self[- ]?esteem","\\\\bCBT\\\\b","talking therapy","talking therapies","\\\\bIAPT\\\\b","NHS talking therapies","mood problem\\\\w*","mood issue\\\\w*","burnt out","burnout","burn out","emotionally exhausted","mental breakdown","nervous breakdown","phobia\\\\w*","OCD\\\\b","PTSD\\\\b","post.?traumatic","intrusive thought\\\\w*","low energy","no energy","mood swings","anger problem\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"PHQ-9","url":"https://patient.info/doctor/patient-health-questionnaire-phq-9"},{"type":"link","label":"GAD-7","url":"https://patient.info/doctor/generalised-anxiety-disorder-assessment-gad-7"},{"type":"link","label":"Local IAPT / Talking Therapies (replace)","url":"https://www.nhs.uk/mental-health/talking-therapies-medicine-treatments/talking-therapies-and-counselling/nhs-talking-therapies/"},{"type":"snippet","label":"MH consultation","text":"MH presentation:\\n- Onset / duration / triggers:\\n- Symptoms (mood, anhedonia, sleep, appetite, energy, concentration):\\n- Anxiety symptoms / panic:\\n- Functional impact (work, relationships, self-care):\\n- Risk: thoughts of self-harm / suicide / harm to others:\\n- Substance use:\\n- Past MH history / family history:\\n- Social context: housing, finances, support network:\\n- Recent losses / life events:\\n- PHQ-9: __ / GAD-7: __\\n\\nPlan:\\n- Self-help / IAPT / counselling\\n- SSRI if moderate-severe (caution under 25 \\u2014 review 2 weekly):\\n- Safety net + follow-up:"}]},{"id":"post-discharge","enabled":true,"label":"Post-discharge","kind":"amber","patterns":["discharged","just home from hospital","out of hospital","recently in hospital","discharge summary","came out of hospital","got home from hospital","back from hospital","left hospital","after my hospital stay","following my admission","post-op","after my operation","after my surgery","discharged from ward","TTO","TTA"],"regex":false,"fields":["request","docs"],"pages":["queue","detail","record"],"bumpsTile":"openLoops","builtin":true,"actions":[{"type":"note","label":"Post-discharge checklist","text":"After hospital discharge \\u2014 review:\\n\\n\\u2022 Medication reconciliation (new / changed / stopped)\\n\\u2022 Follow-up appointments booked?\\n\\u2022 Outstanding investigations / results pending?\\n\\u2022 Self-monitoring / safety-net advice given?\\n\\u2022 District nurse / community support arranged?\\n\\u2022 Social: home situation, carer, equipment\\n\\u2022 Code recent admission in record\\n\\u2022 Update problem list and registers (e.g. HF, COPD, AF post-MI)\\n\\u2022 Consider proactive care plan if frail / multimorbid"},{"type":"snippet","label":"Post-discharge review","text":"Post-discharge review:\\n\\nAdmission:\\n- Dates:\\n- Diagnoses:\\n- Procedures:\\n- Discharge medications (new/changed):\\n- Follow-up planned:\\n\\nReview today:\\n- Recovery progress:\\n- Symptoms \\u2014 concerning / improving:\\n- Pain control:\\n- Mobility / ADLs:\\n- Med compliance / side effects:\\n- Outstanding actions chased:\\n- Safety net advice:"}]},{"id":"repeat-meds","enabled":true,"label":"Repeat meds","kind":"info","patterns":["repeat prescription","repeat medication","repeat script","repeat meds","ran out","run out of","running out","out of my (?!mind|depth|comfort|control|league|way|system|element|own|head|life|hands|hair|sight|reach|price|budget)\\\\w+","reorder","re-order","refill","top.?up","more of my","need more of my","need my tablets","need my inhaler","need my medication","need a prescription","need my prescription","prescription request","order my medication","order my meds","medication review"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"snippet","label":"SMR template","text":"Structured Medication Review (SMR):\\n\\nPatient understanding:\\n- Knows why each med is prescribed:\\n- Adherence / compliance:\\n- Side effects experienced:\\n- Self-monitoring (BP, BG, peak flow):\\n\\nFor each medication:\\n- Indication still valid?\\n- Dose appropriate (renal/hepatic adjustment)?\\n- Duplications / interactions / cascades?\\n- Anticholinergic burden / falls risk?\\n- Recent monitoring done?\\n\\nDeprescribe candidates:\\n- PPI > 8 weeks without indication\\n- Long-term benzo / Z-drug\\n- Statin in extreme frailty / limited life expectancy\\n- Anti-hypertensives if postural hypotension\\n- Aspirin without clear secondary prevention indication\\n\\nAgreed plan:"}]},{"id":"fit-note","enabled":true,"label":"Fit note","kind":"info","patterns":["fit note","fitnote","sick note","sicknote","med[- ]?3","fitness for work","off work","note for work","doctors note","doctor's note","statement of fitness","unfit for work","time off work","signed off","sign me off","sick certificate"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"GOV.UK Med3 guidance","url":"https://www.gov.uk/government/publications/fit-note-guidance-for-healthcare-professionals"},{"type":"snippet","label":"Fit note template","text":"Med3 considerations:\\n\\n- Diagnosis (the condition affecting work):\\n- Functional limitations (what can / can't do):\\n- Duration: <3mo (any duration) / >3mo (max 3mo):\\n- 'Not fit' or 'May be fit' (consider phased return / amended duties / altered hours / workplace adaptations):\\n- Assessment date and end date:\\n- Comments / advice to employer:\\n\\nFor mental health:\\n- Avoid jargon \\u2014 concrete functional language\\n- Consider OH referral / IAPT signposting\\n\\nFor MSK:\\n- Active management plan\\n- Avoid bed rest > 1-2 days"}]},{"id":"menopause","enabled":true,"label":"Menopause/HRT","kind":"info","patterns":["menopaus","menopausal","perimenopaus","peri-menopausal","hot flush","hot flushes","hot flash","hot flashes","night sweat","HRT","hormone replacement","hormone replacement therapy","HRT patch","oestrogen","estrogen","oestrogen gel","vaginal dryness","Evorel","Oestrogel","Sandrena","Utrogestan","Elleste","Femoston","Tibolone","patches for menopause"],"regex":false,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"link","label":"NICE menopause (NG23)","url":"https://www.nice.org.uk/guidance/ng23"},{"type":"link","label":"British Menopause Society","url":"https://thebms.org.uk/"},{"type":"snippet","label":"HRT consultation","text":"Menopause / HRT consultation:\\n\\nSymptoms:\\n- Vasomotor (flushes, sweats, night sweats):\\n- Mood, sleep, cognition:\\n- GU: vaginal dryness, dyspareunia, urinary:\\n- Joint / muscle pain:\\n- Libido:\\n- Functional impact:\\n\\nHistory:\\n- LMP / cycle changes:\\n- Contraception still needed?\\n- Migraine with aura?\\n- VTE / clotting history (personal / family):\\n- Breast / endometrial / ovarian cancer history:\\n- BMI / smoking / alcohol:\\n- Cardiovascular risk:\\n- Liver disease:\\n- Current meds:\\n\\nDiscussion:\\n- Risk / benefit balance\\n- Options: sequential vs continuous combined; oestrogen-only if hysterectomy; transdermal preferred if VTE / migraine / hepatic / >60\\n- Vaginal oestrogen for GU symptoms (no extra systemic risk)\\n- Testosterone for low libido (off-label)\\n- Lifestyle, CBT for vasomotor\\n\\nPlan / review timeframe:"}]},{"id":"stroke-tia","enabled":true,"label":"Stroke/TIA","kind":"red","patterns":["face (is |was |has been |keeps )?droop\\\\w*","facial droop\\\\w*","drooping face","one side of (my )?face (is )?(numb|droop\\\\w*|drop\\\\w*|sag\\\\w*|weak)","mouth (is )?droop\\\\w*","smile (is|has gone) (lopsided|uneven|crooked)","can.?t smile","arm (drift|has gone (numb|weak|dead))","one arm (numb\\\\w*|weak\\\\w*|won.?t move|gone)","can.?t (lift|feel|move) (my )?arm","sudden (arm|leg|face) (weakness|numbness)","slurr\\\\w* (speech|words)","speech (is )?(slurred|unclear|jumbled|muddled)","can.?t (speak|get my words out)","sudden\\\\w* difficulty (speaking|talking)","stroke","TIA","transient ischaemic attack","mini.?stroke","funny turn (down|on) one side","went (numb|weak) down one side","sudden (loss of )?vision in one eye","can.?t (get (my )?words out|speak properly)","(lost|losing) (the ability|my ability) to (speak|talk)","both (my )?arms? (have )?(suddenly )?(gone )?(weak|numb|heavy)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"FAST pathway","text":"Suspected stroke (FAST: Face droop / Arm weakness / Speech / Time) with symptoms NOW or within hours \\u2192 999. Thrombolysis & thrombectomy are time-critical.\\n\\nResolved deficit (?TIA): high early stroke risk \\u2014 aspirin 300mg (unless contraindicated) + specialist TIA-clinic assessment within 24h (NICE NG128). Do NOT \\u201cwait and see\\u201d.\\n\\nMimics (hypo, migraine aura, Bell\\u2019s palsy) \\u2014 treat as stroke until assessed."},{"type":"link","label":"NICE NG128 (stroke & TIA)","url":"https://www.nice.org.uk/guidance/ng128"}]},{"id":"sepsis","enabled":true,"label":"Sepsis?","kind":"red","patterns":["sepsis","septic\\\\w*","(septicaemi|septicemi)\\\\w*","fever (and|with) (confus\\\\w*|drowsy|drowsiness|delirious|hard to wake|can.?t stay awake|unresponsive)","fever (and|with) (mottled|blotchy|grey|pale) skin","mottled skin","high (fever|temperature) (and|with) (rigors|violent shaking|uncontrollable shaking)","shaking (uncontrollably|violently) with (a )?(fever|temperature)","rigors","fever (and|with) (very fast|racing|pounding) (heart|pulse)","fever (and|with) (fast|rapid) breathing","fever (and|with) (not passing|no) urine","flu.?like (and|with) (collaps\\\\w*|can.?t get up|can.?t stand)","felt (the )?worst (i.?ve|i have) ever (felt|been) (and|with) (fever|temperature)","non.?blanching rash","(fever|temperature|burning up) (and|with) feel\\\\w* (absolutely )?(terrible|dreadful|awful)","(hot and cold|cold and hot) (sweats|shivers|all over)","(shaking|shivering) uncontrollably"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Sepsis screen","text":"Could this be sepsis? (NICE NG51 risk stratification.)\\n\\nHigh-risk features \\u2192 999 / immediate F2F:\\n\\u2022 New altered mental state / hard to rouse\\n\\u2022 Mottled, ashen or cyanosed skin; non-blanching rash\\n\\u2022 RR \\u226525, new O\\u2082 requirement\\n\\u2022 HR \\u2265130, SBP \\u226490\\n\\u2022 Not passed urine in 18h\\n\\u2022 Rigors / uncontrollable shaking with fever\\n\\nRemember NEUTROPENIC sepsis: chemotherapy in last 6 weeks + fever = emergency admission, no delays."},{"type":"link","label":"NICE NG51 (sepsis)","url":"https://www.nice.org.uk/guidance/ng51"}]},{"id":"anaphylaxis","enabled":true,"label":"Anaphylaxis?","kind":"red","patterns":["anaphyla\\\\w*","severe allergic reaction","allergic (reaction )?(getting|got) (worse|much worse) (quickly|fast)","(swelling|swollen) (of (my )?)?(throat|tongue|lips|mouth|face)","throat (is )?(closing|tight\\\\w*|swelling)","(can.?t|hard to|struggling to) (breathe|swallow) (after|since) (eating|the sting|the injection|antibiotic\\\\w*|penicillin)","stridor","wheez\\\\w* (after eating|after the sting|with swelling)","hives (and|with) (swelling|breathing|face|throat)","widespread (hives|urticaria|welts) (and|with) (swelling|breathing|face)","lips (have )?(swollen|swelled) up","face (has )?(swollen|puffed) up (suddenly|fast|quickly)","went (pale|clammy|floppy) after (eating|the sting|injection)","reaction (after|to) (a |the )?(bee|wasp) sting","reaction (after|to) (eating )?(nuts|peanut\\\\w*|shellfish)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Anaphylaxis pathway","text":"Airway/breathing/circulation involvement with an allergic trigger = anaphylaxis.\\n\\n\\u2022 999 immediately\\n\\u2022 IM adrenaline 1:1000, 500 micrograms (adult) anterolateral thigh; repeat after 5 min if no improvement\\n\\u2022 Lie flat, raise legs (sit up only if breathing difficulty); do NOT stand the patient up\\n\\u2022 After emergency treatment: ensure 2 adrenaline auto-injectors carried + specialist allergy-clinic referral\\n\\nRash/itch alone without airway, breathing or circulation features is not anaphylaxis \\u2014 antihistamine + safety-net."},{"type":"link","label":"Resus Council UK anaphylaxis","url":"https://www.resus.org.uk/library/additional-guidance/guidance-anaphylaxis"}]},{"id":"meningitis","enabled":true,"label":"Meningitis?","kind":"red","patterns":["meningitis","meningococ\\\\w*","non.?blanch\\\\w* rash","rash (that )?(doesn.?t|does not|won.?t|will not) (fade|blanch|go) (when |if )?(pressed|i press|under (a |the )?glass)","glass test","tumbler test","petechia\\\\w*","petechial rash","purple (spots|rash|blotches)","spots that (don.?t|won.?t) fade","fever (and|with) (neck stiffness|stiff neck)","(stiff neck|neck stiffness) (and|with) (fever|rash|headache|light)","can.?t (bend|move) (my )?neck forward","fever (and|with) (photophobia|light hurt\\\\w*|bright light)","light (hurts|is hurting) (my )?eyes","severe headache (and|with) (fever|neck stiffness|rash|vomiting)","fever (and|with) (rash|confus\\\\w*|drowsy|very sleepy)","bruis\\\\w*.?like rash (with|and) fever","(fever|temperature) (and|with) (a )?(purple|non.?blanching|blotchy) (rash|spots)","(rash|spots) (that )?(doesn.?t|don.?t|won.?t) (fade|go away|disappear) (under|with) (a )?glass"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Meningitis / meningococcal","text":"Fever + any of: non-blanching/petechial rash, neck stiffness, photophobia, new confusion or drowsiness \\u2192 999 (NICE NG240, 2024).\\n\\n\\u2022 Non-blanching rash + fever = meningococcal sepsis until proven otherwise (may occur WITHOUT meningitis)\\n\\u2022 Give IM/IV benzylpenicillin (or ceftriaxone) pre-hospital ONLY if transfer will be delayed \\u2014 never delay transfer to give it\\n\\u2022 Glass/tumbler test is the patient-facing check for blanching"},{"type":"link","label":"NICE NG240 (meningitis & meningococcal)","url":"https://www.nice.org.uk/guidance/ng240"}]},{"id":"aaa","enabled":true,"label":"AAA/dissection?","kind":"red","patterns":["aortic aneurysm","AAA","aortic dissection","sudden (severe )?tearing (pain )?(in (my )?)?(back|tummy|abdomen|chest)","tearing (sensation|pain) (in (my )?)?(back|abdomen|chest)","(ripping|tearing|splitting) pain (in (my )?)?(back|abdomen|chest)","felt (something|a) (tear|rip) (inside|in my (back|tummy|chest))","sudden severe (back|abdominal|tummy) pain (and|with) (faint\\\\w*|collaps\\\\w*|pale|sweat\\\\w*|clammy|dizzy)","(back|abdominal) pain (radiating|going|spreading) (down|into) (both )?(legs|groin)","pulsating (lump|mass) in (my )?(tummy|abdomen|belly)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Vascular emergency","text":"Sudden tearing/ripping back, abdominal or chest pain \\u00b1 collapse, pallor, sweating, or a pulsatile abdominal mass = ruptured AAA / aortic dissection until proven otherwise.\\n\\n\\u2022 999 \\u2014 do not bring to surgery for assessment\\n\\u2022 Highest suspicion: older men, smokers, hypertension, known aneurysm/FH\\n\\u2022 Mimics renal colic in the elderly \\u2014 first presentation of \\u201crenal colic\\u201d over 60 should raise AAA"}]},{"id":"testicular-torsion","enabled":true,"label":"Testicular torsion?","kind":"red","patterns":["testicular torsion","torsion of (the )?(testicle|testis)","sudden (severe )?pain in (my )?(testicle|testis|ball|balls|scrotum)","(testicle|testis|ball|scrotum) (pain|swelling) (came on )?(suddenly|out of nowhere)","(severe|sudden|acute|unbearable) (testicular|scrotal) pain","woke up with (testicular|scrotal|groin) pain","(testicle|testis) (is )?(swollen|riding high|hard|tender) (and |with )?(pain|painful|vomiting|sick)","sudden severe groin pain (and|with) (swelling|vomiting|nausea)","boy (with|has) (testicular|scrotal|groin) pain"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Surgical emergency","text":"Sudden severe unilateral testicular pain \\u00b1 nausea/vomiting = torsion until proven otherwise \\u2014 the salvage window is ~6 hours.\\n\\n\\u2022 Same-day urology / ED NOW \\u2014 do not arrange routine review or wait for swelling to settle\\n\\u2022 Most common 12\\u201325y but any age\\n\\u2022 Do not rely on ultrasound availability to decide \\u2014 clinical suspicion is enough for referral"},{"type":"link","label":"NICE CKS scrotal pain & swelling","url":"https://cks.nice.org.uk/topics/scrotal-pain-swelling/"}]},{"id":"pe-dvt","enabled":true,"label":"PE/DVT?","kind":"red","patterns":["pulmonary embolism","PE","DVT","deep vein thrombosis","blood clot in (my )?(leg|lung\\\\w*|calf)","one (leg|calf) (swollen|bigger|hot|red|hard)","(calf|leg) (swelling|swollen) (and|with) (pain|hot|red|warm|hard|tender)","(calf|leg) (pain|tender\\\\w*) (and|with) (swelling|swollen|hot|red|warm)","sudden(ly)? (short of breath|breathless\\\\w*|out of breath)","pleuritic chest pain","chest pain (when|worse) (i )?breath\\\\w* in","pain (when|on) breathing in (and|with) (breathless\\\\w*|leg)","breathless\\\\w* (and|with) (leg (swelling|pain)|chest pain)","(recent|after) (surgery|operation|long flight|long.?haul) (and|with) (leg (swelling|pain)|breathless\\\\w*)","(leg|foot|arm|hand) (gone|turned|is) (cold|white|pale|mottled|blue) (and |with )?(numb|painful|can.?t move)","no pulse in (my )?(leg|foot|arm)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"VTE / limb-ischaemia pathway","text":"Suspected PE: acute breathlessness \\u00b1 pleuritic pain \\u00b1 haemoptysis. Haemodynamic compromise or hypoxia \\u2192 999; otherwise same-day assessment (Wells \\u2192 D-dimer / CTPA) per NICE NG158.\\n\\nSuspected DVT: unilateral leg swelling/heat/tenderness \\u2192 same-day Wells scoring + proximal leg ultrasound pathway. Do not massage the leg.\\n\\nCOLD, PALE, PULSELESS limb (6 P\\u2019s) = acute limb ischaemia \\u2192 999 / vascular surgery \\u2014 hours matter."},{"type":"snippet","label":"Wells score (DVT)","text":"Wells DVT (1 point each unless stated):\\n- Active cancer:\\n- Paralysis / recent plaster immobilisation:\\n- Bed >3d or major surgery <12wk:\\n- Tenderness along deep venous system:\\n- Entire leg swollen:\\n- Calf >3cm larger than other side:\\n- Pitting oedema (symptomatic leg):\\n- Collateral superficial veins:\\n- Previous DVT:\\n- Alternative diagnosis at least as likely: -2\\n\\n\\u22652 DVT likely \\u2192 USS within 4h (or anticoagulate + USS within 24h)\\n\\u22641 DVT unlikely \\u2192 D-dimer"},{"type":"link","label":"NICE NG158 (VTE diagnosis)","url":"https://www.nice.org.uk/guidance/ng158"}]},{"id":"acute-severe-abdomen","enabled":true,"label":"Acute abdomen?","kind":"red","patterns":["rigid (abdomen|tummy|belly)","board.?like (abdomen|tummy|belly)","(abdomen|tummy|belly) (is )?(rigid|hard as a board)","worst (ever|of my life) (stomach|tummy|belly|abdominal) pain","excruciating (abdominal|tummy|belly|stomach) pain","(can.?t|won.?t) (move|straighten up) (because of|with) (the )?(tummy|stomach|abdominal) pain","peritonitis","perforat\\\\w* (bowel|ulcer|appendix|stomach)","(acute )?pancreatitis","severe (epigastric|upper (tummy|abdominal)) pain (radiating|going) (through|to) (my )?back","appendicitis","sudden severe (tummy|abdominal|belly) pain (and|with) (vomiting|fever|can.?t move)","guarding (and|with) rebound"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Surgical abdomen","text":"Peritonitic features (rigid/board-like abdomen, rebound, guarding, pain on movement/coughing, lying still) \\u2192 same-day surgical assessment / 999 if shocked.\\n\\nConsider: perforation, pancreatitis, ischaemic bowel (pain out of proportion), appendicitis, ruptured ectopic.\\n\\nWomen of reproductive age with acute lower abdominal pain: ALWAYS pregnancy test (?ectopic)."}]},{"id":"fever-infant","enabled":true,"label":"Fever <3m","kind":"red","patterns":["(baby|newborn|infant) (has|with|has got|running) (a |high )?(fever|temperature)","(baby|newborn|infant) (is )?(burning up|really hot|very hot|boiling)","(baby|newborn)(.?s)? temperature (of |is )?(3[8-9]|4\\\\d|over 38)","temperature (won.?t|will not) come down","under (3|three) months (old )?(and|with) (a )?(fever|temperature|hot)","\\\\d+ (week|month) old (with|and|has) (a )?(fever|temperature)","newborn (is |feels )?(hot|feverish)","(baby|infant) (fever|temperature) (and|with) (not feeding|poor feeding|floppy|drowsy|lethargic)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"NICE traffic light","text":"Temperature \\u226538\\u00b0C in an infant UNDER 3 MONTHS is a RED traffic-light feature (NICE NG143) \\u2192 same-day paediatric assessment (usually ED), regardless of how well the baby looks.\\n\\n3\\u20136 months \\u226539\\u00b0C = amber minimum.\\n\\nAny age + fever with: drowsy/floppy, poor feeding, non-blanching rash, grunting/recession, reduced wet nappies \\u2192 escalate same-day."},{"type":"link","label":"NICE NG143 (fever under 5s)","url":"https://www.nice.org.uk/guidance/ng143"}]},{"id":"resp-distress-child","enabled":true,"label":"Child breathing difficulty","kind":"red","patterns":["(drawing|sucking) (breath )?in (funny|hard)","(ribs|tummy|chest) (are |is |keep |keeps )?(going|sucking|pulling) in (when|as|with) (he |she |they |baby |every )?breath\\\\w*","recession (when|while) breathing","retractions","(nostrils|nose) flaring","grunting (when |while )?breath\\\\w*","baby (is )?grunting","stridor\\\\w*","(barky|barking|seal.?like) cough","croup","bronchiolitis","(blue|grey|dusky) (lips|face|tongue|around (the |his |her )?mouth)","cyanos\\\\w*","breathing (really|very) (fast|hard|quickly)","(can.?t|struggling to) (catch (his|her|their) breath|breathe at all|breathe properly)","working (really )?hard to breathe"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Paediatric respiratory distress","text":"Signs of increased work of breathing in a child \\u2014 recession (ribs/tummy sucking in), grunting, nasal flaring, stridor at rest, cyanosis/blue lips, too breathless to feed or talk \\u2192 same-day assessment; 999 if stridor at rest, cyanosis, exhaustion or drowsiness.\\n\\nCroup: barky cough + stridor \\u2014 oral dexamethasone if more than mild.\\nBronchiolitis (<2y): escalate if feeding <50% of normal, apnoeas, marked recession, sats concern."},{"type":"link","label":"NICE NG143 (fever under 5s)","url":"https://www.nice.org.uk/guidance/ng143"}]},{"id":"seizure","enabled":true,"label":"Seizure","kind":"red","patterns":["febrile (convulsion|seizure)\\\\w*","(had|having) a (fit|seizure|convulsion)","(fit|seizure|convulsion) (with|during|from) (a )?(fever|temperature)","first (ever )?(fit|seizure|convulsion)","(shaking|jerking) (uncontrollably|all over) (with|and) (fever|temperature|eyes rolled)","eyes (rolled|rolling) back (and|with) (shaking|jerking|stiff)","(fitting|seizing|convulsing) (now|for|lasting) (\\\\d+ )?(minutes|seconds)","tonic.?clonic","limbs (jerking|stiffened|went stiff)","won.?t (come round|wake up) after (a |the )?(fit|seizure)","seizure","convulsion\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Seizure pathway","text":"\\u2022 Seizure ongoing >5 min, repeated seizures, or not recovering consciousness \\u2192 999 (status epilepticus)\\n\\u2022 FIRST-ever seizure (any age) \\u2192 same-day assessment + urgent first-fit clinic referral; advise not to drive (DVLA)\\n\\u2022 Febrile convulsion (6m\\u20135y): usually benign if simple (<15 min, generalised, full recovery) but first episode warrants same-day review and exclusion of meningitis/serious infection\\n\\u2022 Known epilepsy with typical self-terminated seizure \\u2192 prompt review, check triggers/adherence"},{"type":"link","label":"NICE CKS febrile seizure","url":"https://cks.nice.org.uk/topics/febrile-seizure/"}]},{"id":"ectopic-miscarriage","enabled":true,"label":"Pregnancy bleeding/pain","kind":"red","patterns":["ectopic( pregnancy)?","miscarr\\\\w*","(pregnan\\\\w*|expecting) (and|with) (bleed\\\\w*|spotting|blood|cramp\\\\w*|pain)","bleed\\\\w* (and|while|when) (pregnan\\\\w*|expecting)","(spotting|bleeding|blood) in (early )?pregnancy","(pregnan\\\\w*|expecting) (and|with) (one.?sided|shoulder.?tip|shoulder) pain","(severe|bad) (cramp\\\\w*|period.?like pain|tummy pain) (and|while) pregnan\\\\w*","losing (the |my )?(baby|pregnancy)","positive (pregnancy )?test (and|with) (bleed\\\\w*|pain|cramp\\\\w*)","collaps\\\\w* (and|while|when) pregnan\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Early pregnancy pathway","text":"Pain and/or bleeding in (possible) pregnancy \\u2192 same-day Early Pregnancy Unit assessment.\\n\\n\\u2022 Ectopic can present with PAIN BEFORE any bleeding \\u2014 one-sided pain, shoulder-tip pain, dizziness/collapse in early pregnancy = ruptured ectopic until proven otherwise \\u2192 999\\n\\u2022 Always pregnancy-test women of reproductive age with abdominal pain\\n\\u2022 Anti-D consideration for surgical management of miscarriage"},{"type":"link","label":"NICE NG126 (ectopic & miscarriage)","url":"https://www.nice.org.uk/guidance/ng126"}]},{"id":"reduced-fetal-movements","enabled":true,"label":"Reduced fetal movements","kind":"red","patterns":["baby (not|isn.?t|stopped) (moving|kicking)( as much| much| at all)?","baby (is )?(quieter|less active|still|not as active)( than usual)?","(fewer|less|reduced|decreased) (baby |fetal |foetal )?(movements|kicks)","(no|hardly any|barely any) (kicks|movements)","(haven.?t|not) felt (the )?baby (move|kick)","movements (have )?(slowed (down|right down)|reduced|dropped off|stopped)","(worried|concerned) (baby|movements) (not moving|reduced|quiet)","not as much movement"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"RFM pathway (RCOG GTG57)","text":"Any maternal perception of reduced fetal movements (after ~24 weeks) \\u2192 signpost DIRECTLY to maternity triage / day assessment unit NOW for CTG \\u00b1 ultrasound.\\n\\n\\u2022 Do NOT book a GP appointment or advise \\u201cwait and count kicks\\u201d\\n\\u2022 Never reassure by phone without fetal assessment\\n\\u2022 Repeat episodes still warrant assessment every time"},{"type":"link","label":"RCOG GTG57 (reduced fetal movements)","url":"https://www.rcog.org.uk/guidance/browse-all-guidance/green-top-guidelines/reduced-fetal-movements-green-top-guideline-no-57/"}]},{"id":"pre-eclampsia","enabled":true,"label":"Pre-eclampsia?","kind":"red","patterns":["pre.?eclampsia","(pregnan\\\\w*|expecting) (and|with) (a |really |very )?(severe|bad|terrible|awful|pounding) headache","(severe|bad) headache (and|while|when) pregnan\\\\w*","(blurred|blurry) vision (and|while|when) pregnan\\\\w*","(seeing )?(flashing lights|spots|stars) (and|while|when) pregnan\\\\w*","(pregnan\\\\w*|expecting) (and|with) (visual|vision) (changes|disturbance)","(pain|hurting) (under|below) (my )?ribs (and|while|when) pregnan\\\\w*","(upper (tummy|abdominal)|epigastric) pain (and|while|when) pregnan\\\\w*","(sudden|severe) swelling (of (my )?)?(face|hands) (and|while|when) pregnan\\\\w*","(pregnan\\\\w*|expecting) (and|with) (headache (and|with) (vision|swelling)|swelling (and|with) headache)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Pre-eclampsia pathway","text":"Pregnancy (especially >20 weeks) + severe/persistent headache, visual disturbance, epigastric/RUQ pain, or sudden swelling of face/hands \\u2192 same-day maternity assessment for BP + urine protein.\\n\\n\\u2022 Can progress rapidly to eclampsia/HELLP\\n\\u2022 Seizure, severe hypertension or reduced consciousness \\u2192 999\\n\\u2022 Direct to maternity triage, not a routine GP slot"},{"type":"link","label":"NICE NG133 (hypertension in pregnancy)","url":"https://www.nice.org.uk/guidance/ng133"}]},{"id":"sudden-vision-loss","enabled":true,"label":"Sudden visual loss","kind":"red","patterns":["sudden (loss of )?(vision|sight)","(lost|losing) (my )?(vision|sight) (suddenly|in one eye|in my (left|right) eye)","curtain (coming|coming down|over) (my |one )?(eye|vision)","(shadow|curtain) (across|over) (my )?vision","new floaters","(shower of|sudden|lots of new) (floaters|flashes|flashing lights)","(flashes|flashing lights) (and|with) (new )?floaters","cobwebs (in|across) (my )?vision","sudden (blurred|blurry) vision in one eye","(giant cell arteritis|GCA)","(temporal|scalp) (pain|tenderness) (and|with) (jaw|vision|headache)","jaw (pain|ache\\\\w*|claudication) (when|while|on) (chewing|eating)","amaurosis","retinal detach\\\\w*","black (spot|patch) (in|across) (my )?vision"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Sight-threatening pathway","text":"\\u2022 Sudden painless loss of vision in one eye \\u2192 same-day emergency ophthalmology (?CRAO/CRVO/retinal detachment/vitreous haemorrhage)\\n\\u2022 Curtain/shadow over vision, or flashes + NEW floaters \\u2192 same-day (?retinal detachment/tear)\\n\\u2022 GCA: age >50 + new headache, scalp tenderness, jaw claudication \\u00b1 visual symptoms \\u2192 SAME-DAY high-dose steroid + urgent ophthalmology/rheumatology + ESR/CRP \\u2014 the second eye is at risk\\n\\u2022 Painful red eye + visual loss \\u2192 ?acute angle-closure \\u2192 emergency"},{"type":"link","label":"NICE CKS giant cell arteritis","url":"https://cks.nice.org.uk/topics/giant-cell-arteritis/"}]},{"id":"septic-arthritis","enabled":true,"label":"Hot swollen joint","kind":"red","patterns":["(hot|red.?hot) (and )?swollen joint","(swollen|huge) (and |very )?(hot|red) (knee|hip|shoulder|elbow|wrist|ankle|joint)","(knee|hip|shoulder|ankle|wrist|elbow|joint) (is )?(red.?hot|red and (hot|swollen)|hot and swollen)","joint (swelled|swelled up|swollen) (overnight|suddenly|very quickly)","(can.?t|unable to) (move|bend|weight bear on) (my )?(knee|hip|shoulder|joint) (and|with) (hot|swollen|red|fever)","acutely (swollen|hot|painful) joint","(hot|swollen) joint (and|with) (fever|feeling unwell|temperature)","septic arthritis"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Septic arthritis pathway","text":"An acutely hot, swollen, very painful joint (especially single joint \\u00b1 fever) = septic arthritis until proven otherwise.\\n\\n\\u2022 Same-day orthopaedics / ED for joint aspiration BEFORE antibiotics\\n\\u2022 An untreated septic joint is destroyed within days\\n\\u2022 Prosthetic joint, immunosuppression, recent injection = even lower threshold\\n\\u2022 Do not assume gout if febrile or systemically unwell"}]},{"id":"psychosis","enabled":true,"label":"Psychosis?","kind":"red","patterns":["hearing voices","voices (in my head|telling me|commenting)","(seeing|hearing) (things|stuff) (that aren.?t|not) (there|real)","hallucinat\\\\w*","visual hallucination\\\\w*","delusion\\\\w*","(psychosis|psychotic)","first episode psychosis","(people|they|the government|neighbours) (are )?(out to get|spying on|poisoning|watching) me","thoughts (being )?(put|inserted) (in|into) my (head|mind)","my (mind|thoughts) (are )?being controlled","paranoid (and|with) (voices|hallucinat\\\\w*|not safe|they.?re after me)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":"safeguarding","builtin":true,"actions":[{"type":"note","label":"First-episode psychosis","text":"Hallucinations, delusions, thought disorder or marked paranoia \\u2192 urgent referral to Early Intervention in Psychosis (EIP) \\u2014 NICE: assessment started within 2 weeks; same-day crisis-team input if risk.\\n\\n\\u2022 Command hallucinations / risk to self or others \\u2192 crisis pathway now\\n\\u2022 Exclude organic causes (delirium, substances) \\u2014 acute confusion in the elderly is delirium, not psychosis\\n\\u2022 POSTPARTUM PSYCHOSIS = psychiatric emergency \\u2192 same-day perinatal MH / crisis team"},{"type":"link","label":"NICE CKS psychosis","url":"https://cks.nice.org.uk/topics/psychosis-schizophrenia/"}]},{"id":"haematuria-2ww","enabled":true,"label":"Blood in urine","kind":"amber","patterns":["blood in (my )?(urine|wee|pee)","blood when (i )?(wee|pee|pass (water|urine))","ha?ematuria\\\\w*","(red|pink|cola.?colou?red|rusty) (urine|wee|pee)","(urine|wee|pee) (is|looks|has gone) (red|pink|bloody|like blood)","passing (blood|red water|bloody (water|urine))","visible blood (in|when passing) (urine|wee|pee)","bleeding when (i )?(wee|pee|urinat\\\\w*)","blood clots in (my )?(urine|wee)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"2WW pathway","text":"NICE NG12: visible haematuria aged \\u226545 (unexplained, or persisting/recurring after UTI treatment) \\u2192 2WW urology. Aged \\u226560 with unexplained non-visible haematuria + dysuria or raised WCC \\u2192 2WW.\\n\\nUnder the age cutoffs: still assess (UTI, stones, anticoagulants) and safety-net \\u2014 haematuria is never normal.\\n\\nExclude/treat UTI but do not let an infection label close the loop without confirming resolution."},{"type":"link","label":"NICE NG12 urological cancers","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#urological-cancers"}]},{"id":"postmenopausal-bleeding","enabled":true,"label":"Post-menopausal bleeding","kind":"amber","patterns":["post.?menopausal bleed\\\\w*","bleeding (after|since) (the |my )?menopause","(vaginal )?bleed\\\\w* (after|since) (my )?periods (stopped|ended|finished)","spotting (after|since) (the )?menopause","(haven.?t|not) had a period (for|in) (\\\\w+ )?(years|months) (and|but) (now )?(i.?m |i am )?(bleed\\\\w*|spotting|blood)","brown discharge (after|since) menopause","bleeding (and|but) (i.?m|i am) post.?menopausal"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"2WW pathway","text":"NICE NG12: post-menopausal bleeding (\\u226512 months after last period) in women \\u226555 \\u2192 2WW gynaecology (transvaginal USS endometrial assessment); strongly consider for younger post-menopausal women too.\\n\\n\\u2022 Includes spotting, staining and blood-streaked discharge\\n\\u2022 HRT breakthrough bleeding still needs assessment if unscheduled/persistent"},{"type":"link","label":"NICE NG12 gynaecological cancers","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#gynaecological-cancers"}]},{"id":"breast-changes-2ww","enabled":true,"label":"Breast lump/change","kind":"amber","patterns":["(lump|hard lump|thickening) (in|on) (my )?(breast|boob|boobs)","breast lump\\\\w*","boob lump\\\\w*","one breast (bigger|larger|different|changed)","breast (has |is )?(changed|dimpl\\\\w*|pucker\\\\w*)","(skin )?(dimpl\\\\w*|pucker\\\\w*|orange.?peel) (on|in) (my )?(breast|boob)","nipple (discharge|bleed\\\\w*|inver\\\\w*|retract\\\\w*|pulled in)","(scaly|crusty|eczema|rash) (on )?(my )?(nipple|areola)","inverted nipple"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"2WW pathway","text":"NICE NG12 breast referral:\\n\\u2022 Aged \\u226530 with an unexplained breast lump \\u2192 2WW\\n\\u2022 Aged \\u226550 with nipple discharge, retraction or other concerning unilateral nipple change \\u2192 2WW\\n\\u2022 Skin changes suggestive of cancer (dimpling, peau d\\u2019orange, nipple eczema) or axillary lump \\u2192 refer\\n\\u2022 Under 30 with a lump: non-urgent referral/assessment, lower threshold if FH\\n\\nIf the story is feeding-related (mastitis), treat \\u2014 but a lump persisting after mastitis resolves needs 2WW."},{"type":"link","label":"NICE NG12 breast cancer","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#breast-cancer"}]},{"id":"dysphagia-2ww","enabled":true,"label":"Swallowing difficulty","kind":"amber","patterns":["food (gets |is |keeps |keeps getting |getting )?(sticking|stuck) (in (my )?)?(throat|chest|food pipe|gullet|oesophagus)","something stuck (in my throat|when i swallow)","difficulty swallowing (food|solids|getting worse|for weeks)","swallowing (is )?(getting (worse|harder)|harder)","can.?t swallow (food|solids|properly)","food (won.?t |doesn.?t )?go down","odynophagia","dysphagia\\\\w*","hoarse\\\\w* (for|lasting|more than) (\\\\d+ )?(week|month)\\\\w*","(persistent|chronic) hoarse\\\\w*","voice (has been )?(hoarse|rough|gone) for (weeks|ages|a month)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"2WW pathway","text":"NICE NG12:\\n\\u2022 Dysphagia (food sticking, progressive difficulty swallowing) at ANY age \\u2192 2WW upper-GI endoscopy\\n\\u2022 Persistent hoarseness >3 weeks (especially >45y or smoker) \\u2192 2WW ENT + consider CXR\\n\\nAcute painful swallow with sore throat/tonsillitis is different \\u2014 see sore-throat rule. Difficulty swallowing SALIVA / drooling \\u2192 same-day (?epiglottitis/quinsy)."},{"type":"link","label":"NICE NG12 upper GI cancers","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#upper-gastrointestinal-tract-cancers"}]},{"id":"dka-hhs","enabled":true,"label":"DKA / HHS","kind":"red","patterns":["diabetic ketoacidosis","DKA","HHS","hyperosmolar","ketones (high|raised|in my (blood|urine|wee))","fruity (smelling )?breath","acetone breath","diabetes (and|with) (vomiting|can.?t keep (fluids|anything) down|confus\\\\w*)","(high|raised) ketones (and|with) (vomiting|unwell|drowsy|breathless)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Diabetic emergency","text":"Suspected DKA or HHS \\u2192 same-day / 999.\\n\\n\\u2022 DKA (type 1): vomiting, abdominal pain, raised ketones, deep/fast (Kussmaul) breathing, fruity breath, drowsiness\\n\\u2022 HHS (elderly type 2): very high glucose + marked dehydration + confusion, usually without significant ketones\\n\\nAction:\\n\\u2022 Check capillary glucose AND ketones now if able\\n\\u2022 Capillary ketones \\u22653.0 mmol/L (or urine ketones ++), or vomiting and unable to keep fluids down \\u2192 emergency admission\\n\\u2022 NEVER omit insulin - arrange immediate transfer"}]},{"id":"diabetes","enabled":true,"label":"Diabetes problem","kind":"amber","patterns":["(hyperglycaemi|hyperglycemi)\\\\w*","(hypoglycaemi|hypoglycemi)\\\\w*","hypo","blood sugars? (too high|very high|sky high|dangerously high|too low|very low|in the \\\\d+s)","blood sugars? (won.?t come down|keep dropping|all over the place)","(keep having|frequent|lots of) hypos","sick day rules","insulin (not working|isn.?t working|won.?t bring (it|sugars) down)","diabetes (out of control|not controlled|poorly controlled)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Escalation thresholds","text":"RED FLAGS \\u2192 same-day / 999:\\n\\u2022 ?DKA (esp. type 1): vomiting, abdominal pain, ketones, deep/fast breathing, fruity breath, drowsiness\\n\\u2022 ?HHS (esp. elderly type 2): very high glucose + dehydration + confusion\\n\\u2022 Severe hypo (needed help / unconscious / seizure) \\u2192 999; IM glucagon if available\\n\\u2022 Vomiting and cannot keep fluids down \\u2192 same-day\\n\\nSick-day rules: NEVER stop insulin; check glucose & ketones 2\\u20134-hourly; keep drinking; ketones rising or persistent vomiting \\u2192 urgent review.\\n\\nRoutine \\u201csugars running high\\u201d without red flags \\u2192 prompt clinical review/titration, not emergency."},{"type":"link","label":"NICE CKS diabetes","url":"https://cks.nice.org.uk/topics/diabetes-type-2/"}]},{"id":"dehydration-child","enabled":true,"label":"Child dehydration?","kind":"amber","patterns":["(no|hasn.?t had a|dry) (wet )?nappy (for|in) (\\\\d+ )?(hours|day)","hasn.?t (wee.?d|passed urine) (for|in) (\\\\d+ )?(hours|day)","(baby|she|he) (won.?t|not) (drink|feed|take (a |the )?(bottle|breast|milk|feed))","not feeding (and|with) (lethargic|drowsy|floppy|sunken)","dry (mouth|lips|tongue) (and|with) (not (drinking|feeding)|lethargic|drowsy)","sunken (eyes|fontanelle|soft spot)","fontanelle (sunken|bulging)","no (wet )?nappies","not (making|producing) tears","floppy (and|with) (not (drinking|feeding)|lethargic)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Dehydration assessment","text":"Concerning: \\u226550% fewer wet nappies, no tears, dry mouth, sunken eyes/fontanelle, lethargy, not tolerating fluids \\u2192 same-day assessment.\\n\\nRED (\\u2192 999/ED): mottled, cold extremities, cap refill >2s, very drowsy/floppy, no urine >12\\u201324h, persistent bilious vomiting.\\n\\nMild D&V tolerating ORS \\u2192 small frequent fluids + strict safety-net. Bulging fontanelle = different emergency (?meningitis)."}]},{"id":"vomiting-baby","enabled":true,"label":"Infant vomiting","kind":"amber","patterns":["projectile vomit\\\\w*","bringing (everything|every feed) (back )?up","vomiting (every|after every) feed","won.?t keep (a |any )?(feed|milk|bottle) down","(green|bilious|bile.?stained) vomit\\\\w*","vomiting (green|bile)","keeps being sick (and|with) (not feeding|lethargic|drowsy)","can.?t keep (anything|fluids|milk) down","baby (sick|vomiting) (and|with) (lethargic|floppy|drowsy|swollen tummy)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Infant vomiting red flags","text":"\\u2022 GREEN/BILIOUS vomiting in an infant = intestinal obstruction (?malrotation/volvulus) until proven otherwise \\u2192 SAME-DAY surgical/ED \\u2014 this is an emergency\\n\\u2022 Projectile vomiting in a 2\\u20138-week-old, hungry after, weight faltering \\u2192 ?pyloric stenosis \\u2192 same-day referral\\n\\u2022 Vomiting + drowsy/floppy/bulging fontanelle \\u2192 ?meningitis/raised ICP \\u2192 emergency\\n\\u2022 Effortless small possets in a well, gaining baby = reflux \\u2014 reassure + safety-net"}]},{"id":"head-injury","enabled":true,"label":"Head injury","kind":"amber","patterns":["(hit|bumped|banged|knocked|whacked) (my |his |her |their |the )?head","head (injury|trauma)","fell (and|then) (hit|banged|knocked) (my|his|her|their|the) head","(bang|blow|knock) (on|to) the head","concuss\\\\w*","(lost consciousness|knocked out|passed out|blacked out) (after|when|from) (the |a )?(fall|hit|blow)","knocked (out|unconscious)","(vomit\\\\w*|drowsy|confus\\\\w*|sleepy|not right) (after|since) (hitting|banging) (my |his |her )?head","clear fluid (from|leaking from) (my |his |her )?(ear|nose)","won.?t (wake up|stay awake) after (hitting|banging|the bang on) (his |her |their )?head","on (blood thinners|warfarin|apixaban|rivaroxaban|edoxaban|dabigatran|anticoagulant\\\\w*) (and|after) (hit\\\\w*|bang\\\\w*|fell)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"NG232 CT criteria","text":"CT head WITHIN 1 HOUR (\\u2192 ED now) if any: GCS <13 initially or <15 at 2h; suspected open/depressed or basal skull fracture (CSF leak, panda eyes, Battle\\u2019s sign); post-traumatic seizure; focal neurology; >1 episode of vomiting.\\n\\nON ANTICOAGULANT (warfarin/DOAC) or with bleeding disorder: CT within 8h after ANY head injury, even if entirely well \\u2014 send to ED.\\n\\nLOC or amnesia + (age \\u226565 / dangerous mechanism / clotting issue) \\u2192 CT within 8h.\\n\\nChildren: lower threshold; <1y with any bruise/swelling on head \\u2192 assess; consider NAI if mechanism inconsistent."},{"type":"link","label":"NICE NG232 (head injury)","url":"https://www.nice.org.uk/guidance/ng232"}]},{"id":"acute-limp-child","enabled":true,"label":"Limping child","kind":"amber","patterns":["(child|toddler|boy|girl|son|daughter|he|she) (is )?limping","limping (and|with) (fever|temperature|hot|swollen|won.?t walk)","won.?t (put weight on|walk on|stand on) (his|her|their|the) (leg|foot|knee|hip)","refusing to (walk|weight bear|stand)","not (weight.?bearing|bearing weight)","woke up limping","(hot|swollen|red) (knee|hip|ankle|leg) (and|with) (limp\\\\w*|fever|won.?t walk)","sudden (onset )?limp"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Limping child pathway","text":"Limp + fever or systemically unwell = septic arthritis/osteomyelitis until proven otherwise \\u2192 same-day paediatric/ortho assessment (bloods + imaging).\\n\\n\\u2022 Non-weight-bearing at any age \\u2192 same-day (fracture, septic hip)\\n\\u2022 Child <3y with a limp \\u2192 same-day assessment (and consider NAI)\\n\\u2022 Adolescent with hip/knee pain + limp \\u2192 ?SUFE \\u2192 urgent\\n\\u2022 Transient synovitis is a diagnosis of exclusion"},{"type":"link","label":"NICE CKS acute childhood limp","url":"https://cks.nice.org.uk/topics/acute-childhood-limp/"}]},{"id":"neonatal-jaundice","enabled":true,"label":"Newborn jaundice","kind":"amber","patterns":["(baby|newborn) (is|looks|has gone|going) (very |really )?yellow","jaundice\\\\w* (in (my |the )?)?(baby|newborn)","(baby|newborn).?s? (skin|eyes|sclera) (are |is |look\\\\w* )?yellow","bilirubin","jaundice (within|in the first) (24 hours|first day|day one)","(yellow|jaundice\\\\w*) (and|with) (poor feeding|not feeding|drowsy|lethargic|sleepy)","still (yellow|jaundiced) at (2|3|two|three) weeks"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Neonatal jaundice (NG98)","text":"\\u2022 Jaundice in the FIRST 24 HOURS of life = always pathological \\u2192 same-day urgent serum bilirubin + paediatric assessment\\n\\u2022 Visible jaundice any time in first 2 weeks \\u2192 measure bilirubin (transcutaneous/serum) and plot on treatment-threshold chart \\u2014 do not estimate by eye\\n\\u2022 Jaundice + poor feeding/drowsy \\u2192 urgent same-day\\n\\u2022 Prolonged jaundice (>14 days term, >21 days preterm) \\u2192 prolonged-jaundice screen incl. CONJUGATED bilirubin (?biliary atresia \\u2014 pale stools/dark urine)"},{"type":"link","label":"NICE NG98 (neonatal jaundice)","url":"https://www.nice.org.uk/guidance/ng98"}]},{"id":"adult-jaundice","enabled":true,"label":"Jaundice (adult)","kind":"amber","patterns":["(skin|eyes) (have |has |are |is )?(gone|turned|turning|going) yellow","yellow (skin|eyes|tinge)","whites of (my |the )?eyes (are |look )?yellow","jaundice\\\\w*","(i|he|she) (look|am|is|seem)\\\\w* yellow","(dark urine|pale stools?) (and|with) (yellow|itch\\\\w*|jaundice)","itch\\\\w* (all over )?(and|with) (yellow|dark urine|pale stools?)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Adult jaundice pathway","text":"New jaundice in an adult \\u2192 same-day bloods (LFTs, FBC, U&E, INR) and urgent assessment.\\n\\n\\u2022 PAINLESS jaundice (esp. >40y, weight loss, dark urine/pale stools) is a pancreatic-cancer red flag \\u2192 NICE NG12 urgent CT/2WW pathway\\n\\u2022 Jaundice + fever/RUQ pain \\u2192 ?cholangitis \\u2192 same-day admission\\n\\u2022 Jaundice + confusion/bruising \\u2192 ?acute liver failure \\u2192 emergency\\n\\u2022 Check paracetamol overdose, alcohol, new drugs (incl. herbal)"},{"type":"link","label":"NICE NG12 pancreatic cancer","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#pancreatic-cancer"}]},{"id":"testicular-lump","enabled":true,"label":"Testicular lump","kind":"amber","patterns":["(lump|swelling|mass) (in|on) (my )?(testicle|testis|ball|balls|scrotum)","testicular lump","(testicle|testis|ball) (feels|is) (hard|bigger|enlarged|different|heavy)","(found|felt|noticed) a lump (in|on) (my )?(testicle|testis|ball|scrotum)","swollen (testicle|testis)","(heaviness|dragging) (in (my )?)?(scrotum|testicle|balls)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"2WW pathway","text":"NICE NG12: non-painful enlargement or change in shape/texture of the testis \\u2192 2WW urology (any age \\u2014 peak 15\\u201340y). Consider direct-access ultrasound if unsure whether mass is testicular.\\n\\nSUDDEN SEVERE testicular PAIN = torsion \\u2192 emergency (separate red rule).\\nYoung men under-present \\u2014 take written mentions seriously."},{"type":"link","label":"NICE NG12 testicular cancer","url":"https://www.nice.org.uk/guidance/ng12/chapter/Recommendations-organised-by-site-of-cancer#urological-cancers"}]},{"id":"vzv-pregnancy","enabled":true,"label":"Chickenpox/shingles in pregnancy","kind":"amber","patterns":["pregnan\\\\w*.{0,50}(chickenpox|chicken pox|varicella|shingles)","(chickenpox|chicken pox|varicella|shingles).{0,50}pregnan\\\\w*","expecting.{0,40}(chickenpox|chicken pox|varicella|shingles)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"VZV in pregnancy","text":"Chickenpox CONTACT in pregnancy: same-day advice \\u2014 check varicella history/immunity (IgG if uncertain); if non-immune and significant contact, post-exposure prophylaxis (antivirals/VZIG per current UKHSA guidance) is TIME-CRITICAL \\u2192 discuss with obstetrics/virology today.\\n\\nChickenpox RASH in pregnancy: same-day clinical discussion \\u2014 oral aciclovir if \\u226520 weeks and within 24h of rash; severe disease/respiratory symptoms \\u2192 admission. Risks: fetal varicella syndrome (<28wk), neonatal varicella (around delivery), maternal pneumonitis."},{"type":"link","label":"RCOG chickenpox in pregnancy (GTG13)","url":"https://www.rcog.org.uk/guidance/browse-all-guidance/green-top-guidelines/chickenpox-in-pregnancy-green-top-guideline-no-13/"}]},{"id":"emergency-contraception","enabled":true,"label":"Emergency contraception","kind":"amber","patterns":["morning after pill","emergency contracept\\\\w*","emergency (pill|coil|contraceptive)","need contraception (quickly|urgently|today|asap)","unprotected sex","condom (broke|split|came off|failed)","missed (my |a |several )?(contraceptive )?pills?","forgot (to take )?(my )?pill","(took|taken) (my )?pill (late|too late)","(levonorgestrel|ulipristal|ellaone)","plan b","copper coil (for|as) emergency"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"EC time windows","text":"Time-critical \\u2014 deal with today:\\n\\u2022 Copper IUD: most effective, up to 5 days (120h) after UPSI (or up to 5 days after earliest ovulation) \\u2014 also ongoing contraception\\n\\u2022 Ulipristal (ellaOne): up to 120h\\n\\u2022 Levonorgestrel: up to 72h (less effective later; double dose if BMI/weight criteria per FSRH)\\n\\nCommunity pharmacy can supply oral EC free via Pharmacy First. Safeguard: under-16s (Fraser), coercion/assault \\u2192 follow safeguarding pathway. Offer STI screen + ongoing contraception; pregnancy test if next period late."},{"type":"link","label":"NHS Pharmacy First","url":"https://www.nhs.uk/nhs-services/pharmacies/pharmacy-first/"},{"type":"link","label":"NICE CKS emergency contraception","url":"https://cks.nice.org.uk/topics/contraception-emergency/"}]},{"id":"mastitis","enabled":true,"label":"Mastitis/breastfeeding","kind":"amber","patterns":["mastitis","breast (infection|abscess)","infected breast","breastfeed\\\\w*.{0,40}(pain\\\\w*|sore|red|hot|fever\\\\w*|lump\\\\w*|flu.?like|burning)","(painful|sore|red|hot|hard|engorged) breast (while|when|and) (feeding|breastfeeding|nursing)","(breast engorgement|engorged breasts?)","(blocked|plugged|clogged) (milk )?duct","cracked nipple (and|with) (pain|red|fever)","(red|hot|hard) (patch|area|wedge|lump) (on|in) (my )?breast (and|with) (fever|feeding|flu)","flu.?like (and|with) (breast|breastfeeding)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Mastitis pathway","text":"Lactational mastitis: continue feeding/expressing (milk drainage is the treatment), analgesia (paracetamol/ibuprofen safe), warm compress before feeds.\\n\\nAntibiotics (flucloxacillin 10\\u201314d; erythromycin if pen-allergic) if: systemically unwell, nipple fissure infection, or not improving after 12\\u201324h of effective milk removal.\\n\\n\\u2022 Fluctuant mass \\u2192 ?abscess \\u2192 same-day referral for USS \\u00b1 drainage\\n\\u2022 A discrete lump or skin change persisting AFTER mastitis resolves \\u2192 breast 2WW (inflammatory cancer mimics mastitis)\\n\\u2022 Sepsis features \\u2192 admit"},{"type":"link","label":"NICE CKS mastitis","url":"https://cks.nice.org.uk/topics/mastitis-breast-abscess/"}]},{"id":"heavy-period","enabled":true,"label":"Heavy menstrual bleeding","kind":"amber","patterns":["heavy periods?","(very|really|extremely) heavy (menstrual )?bleed\\\\w*","soaking through (pads|tampons|sanitary)","changing (my )?(pad|tampon) every (hour|half hour|30 min\\\\w*)","flooding (through|at night|during my period)","period (flooding|won.?t stop)","(large|big) (blood )?clots (in|during|with) (my )?(period|bleed\\\\w*)","bleeding (for|going on) (more than|over) (a week|7 days|two weeks)","menorrhagia","heavy menstrual bleeding","bleeding through (my )?clothes","period (is )?(much |a lot )?heavier than usual"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"HMB pathway (NG88)","text":"\\u2022 Check FBC (\\u00b1 ferritin) \\u2014 anaemia is common\\n\\u2022 First-line: LNG-IUS; or tranexamic acid \\u00b1 NSAID, or hormonal options\\n\\u2022 Red flags out: intermenstrual/postcoital bleeding, post-menopausal bleeding (\\u2192 2WW), pressure symptoms/mass (?fibroids \\u2192 USS)\\n\\u2022 Acute flooding + dizziness/syncope or Hb concern \\u2192 same-day review\\n\\u2022 Persistent IMB or treatment failure \\u2192 gynae referral"},{"type":"link","label":"NICE NG88 (heavy menstrual bleeding)","url":"https://www.nice.org.uk/guidance/ng88"}]},{"id":"postpartum-complications","enabled":true,"label":"Postpartum bleeding/infection","kind":"amber","patterns":["(heavy |postpartum |postnatal )?bleeding (after|since) (giving birth|the birth|delivery|having (my )?baby)","postpartum (bleed\\\\w*|haemorrhage|hemorrhage)","lochia (heavy|heavier|smelly|foul|increasing)","(fever|temperature|unwell|shivery) (after|since) (giving birth|the birth|delivery)","(c.?section|caesarean|cesarean) (wound|scar) (infect\\\\w*|red|oozing|opening|leaking)","stitches (infected|opened|smelly|oozing)","(foul|smelly|offensive) (smelling )?discharge (after|since) (giving birth|the birth|birth|delivery|having (my )?baby)","retained placenta","endometritis","unwell (a )?(few days|week|fortnight) after (giving birth|having (my )?baby)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Postpartum red flags","text":"Postpartum women deteriorate FAST \\u2014 low threshold for same-day review/admission.\\n\\n\\u2022 Secondary PPH (heavy/increasing bleeding >24h\\u201312wk post-delivery) \\u2192 same-day; clots/offensive lochia \\u2192 ?retained products/endometritis\\n\\u2022 Fever + foul lochia + uterine tenderness = endometritis \\u2192 same-day, often admission for IV antibiotics\\n\\u2022 Wound infection: spreading erythema/systemic features \\u2192 same-day\\n\\u2022 Always consider sepsis (MBRRACE: genital-tract sepsis remains a leading cause of maternal death)"}]},{"id":"acute-red-eye","enabled":true,"label":"Painful red eye","kind":"amber","patterns":["(painful|sore) red eye","red (and )?(painful|sore) eye","red eye (and|with) (pain|blurred vision|vision (loss|change)|light hurt\\\\w*|photophobia|haz\\\\w*|halo\\\\w*)","eye (is )?red (and|with) (painful|losing vision|can.?t see|light sensitive)","(photophobia|light hurt\\\\w*|can.?t tolerate light) (and|with) (red|painful) eye","contact lens\\\\w* (and|with) (red|painful|sore) eye","keratitis","(uveitis|iritis)","corneal (pain|ulcer|abrasion)","eye pain (and|with) (vision (loss|change|blur\\\\w*)|halo\\\\w*|redness)","(something|chemical|bleach) (splashed|went) in (my )?eye"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Red eye red flags","text":"Same-day ophthalmology if red eye PLUS any: pain (not just gritty), photophobia, reduced vision, haloes (?acute angle-closure), fixed/irregular pupil, CONTACT-LENS wearer (?microbial keratitis \\u2014 lens out, same-day), herpetic vesicles, hypopyon, trauma.\\n\\nChemical injury: irrigate copiously NOW, then emergency referral.\\n\\nBland red eye, no pain/vision change = likely conjunctivitis \\u2192 self-care/pharmacy + safety-net."},{"type":"link","label":"NICE CKS red eye","url":"https://cks.nice.org.uk/topics/red-eye/"}]},{"id":"sudden-hearing-loss","enabled":true,"label":"Sudden hearing loss","kind":"amber","patterns":["sudden (hearing loss|loss of hearing|deaf\\\\w*)","(lost|losing) (my )?hearing (in (my |the )?one ear|in my (left|right) ear|overnight|suddenly)","woke up (deaf|and (can.?t|couldn.?t) hear)","gone deaf in one ear","ear (went|has gone) dead","(can.?t hear|hearing.?s gone) (in one ear|suddenly|overnight)","sensorineural","hearing (disappeared|vanished) (overnight|suddenly)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"SSNHL \\u2014 urgent","text":"Sudden (\\u226472h) unexplained hearing loss in one or both ears, not explained by wax/effusion on otoscopy, = sudden sensorineural hearing loss \\u2192 URGENT same-day/24h ENT referral for audiometry + oral steroids \\u2014 the treatment window is days, outcomes worsen with delay.\\n\\nDo NOT routine-refer. Tuning fork (Weber lateralises AWAY from affected ear in SNHL) helps distinguish from conductive causes.\\n\\nWith vertigo/neurology \\u2192 consider stroke pathway."}]},{"id":"epistaxis","enabled":true,"label":"Nosebleed (significant)","kind":"amber","patterns":["nose ?bleed\\\\w* (that )?(won.?t|will not) stop","(can.?t|unable to) stop (my |the )?nose ?bleed\\\\w*","(heavy|prolonged|continuous|torrential) nose ?bleed\\\\w*","nose ?bleed\\\\w* (for|lasting|going on) (\\\\d+ )?(hour|hours|30 min\\\\w*)","nose (won.?t|will not) stop bleeding","epistaxis","bleeding (heavily )?from (my )?nose (and|that) won.?t stop","nose ?bleed\\\\w* (and|on) (blood thinners|warfarin|apixaban|rivaroxaban|anticoagulant\\\\w*)","(keep getting|recurrent|repeated) nose ?bleed\\\\w*"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Epistaxis pathway","text":"First aid: sit forward, pinch the SOFT part of the nose firmly 10\\u201315 min continuously, ice to bridge, spit don\\u2019t swallow.\\n\\n\\u2022 Not controlled after 2 \\u00d7 15 min pressure \\u2192 ED (cautery/packing)\\n\\u2022 On anticoagulant/antiplatelet + heavy or recurrent bleeding \\u2192 same-day review (check INR if warfarin) \\u2014 low threshold for ED\\n\\u2022 Posterior bleed (blood down throat both sides), haemodynamic symptoms \\u2192 999/ED\\n\\u2022 Recurrent unilateral epistaxis + blocked nose in an adult \\u2192 consider ENT referral (rare: tumour)"}]},{"id":"gout","enabled":true,"label":"Gout flare?","kind":"amber","patterns":["gout( flare| attack)?","big toe (joint )?(pain|swollen|swelling|red.?hot|agony|on fire)","(red|hot|swollen) big toe","toe (is )?(red and swollen|hot and swollen)","acute (toe|midfoot|ankle) (pain|swelling) (came on )?(overnight|suddenly)","toph(us|i)","gouty"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Gout (NG219)","text":"Acute flare: NSAID (with PPI) OR colchicine 500mcg bd\\u2013qds (cap dose; caution renal impairment/statins) OR short oral prednisolone \\u2014 treat fast, any of the three.\\n\\n\\u2022 Do NOT stop allopurinol/febuxostat during a flare\\n\\u2022 After the flare settles: offer urate-lowering therapy (treat-to-target serum urate <360 micromol/L; <300 if tophi/recurrent), start low + flare prophylaxis cover\\n\\u2022 Hot swollen joint + fever/unwell \\u2192 treat as SEPTIC arthritis, not gout\\n\\u2022 Check U&E, consider CV risk/diuretic review"},{"type":"link","label":"NICE NG219 (gout)","url":"https://www.nice.org.uk/guidance/ng219"}]},{"id":"cellulitis","enabled":true,"label":"Cellulitis?","kind":"amber","patterns":["cellulitis","spreading (redness|red area|infection)","(redness|red area|red patch).{0,30}(spreading|getting bigger|getting worse|tracking)","red streak\\\\w*","lymphangitis","(leg|arm|skin|wound|foot|hand) infection (and|with) (red|hot|swollen|spreading|fever)","infected wound (and|with) (spreading|red|hot|fever)","(hot|warm) (red|swollen) (and )?spreading","(leg|arm) (is )?(red, hot and swollen|hot, red and swollen)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Cellulitis pathway","text":"Mark the border and date it. Uncomplicated: oral flucloxacillin (clarithromycin/doxycycline if pen-allergic), elevate, review 48h.\\n\\nAdmit / same-day ED if: systemic sepsis features, rapidly spreading, facial/periorbital (?orbital cellulitis \\u2014 emergency), severe pain out of proportion (?necrotising \\u2014 999), immunosuppressed, failed orals.\\n\\nUnilateral red swollen leg: consider DVT (often confused) and chronic venous eczema (usually bilateral, itchy, not febrile \\u2014 doesn\\u2019t need antibiotics)."},{"type":"link","label":"NICE CKS cellulitis","url":"https://cks.nice.org.uk/topics/cellulitis-acute/"}]},{"id":"medication-side-effect","enabled":true,"label":"Medication side effect","kind":"amber","patterns":["side.?effects?","adverse (reaction|effect)","reaction to (my )?(medication|tablets|pills|new (tablet|medication|med))","(medication|tablets?|pills?) (is |are )?(making me|giving me) (unwell|sick|dizzy|a rash|nausea|itchy)","(rash|nausea|dizziness|diarrhoea|swelling) (from|since starting) (my )?(medication|tablets|new (tablet|medication|med))","can.?t tolerate (my )?(medication|tablets|new (tablet|medication|med))","since starting (the|my|this) new (tablet\\\\w*|medication|med\\\\w*|inhaler)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"ADR triage","text":"Prescriber review needed \\u2014 check timing vs drug start, dose, interactions (BNF).\\n\\nSERIOUS \\u2014 same-day/emergency:\\n\\u2022 ACEi angioedema (lip/tongue swelling) \\u2192 emergency\\n\\u2022 New rash on allopurinol / lamotrigine / carbamazepine / penicillins \\u2192 ?SJS/DRESS \\u2192 stop + urgent review (mucosal involvement/blistering = emergency)\\n\\u2022 Muscle pain + dark urine on statin \\u2192 ?rhabdo \\u2192 same-day CK\\n\\u2022 Bleeding on anticoagulant \\u2192 same-day\\n\\nReport serious/unexpected reactions via MHRA Yellow Card."},{"type":"link","label":"MHRA Yellow Card","url":"https://yellowcard.mhra.gov.uk/"}]},{"id":"delirium","enabled":true,"label":"Acute confusion","kind":"amber","patterns":["(suddenly|acutely|overnight|out of the blue) confused","acute confusion","confus\\\\w* (and|with) (fever|not (himself|herself|themselves)|drowsy|hallucinating)","confused since (yesterday|this morning|last night)","(mum|dad|nan|gran|grandad|mother|father|husband|wife) (is|has been|has got|seems) (suddenly |very |really )?(confused|muddled|not making sense)","not (himself|herself|themselves) (and|with) confus\\\\w*","(rambling|incoherent|talking nonsense|not making sense) (suddenly|since|today|overnight)","doesn.?t know (what day|where (he|she|they) (is|are)|who (i am|people are))","(delirium|delirious)","woke up confused","hallucinating (and|with) (confused|fever|unwell)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Delirium screen","text":"ACUTE change in cognition/attention = delirium until proven otherwise \\u2014 in an older person this is a same-day assessment (4AT screen).\\n\\nHunt the cause: infection (UTI/chest), urinary retention, constipation, dehydration, hypoxia, drugs (opioids, anticholinergics, benzos \\u2014 recent changes), alcohol withdrawal, electrolytes/glucose, pain, stroke.\\n\\nFluctuating course + inattention distinguishes from dementia (chronic \\u2192 memory-loss rule). Both can coexist \\u2014 acute-on-chronic change still needs same-day review."},{"type":"link","label":"NICE CKS delirium","url":"https://cks.nice.org.uk/topics/delirium/"}]},{"id":"alcohol-misuse","enabled":true,"label":"Alcohol concern","kind":"amber","patterns":["drinking too much","(drink|drinking|alcohol) problem\\\\w*","alcoholi(c|sm)","(worried|concerned) about (my |his |her )?drinking","help (to |with )?(stop|stopping|cut down|cutting down|control\\\\w*) (my )?drinking","can.?t (stop|control) (my )?drinking","alcohol (dependence|dependent|withdrawal|detox)","shakes (when|from|if) (i )?(stop|don.?t|haven.?t) (been )?drink\\\\w*","(detox|withdraw\\\\w*) (from|off) alcohol","drinking (every day|every morning|in the morning|first thing)","relapsed? (on |with )?(drinking|alcohol)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Alcohol pathway","text":"\\u2022 Screen with AUDIT-C / full AUDIT\\n\\u2022 DEPENDENT drinkers must NOT stop abruptly \\u2014 withdrawal seizures and delirium tremens can kill; arrange planned/supported detox\\n\\u2022 Already withdrawing (tremor, sweating, agitation, hallucinations, seizure) \\u2192 same-day; severe \\u2192 admission\\n\\u2022 Oral thiamine (Wernicke prophylaxis); refer local community alcohol service\\n\\u2022 Safeguarding: children/dependants at home; DVLA if relevant"},{"type":"link","label":"NICE CKS alcohol problem drinking","url":"https://cks.nice.org.uk/topics/alcohol-problem-drinking/"}]},{"id":"eating-disorder","enabled":true,"label":"Eating disorder?","kind":"amber","patterns":["(anorexi|bulimi)\\\\w*","eating disorder\\\\w*","(making|make) myself (sick|throw up|vomit)","purg\\\\w* (after eating|food|meals)","vomiting (after|straight after) (every )?(meal\\\\w*|eating)","laxative\\\\w* (abuse|misuse|to lose weight)","restrict\\\\w* (my )?(food|eating|calories)","afraid (of food|to eat|of (gaining|putting on) weight)","(losing|lost) weight (very |really )?(fast|quickly|rapidly)","binge\\\\w* (and|then) (purg\\\\w*|vomit\\\\w*|making myself sick)","(ARFID|binge eating disorder)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"MEED risk assessment","text":"Eating disorders kill \\u2014 assess medical risk (RCPsych MEED), do not rely on appearance or BMI alone (bulimia/ARFID often normal weight).\\n\\nCheck: rate of weight loss, BMI/%mBMI, HR (bradycardia <50), postural BP drop, core temp, SUSS test (sit-up/squat-stand), ECG (QTc), U&E (K+!), phosphate, glucose.\\n\\n\\u2022 Physiological compromise \\u2192 same-day medical admission (refeeding risk \\u2014 admit, don\\u2019t \\u201cfeed up at home\\u201d)\\n\\u2022 Under-18 \\u2192 urgent referral to community eating-disorder service/CAMHS-ED (NICE NG69: do not delay for weight thresholds)"},{"type":"link","label":"NICE NG69 (eating disorders)","url":"https://www.nice.org.uk/guidance/ng69"},{"type":"link","label":"BEAT (support)","url":"https://www.beateatingdisorders.org.uk/"}]},{"id":"postnatal-mh","enabled":true,"label":"Perinatal mental health","kind":"amber","patterns":["(postnatal|post.?partum) depression","PND","(struggling|not coping|can.?t cope) (after|since) (having )?(the |my )?baby","(struggling|low|depressed|anxious|tearful) since (giving birth|the baby|baby was born)","bonding (problem\\\\w*|difficult\\\\w*|issues) (with )?(the |my )?baby","not bonding with (the |my )?baby","intrusive thoughts (about|of) (the |my )?baby","baby blues","perinatal (mental health|anxiety|depression)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":"safeguarding","builtin":true,"actions":[{"type":"note","label":"Perinatal MH pathway","text":"\\u2022 Ask directly about thoughts of self-harm and of harming the baby; intrusive \\u201cwhat if\\u201d thoughts WITH distress and no intent are common in perinatal OCD \\u2014 distinguish from psychotic ideation\\n\\u2022 Postpartum PSYCHOSIS (rapid onset days\\u2013weeks post-birth: confusion, mania, delusions about the baby) = psychiatric emergency \\u2192 same-day perinatal/crisis team\\n\\u2022 Refer perinatal mental-health team (priority access); EPDS/PHQ-9 useful\\n\\u2022 Baby blues (day 3\\u201310, mild, self-limiting) \\u2014 safety-net; persistent >2wk = treat as PND\\n\\u2022 Safeguarding: consider infant + other children"},{"type":"link","label":"NICE CKS postnatal depression","url":"https://cks.nice.org.uk/topics/depression-antenatal-postnatal/"}]},{"id":"dental","enabled":true,"label":"Dental","kind":"info","patterns":["(toothache|tooth ache\\\\w*)","dental (pain|abscess)","pain in (my )?(tooth|teeth)","(broken|chipped|cracked) tooth","abscess (on|in) (my )?(tooth|gum)","infected tooth","(swollen|painful|bleeding) gums?","wisdom tooth","(filling|crown|cap) (came out|fell out)","lost a (filling|crown)","need (a |an emergency )?dentist"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Dental signposting","text":"GPs cannot provide NHS dental treatment and should not routinely prescribe for dental infection \\u2014 the treatment is dental (drainage/extraction).\\n\\nSignpost: own dentist (urgent slot) or NHS 111 for urgent dental access if no dentist.\\n\\nESCALATE (\\u2192 ED): facial swelling spreading to eye or neck, trismus, difficulty swallowing/breathing, systemically unwell (?Ludwig\\u2019s angina / spreading odontogenic infection)."},{"type":"link","label":"NHS find a dentist","url":"https://www.nhs.uk/service-search/find-a-dentist"}]},{"id":"blood-test-result","enabled":true,"label":"Results query","kind":"info","patterns":["(blood|test) results?","bloods? (back|results)","(have|got|chasing|waiting for|when will i get|any news on|where are) (my )?(blood |test )?results","results (back|come back|came back)","what (do|does) my (results|bloods) (say|show|mean)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Admin routing","text":"Results-status query \\u2014 admin/clerical, not a clinical queue item.\\n\\n1. Check if result is filed \\u2192 if normal & actioned, reception/portal can relay\\n2. If abnormal/unactioned \\u2192 route to the requesting clinician\\n3. If pending \\u2192 give expected turnaround\\n4. Signpost NHS App / online record for future self-serve"}]},{"id":"referral-chase","enabled":true,"label":"Referral chase","kind":"info","patterns":["chas(e|ing) (my |up )?(referral|appointment)","(where.?s|where is|any news on|status of|update on) (my )?referral","(haven.?t|not) heard (anything )?(about|from|back from) (the |my )?(hospital|consultant|clinic|specialist|referral)","(still )?waiting (for|on|to hear about) (my |a |the )?(hospital|specialist|consultant|clinic) (appointment|letter|call|date)","referral (status|gone through|been sent|been done)","has my referral (gone|been sent)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Admin routing","text":"Referral-status query \\u2014 route to admin team, not the clinical queue.\\n\\n1. Check referral was sent + e-RS status\\n2. If 2WW referral and no appointment within expected window \\u2192 escalate to secretary/2WW chase actively (this one IS time-critical)\\n3. Routine: signpost NHS App appointment tracking / hospital booking line\\n4. New symptoms or deterioration while waiting \\u2192 clinical review, consider expediting letter"}]},{"id":"medical-report-letter","enabled":true,"label":"Letter/report request","kind":"info","patterns":["(need|requesting|request|asking for|can i (have|get)) (a )?(letter|medical letter|gp letter|doctor.?s letter|support\\\\w* letter|evidence letter)","letter (for|to) (my )?(insurance|employer|work|mortgage|landlord|housing|solicitor|court|university|college|school|airline|visa|travel|DWP|PIP)","medical report","fitness to (fly|travel) (letter|certificate)","to whom it may concern","(insurance|solicitor.?s?|capability) report"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Admin routing","text":"Letter/report request \\u2014 admin workflow, not the clinical queue (fit notes have their own rule).\\n\\n\\u2022 Non-NHS work: practice may charge (per BMA guidance) \\u2014 admin to advise fee + timescale before clinician writes\\n\\u2022 Factual extracts can often be handled via SAR/online record instead of a bespoke letter\\n\\u2022 Route to designated letters clinician/secretary with clear purpose stated"}]},{"id":"travel-vaccination","enabled":true,"label":"Travel health","kind":"info","patterns":["travel (vaccin\\\\w*|jabs?|injections?)","travel (clinic|health|advice)","(going|travelling|traveling|flying) abroad","(yellow fever|typhoid|rabies|hepatitis a|hepatitis b|cholera|japanese encephalitis) (vaccin\\\\w*|jab)","malaria (tablets?|prophylaxis|prevention|pills)","fit (to|for) (fly|travel)","(vaccin\\\\w*|jabs?) (for|before) (my )?(holiday|trip|travels)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Travel health routing","text":"Planned preventive care \\u2192 practice nurse travel clinic or private travel clinic, ideally 6\\u20138 weeks before departure (some courses need time; late presentation still worth assessing).\\n\\n\\u2022 Risk-assess via fitfortravel/NaTHNaC by destination\\n\\u2022 Only some vaccines are NHS-funded (typhoid, hep A, cholera, polio-containing booster); yellow fever/rabies/JE = private/registered centre\\n\\u2022 Malaria prophylaxis: private prescription\\n\\u2022 Returning traveller with FEVER = clinical, not admin (?malaria \\u2014 same-day)"},{"type":"link","label":"Fit for Travel (NHS)","url":"https://www.fitfortravel.nhs.uk/"}]},{"id":"weight-loss-injection","enabled":true,"label":"Weight-loss medication request","kind":"info","patterns":["(wegovy|mounjaro|saxenda|ozempic|rybelsus)","(semaglutide|tirzepatide|liraglutide)","weight.?loss (injection\\\\w*|jabs?|pen|medication|drug)","GLP.?1","(skinny|fat|weight.?loss) (jab|pen)","injections? (for|to) (lose|losing) weight"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"GLP-1 weight-management requests","text":"Rapidly growing request type \\u2014 route to a planned appointment, not urgent queue.\\n\\n\\u2022 NICE: semaglutide (Wegovy, TA875) via specialist weight management; tirzepatide (Mounjaro, TA1026) with phased primary-care rollout from 2025 under strict eligibility (BMI + comorbidity tiers) \\u2014 CHECK CURRENT LOCAL COMMISSIONING before promising anything\\n\\u2022 Ozempic is licensed for T2DM, not weight loss \\u2014 do not prescribe off-label for weight\\n\\u2022 Many patients buy privately online: ask, document, counsel (side effects, gallstones, pancreatitis, pregnancy avoidance)\\n\\u2022 Screen for eating disorder before supporting weight-loss medication"}]},{"id":"end-of-life-admin","enabled":true,"label":"ACP/DNACPR admin","kind":"info","patterns":["(DNACPR|DNAR|DNR)","do not (attempt )?resuscitat\\\\w*","respect form","advance (directive|decision|statement|care plan)","(lasting )?power of attorney","LPA","living will","organ donation","treatment escalation plan","TEP"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"ACP routing","text":"Advance-care-planning / DNACPR / LPA request \\u2014 sensitive but planned work: book with the patient\\u2019s usual GP (or palliative lead), allow a double slot; not for the urgent queue.\\n\\n\\u2022 DNACPR/ReSPECT: clinical decision made WITH patient/family \\u2014 document and share (incl. out-of-hours/ambulance visibility)\\n\\u2022 LPA forms are completed via OPG \\u2014 GP only needed if asked to act as certificate provider (may carry a fee)\\n\\u2022 If the text suggests the patient is actively dying or in symptom crisis \\u2192 that is urgent clinical work, not admin"},{"type":"link","label":"Resus Council ReSPECT","url":"https://www.resus.org.uk/respect"}]},{"id":"memory-loss","enabled":true,"label":"Memory concern","kind":"info","patterns":["memory (loss|problems?|concerns?)","(losing|lost) (my|his|her) memory","forget\\\\w* (things|names|words|appointments|conversations)","(dementia|alzheimer\\\\w*)","cognitive decline","memory (getting worse|going|deteriorat\\\\w*)","worried about (my |his |her |mum.?s |dad.?s )?memory","memory (clinic|assessment|test)","(mum|dad|nan|gran|grandad).?s? memory (is )?(getting worse|going|terrible|bad)","keeps (getting lost|forgetting|repeating)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Memory pathway","text":"Gradual memory decline \\u2192 routine (not urgent) workup: collateral history, cognitive test (GPCOG/6-CIT), dementia bloods (FBC, U&E, LFT, TFT, B12/folate, calcium, glucose \\u00b1 HbA1c), depression screen, medication review (anticholinergic burden) \\u2192 memory clinic referral.\\n\\n\\u2022 ACUTE/fluctuating confusion = delirium \\u2192 same-day (separate rule)\\n\\u2022 Rapid progression over weeks, young onset, neurology \\u2192 urgent referral\\n\\u2022 Driving: advise DVLA notification where diagnosis made"},{"type":"link","label":"NICE CKS dementia","url":"https://cks.nice.org.uk/topics/dementia/"}]},{"id":"practice-admin-details","enabled":true,"label":"Practice admin (non-clinical)","kind":"green","patterns":["proof of address","registration query","regist\\\\w* (with|at) (the |this )?practice","new patient registration","change of address","chang\\\\w* (my |our |the )?address","updat\\\\w* (my |our |the )?address","change of (phone|telephone|mobile) number","chang\\\\w* (my |our |the )?(phone|telephone|mobile) number","updat\\\\w* (my |our |the )?(phone|telephone|mobile) number","change (my |our |the )?(contact )?details","updat\\\\w* (my |our |the )?(contact )?details","change of name","deregist\\\\w*","leav\\\\w* the practice","transfer\\\\w* (my )?(medical )?records to (a|another)"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Reception admin \\u2014 no clinical action needed","text":"Routine administrative request (address / phone / registration / name / leaving the practice) \\u2014 confidently non-clinical. No GP review required.\\n\\n\\u2022 Verify patient identity before amending personal details (data-protection / anti-impersonation check)\\n\\u2022 Registration/catchment queries: confirm catchment area before accepting\\n\\u2022 Deregistration/leaving: follow the practice's standard leaver process (records transfer request)\\n\\u2022 If this request ALSO raises a clinical concern elsewhere in the same message, that concern fires its own (higher-ranked) rule chip independently \\u2014 this note only covers the administrative part"}]},{"id":"pharmacy-process-query","enabled":true,"label":"Pharmacy/prescription admin","kind":"green","patterns":["pharmacy quer\\\\w*","chemist quer\\\\w*","prescription not ready","prescription (hasn.?t|has not) (arrived|come through|been sent|turned up)","pharmacy (hasn.?t|has not) receiv\\\\w*","wrong pharmacy","chang\\\\w* (my |the )?(nominated )?pharmacy","nominated pharmacy","prescription (sent|gone) to (the )?wrong pharmacy","collect (my |the )?prescription","prescription ready for collection","when (can|will) i collect my prescription"],"regex":true,"fields":["request"],"pages":["queue","detail"],"bumpsTile":null,"builtin":true,"actions":[{"type":"note","label":"Reception admin \\u2014 no clinical action needed","text":"Routine pharmacy/prescription-PROCESS query (dispensing, collection, nominated pharmacy) \\u2014 confidently non-clinical, distinct from a NEW repeat-prescription request (see the separate 'Repeat meds' rule). No GP review required.\\n\\n\\u2022 Direct to reception/dispensary to chase the pharmacy or amend the nominated pharmacy on the EPS system\\n\\u2022 If the patient ALSO reports a new symptom or a medication concern (e.g. ran out and now unwell), that fires its own (higher-ranked) rule chip independently \\u2014 this note only covers the dispensing-process part"}]}],"thresholds":{"polypharmacyRed":15,"polypharmacyAmber":10,"bpAgeMonthsLtc":9,"bpAgeMonthsNoLtc":24,"weightAgeMonths":24,"frailtyHitsRed":3,"frailtyHitsAmber":1,"lastContactMonths":12,"recentDischargeRed":14,"recentDischargeAmber":90,"anticholinergicAmber":3,"qofOverdueRed":2,"recentReferralDays":60,"taskAgeAmber":3,"taskAgeRed":7,"elderAge":80,"childAge":16},"prefs":{"showAgeChip":true,"showFootStats":true,"showRequestSnippet":true,"snippetMaxChars":240,"showBuiltInTiles":true,"oirEnabled":true,"oirBulkTickOff":true,"oirConfidenceFloor":"default","oirEngine":"legacy","oirLookbackMonths":0,"oirShowValueOnBadge":false,"oirDateFormat":"absolute","oirAuditLog":true,"filingEngine":"legacy"},"oirTests":[],"systemChips":{"queue.child":{"enabled":true,"label":"Child ({age})","kind":"amber","actions":[]},"queue.elder":{"enabled":true,"label":"Elder ({age})","kind":"amber","actions":[]},"queue.taskAgeAmber":{"enabled":true,"label":"{days}d","kind":"amber","actions":[]},"queue.taskAgeRed":{"enabled":true,"label":"{days}d","kind":"red","actions":[]},"queue.priority":{"enabled":true,"label":"{priority}","kind":"red","actions":[]},"detail.statusAwaiting":{"enabled":true,"label":"{status}","kind":"amber","actions":[]},"detail.statusReplyReceived":{"enabled":true,"label":"{status}","kind":"red","actions":[]},"detail.statusClosed":{"enabled":true,"label":"{status}","kind":"green","actions":[]},"detail.statusOther":{"enabled":true,"label":"{status}","kind":"info","actions":[]},"detail.priority":{"enabled":true,"label":"{priority}","kind":"red","actions":[]},"detail.daysOpenInfo":{"enabled":true,"label":"{days}d open","kind":"info","actions":[]},"detail.daysOpenAmber":{"enabled":true,"label":"{days}d open","kind":"amber","actions":[]},"detail.daysOpenRed":{"enabled":true,"label":"{days}d open","kind":"red","actions":[]},"detail.today":{"enabled":true,"label":"today","kind":"info","actions":[]},"detail.proxy":{"enabled":true,"label":"via {relationship}","kind":"info","actions":[]},"detail.attachments":{"enabled":true,"label":"{count} attach","kind":"info","actions":[]},"record.age":{"enabled":true,"label":"{age}y","kind":"info","actions":[]},"record.palliative":{"enabled":true,"label":"Palliative","kind":"red","actions":[]},"record.riskToSelf":{"enabled":true,"label":"Risk to self","kind":"red","actions":[]},"record.frailtyRed":{"enabled":true,"label":"Frailty x{count}","kind":"red","actions":[]},"record.frailtyAmber":{"enabled":true,"label":"Frailty x{count}","kind":"amber","actions":[]},"record.recentAdmissionRed":{"enabled":true,"label":"Admit {days}d","kind":"red","actions":[]},"record.recentAdmissionAmber":{"enabled":true,"label":"Admit {days}d","kind":"amber","actions":[]},"record.polypharmacyRed":{"enabled":true,"label":"Meds x{count}","kind":"red","actions":[]},"record.polypharmacyAmber":{"enabled":true,"label":"Meds x{count}","kind":"amber","actions":[]},"record.monitoringDueRed":{"enabled":true,"label":"Monitoring due x{count}","kind":"red","actions":[]},"record.monitoringDueAmber":{"enabled":true,"label":"Monitoring x{count}","kind":"amber","actions":[]},"detail.monitoringDueRed":{"enabled":true,"label":"Monitoring due x{count}","kind":"red","actions":[]},"detail.monitoringDueAmber":{"enabled":true,"label":"Monitoring x{count}","kind":"amber","actions":[]},"detail.docType":{"enabled":true,"label":"{docType}","kind":"info","actions":[]},"detail.docSpecialty":{"enabled":true,"label":"{specialty}","kind":"info","actions":[]},"queue.monitoringDueRed":{"enabled":false,"label":"Monitoring \\u00d7{count}","kind":"red","actions":[]},"queue.monitoringDueAmber":{"enabled":false,"label":"Monitoring {count}","kind":"amber","actions":[]},"queue.pendingResultRed":{"enabled":true,"label":"\\u26a0 pending urgent result \\u00b7 graded {age} ago","kind":"red","actions":[]},"queue.pendingResultAmber":{"enabled":true,"label":"pending abnormal result \\u00b7 {age}","kind":"amber","actions":[]},"queue.repeatContact":{"enabled":true,"label":"{nth} contact in {days}d","kind":"amber","actions":[]},"queue.repeatContactSession":{"enabled":true,"label":"{count} open requests \\u00b7 this patient","kind":"amber","actions":[]},"queue.carryOverAmber":{"enabled":true,"label":"carried over {days}d","kind":"amber","actions":[]},"queue.carryOverRed":{"enabled":true,"label":"carried over {days}d","kind":"red","actions":[]},"queue.resultUrgent":{"enabled":true,"label":"{name}","kind":"red","actions":[]},"queue.resultAbnormal":{"enabled":true,"label":"{count} abnormal","kind":"amber","actions":[]},"queue.resultRuleUrgent":{"enabled":true,"label":"{label}","kind":"red","actions":[]},"queue.resultRuleAbnormal":{"enabled":true,"label":"{label}","kind":"amber","actions":[]},"queue.resultMisprioritised":{"enabled":true,"label":"Under-prioritised","kind":"red","actions":[]},"queue.resultUnmatched":{"enabled":true,"label":"Unmatched patient","kind":"amber","actions":[]},"queue.resultReview":{"enabled":true,"label":"Needs review","kind":"amber","actions":[]},"queue.resultReviewRule":{"enabled":true,"label":"{rule}","kind":"amber","actions":[]},"queue.resultNoGrowth":{"enabled":true,"label":"No growth","kind":"info","actions":[]},"queue.resultNoGrowthRule":{"enabled":true,"label":"{label}","kind":"info","actions":[]},"queue.resultCombo":{"enabled":true,"label":"{rule}","kind":"amber","actions":[]},"record.stoppStart":{"enabled":true,"label":"Rx review \\u00d7{count}","kind":"amber","actions":[]},"record.riskScores":{"enabled":true,"label":"Risk tools","kind":"info","actions":[{"type":"link","label":"QRISK3 (CVD 10-yr)","url":"https://qrisk.org/"},{"type":"link","label":"QCancer","url":"https://qcancer.org/"},{"type":"link","label":"eFI \\u2014 electronic frailty index (NHSE)","url":"https://www.england.nhs.uk/ourwork/clinical-policy/older-people/frailty/efi/"},{"type":"note","label":"How to use","text":"Signpost only \\u2014 Medicus does not compute these scores.\\n\\nOpen the calculator and enter the inputs from the record:\\n\\u2022 QRISK3: age, sex, ethnicity, smoking, systolic BP, total cholesterol:HDL ratio, BMI, comorbidities\\n\\u2022 QCancer: age, sex, symptoms, comorbidities\\n\\u2022 eFI: coded frailty deficits\\n\\nAlways verify against the patient record."}]}},"resultRules":[{"id":"msu-culture","kind":"text","enabled":true,"builtin":true,"label":"Needs review","normalLabel":"No growth","analyte":{"match":["msu","urine culture","mid-stream urine","mid stream urine","m,c&s","mc&s","culture & sensitivity","culture and sensitivity"]},"normalText":["no growth","no bacterial growth","no significant growth","no organisms isolated","no organism isolated","no growth after"],"abnormalText":["pure growth of","predominant growth of","heavy growth of","sensitive to","resistant to","sensitivities shown","antimicrobial sensitivity"]},{"id":"base-urine-sterile-pyuria","kind":"combo","enabled":true,"builtin":true,"label":"Sterile pyuria \\u2014 pus cells raised, culture negative","level":"amber","conditions":[{"analyte":{"match":["pus cell","white cell","white blood cell","wbc","leucocyte","leukocyte"],"specimen":["urine","msu","mid-stream","mid stream","csu"]},"comparator":"above","value":40},{"analyte":{"match":["culture"],"specimen":["urine","msu","mid-stream","mid stream","csu"]},"contains":["no growth","no significant growth","no bacterial growth","no organisms isolated","no organism isolated","sterile"]}]},{"id":"base-bowel-screening-nonresponder","kind":"text","enabled":true,"builtin":true,"label":"Bowel screening: no response","analyte":{"match":["bcs:fob","bcs fob","bowel cancer screening","faecal occult blood"]},"abnormalText":["no response to bowel cancer screening","no response to bowel screening","non-response to bowel cancer screening","bowel cancer screening programme non-responder","bowel cancer screening non-responder","non-responder","non responder"]},{"id":"base-low-haemoglobin","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low haemoglobin (red \\u226480 g/L)","analyte":{"match":["haemoglobin","hemoglobin"],"exclude":["a1c","glycated","glycosylated"]},"comparator":"below","red":80,"unit":"g/L"},{"id":"base-high-potassium","kind":"threshold","enabled":true,"builtin":true,"label":"Critical high potassium (red \\u22656.5 mmol/L, amber \\u22656.0)","analyte":{"match":["potassium"],"exclude":["urine","urinary"]},"comparator":"above","amber":6,"red":6.5,"unit":"mmol/L"},{"id":"base-low-sodium","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low sodium (red \\u2264120 mmol/L)","analyte":{"match":["sodium"],"exclude":["urine","urinary","valproate"]},"comparator":"below","red":120,"unit":"mmol/L"},{"id":"base-low-egfr","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low eGFR (red \\u226415 mL/min/1.73m\\u00b2)","analyte":{"match":["gfr"]},"comparator":"below","red":15,"unit":"mL/min/1.73m\\u00b2"},{"id":"base-low-platelets","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low platelets (red \\u226430 \\u00d710\\u2079/L)","analyte":{"match":["platelet"],"exclude":["mean platelet","volume","ratio","large"]},"comparator":"below","red":30,"unit":"\\u00d710\\u2079/L"},{"id":"base-low-neutrophils","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low neutrophils (red \\u22640.5 \\u00d710\\u2079/L)","analyte":{"match":["neutrophil"],"exclude":["%","percent","ratio"]},"comparator":"below","red":0.5,"unit":"\\u00d710\\u2079/L"},{"id":"base-high-inr","kind":"threshold","enabled":true,"builtin":true,"label":"High INR (red \\u22658)","analyte":{"match":["inr","international normalised ratio","international normalized ratio"]},"comparator":"above","red":8,"unit":"ratio"},{"id":"base-hba1c-prediabetes","kind":"threshold","enabled":true,"builtin":true,"label":"Prediabetes range \\u2014 not on record (HbA1c 42\\u201347)","analyte":{"match":["hba1c","haemoglobin a1c","glycated haemoglobin","glycosylated haemoglobin"]},"comparator":"above","amber":42,"unit":"mmol/mol","suppressIfProblem":{"match":["prediabetes","pre-diabetes","pre-diabetic","impaired glucose","impaired fasting","non-diabetic hyperglycaemia","non-diabetic hyperglycemia","diabetes","diabetic","t1dm","t2dm","diabetes mellitus","type 1 diabetes","type 2 diabetes"],"exclude":["family history","diabetes insipidus","gestational"]}},{"id":"base-hba1c-diabetes","kind":"threshold","enabled":true,"builtin":true,"label":"Possible diabetes \\u2014 not on register (HbA1c \\u226548)","analyte":{"match":["hba1c","haemoglobin a1c","glycated haemoglobin","glycosylated haemoglobin"]},"comparator":"above","red":null,"amber":48,"unit":"mmol/mol","suppressIfProblem":{"match":["diabetes","diabetic","t1dm","t2dm","diabetes mellitus","type 1 diabetes","type 2 diabetes","type i diabetes","type ii diabetes","insulin dependent diabetes","non insulin dependent diabetes"],"exclude":["family history","non-diabetic","pre-diabetic","prediabetes","pre-diabetes","impaired glucose","impaired fasting","diabetes insipidus","gestational"]}},{"id":"base-lithium-toxicity","kind":"threshold","enabled":true,"builtin":true,"label":"High lithium level \\u2014 toxicity risk (red \\u22651.5 mmol/L)","analyte":{"match":["lithium"]},"comparator":"above","amber":1,"red":1.5,"unit":"mmol/L"},{"id":"base-digoxin-toxicity","kind":"threshold","enabled":true,"builtin":true,"label":"High digoxin level \\u2014 toxicity risk (red \\u22652.0 micrograms/L)","analyte":{"match":["digoxin"]},"comparator":"above","amber":1.5,"red":2,"unit":"micrograms/L"},{"id":"base-low-potassium","kind":"threshold","enabled":true,"builtin":true,"label":"Critical low potassium (red \\u22642.5 mmol/L)","analyte":{"match":["potassium"],"exclude":["urine","urinary"]},"comparator":"below","amber":3,"red":2.5,"unit":"mmol/L"},{"id":"base-high-calcium","kind":"threshold","enabled":true,"builtin":true,"label":"High calcium \\u2014 hypercalcaemia (red \\u22653.0 mmol/L)","analyte":{"match":["calcium"],"exclude":["urine","urinary","24 hour","24-hour","/creat","ionised","ionized"]},"comparator":"above","amber":2.6,"red":3,"unit":"mmol/L"},{"id":"base-egfr-amber","kind":"threshold","enabled":true,"builtin":true,"label":"Low eGFR \\u2014 significant CKD (amber \\u226430 mL/min/1.73m\\u00b2)","analyte":{"match":["gfr"]},"comparator":"below","amber":30,"unit":"mL/min/1.73m\\u00b2"},{"id":"base-blood-culture","kind":"text","enabled":true,"builtin":true,"label":"Blood culture \\u2014 needs review","normalLabel":"No growth","analyte":{"match":["blood culture","blood cx","blood c&s"],"exclude":["urine","wound","sputum","csf","swab","stool","faeces","faecal"]},"normalText":["no growth","no bacterial growth","no significant growth","no organisms isolated","no organism isolated","no growth after"],"abnormalText":["grown in aerobic bottle","grown in anaerobic bottle","positive blood culture","gram positive cocci","gram-positive cocci","gram positive bacilli","gram-positive bacilli","gram negative bacilli","gram-negative bacilli","gram negative cocci","gram-negative cocci","bacteraemia","bacteremia","fungaemia","sensitive to","resistant to","sensitivities shown","staphylococcus","streptococcus","escherichia","klebsiella","enterococcus","pseudomonas","haemophilus","neisseria","listeria","salmonella","candidaemia","candida albicans","candida glabrata","candida parapsilosis","candida tropicalis","candida auris","acinetobacter","serratia","enterobacter","proteus","citrobacter","stenotrophomonas"]},{"id":"base-low-calcium","kind":"threshold","enabled":true,"builtin":true,"label":"Low adjusted calcium \\u2014 hypocalcaemia (red \\u22641.9 mmol/L)","analyte":{"match":["adjusted calcium","corrected calcium","albumin-adjusted calcium","albumin adjusted calcium"],"exclude":["urine","urinary","24 hour","24-hour","/creat","ionised","ionized"]},"comparator":"below","amber":2.1,"red":1.9,"unit":"mmol/L"},{"id":"base-low-magnesium","kind":"threshold","enabled":true,"builtin":true,"label":"Low magnesium \\u2014 hypomagnesaemia (red \\u22640.5 mmol/L)","analyte":{"match":["magnesium"],"exclude":["urine","urinary","24 hour","24-hour"]},"comparator":"below","amber":0.6,"red":0.5,"unit":"mmol/L"},{"id":"base-high-tsh","kind":"threshold","enabled":true,"builtin":true,"label":"High TSH \\u2014 possible hypothyroidism (red \\u226520 mU/L)","analyte":{"match":["tsh","thyroid stimulating hormone","thyroid-stimulating hormone"],"exclude":["receptor","antibody","antibodies"]},"comparator":"above","amber":10,"red":20,"unit":"mU/L","suppressIfProblem":{"match":["hypothyroidism","hypothyroid","levothyroxine","thyroxine","myxoedema","myxedema"],"exclude":["family history"]}},{"id":"base-low-tsh","kind":"threshold","enabled":true,"builtin":true,"label":"Suppressed TSH \\u2014 possible thyrotoxicosis (red \\u22640.01 mU/L)","analyte":{"match":["tsh","thyroid stimulating hormone","thyroid-stimulating hormone"],"exclude":["receptor","antibody","antibodies"]},"comparator":"below","amber":0.1,"red":0.01,"unit":"mU/L","suppressIfProblem":{"match":["thyrotoxicosis","hyperthyroidism","hyperthyroid","graves","carbimazole","propylthiouracil","thyroid cancer","levothyroxine","thyroxine"],"exclude":["family history"]}},{"id":"base-throat-swab","kind":"text","enabled":true,"builtin":true,"label":"Throat swab \\u2014 needs review","normalLabel":"Negative","analyte":{"match":["throat swab","throat culture","culture"],"specimen":["throat swab","throat"]},"normalText":["beta haemolytic streptococcus not isolated","beta-haemolytic streptococcus not isolated","no beta haemolytic streptococci","anaerobes not isolated","no anaerobes isolated"],"abnormalText":["beta haemolytic streptococcus isolated","group a streptococcus isolated"]},{"analyte":{"match":["Echography","Ultrasound","Ultrasonography","USS"]},"builtin":true,"enabled":true,"id":"base-uss-abnormal","kind":"text","label":"Ultrasound \\u2014 review","normalLabel":"Normal US","normalText":["No focal soft tissue abnormality","Lipoma","Unremarkable pelvic study","No sonographic abnormality identified"]},{"analyte":{"match":["Histology"]},"builtin":true,"enabled":true,"id":"base-histology-abnormal","kind":"text","label":"Histology \\u2014 review","normalLabel":"Histology normal","normalText":["benign intradermal melanocytic naevus","no evidence of atypia or malignancy","no evidence of dysplasia or malignancy","no dysplasia or malignancy","no atypia or malignancy"]},{"analyte":{"match":["HELICOBACTER PYLORI STOOL ANTIGEN","helicobacter pylori","H pylori antigen"]},"builtin":true,"enabled":true,"id":"base-h-pylori","kind":"text","label":"H. pylori positive","normalLabel":"H pylori normal","normalText":["NOT detected"]},{"analyte":{"match":["CHLAMYDIA AND GONORRHOEA NAAT","chlamydia trachomatis","neisseria gonorrhoea"]},"builtin":true,"enabled":true,"id":"base-sti-naat","kind":"text","label":"STI screen positive","normalLabel":"STI screen NAD","normalText":["NOT detected"]},{"analyte":{"match":["Enteric pathogen DNA","FAECES - MOLECULAR SCREENING","Faeces MC&S"]},"builtin":true,"enabled":true,"id":"base-stool-mcs","kind":"text","label":"Stool MC&S \\u2014 review","normalLabel":"MC&S NAD","normalText":["not detected"]},{"analyte":{"match":["Candida Culture"],"specimen":["GENITAL SWAB CULTURE"]},"builtin":true,"enabled":true,"id":"base-genital-candida","kind":"text","label":"Vaginal thrush","normalLabel":"No vag. thrush","normalText":["Candida species not isolated"]},{"analyte":{"match":["Culture","Anaerobic culture"],"specimen":["WOUND SWAB"]},"builtin":true,"enabled":true,"id":"base-wound-swab-growth","kind":"text","label":"Wound swab positive","normalLabel":"Wound swab no growth","normalText":["no growth","no significant growth","anaerobes not isolated"]},{"analyte":{"match":["Culture for fungi","Anaerobic culture"],"specimen":["EAR SWAB"]},"builtin":true,"enabled":true,"id":"base-ear-swab-growth","kind":"text","label":"Ear swab positive","normalLabel":"No growth","normalText":["no growth","no significant growth","no organisms isolated"]},{"analyte":{"match":["EBV - VCA IgM level","EBV capsid IgG level","EBV nuclear IgG level"],"specimen":["Epstein-Barr virus serology"]},"builtin":true,"enabled":true,"id":"base-ebv-serology","kind":"text","label":"EBV positive","normalLabel":"No growth","normalText":["NOT detected"]},{"analyte":{"match":["Fibrosis-4 score"]},"builtin":true,"comparator":"above","enabled":true,"id":"base-fib4-elevated","kind":"threshold","label":"FIB-4 elevated \\u2014 fibrosis risk (red \\u22652.67, amber \\u22651.3)","amber":1.3,"red":2.67,"unit":null},{"analyte":{"match":["ferritin"]},"builtin":true,"comparator":"below","enabled":true,"id":"base-low-ferritin","kind":"threshold","label":"Low ferritin (red <15, amber <60 \\u00b5g/L)","amber":60,"red":15,"unit":"\\u00b5g/L"},{"analyte":{"match":["B12"]},"builtin":true,"comparator":"below","enabled":true,"id":"base-low-b12","kind":"threshold","label":"Low B12 (red <110, amber <180 ng/L)","amber":180,"red":110,"unit":"ng/L"},{"id":"base-high-sodium","kind":"threshold","enabled":true,"builtin":true,"label":"High sodium \\u2014 hypernatraemia (red \\u2265160 mmol/L, amber \\u2265150)","analyte":{"match":["sodium"],"exclude":["urine","urinary","valproate"]},"comparator":"above","amber":150,"red":160,"unit":"mmol/L"},{"id":"base-high-creatinine-aki","kind":"threshold","enabled":true,"builtin":true,"label":"Critical high creatinine \\u2014 AKI stage 3 (red \\u2265354 \\u00b5mol/L)","analyte":{"match":["creatinine"],"exclude":["urine","urinary","clearance","ratio"]},"comparator":"above","red":354,"unit":"\\u00b5mol/L"},{"id":"base-creatinine-delta-aki","kind":"delta","enabled":true,"builtin":true,"label":"Rising creatinine \\u2014 possible AKI (amber \\u2265+26.5 \\u00b5mol/L)","analyte":{"match":["creatinine"],"exclude":["urine","urinary","clearance","ratio"]},"direction":"rise","by":true,"amber":26.5,"maxDays":2,"unit":"\\u00b5mol/L"},{"id":"base-high-glucose","kind":"threshold","enabled":true,"builtin":true,"label":"High glucose \\u2014 hyperglycaemia (red \\u226530 mmol/L, amber \\u226511.1)","analyte":{"match":["glucose"],"exclude":["urine","urinary","csf"]},"comparator":"above","amber":11.1,"red":30,"unit":"mmol/L"},{"id":"base-low-glucose","kind":"threshold","enabled":true,"builtin":true,"label":"Low glucose \\u2014 hypoglycaemia (red \\u22643.0 mmol/L, amber \\u22644.0)","analyte":{"match":["glucose"],"exclude":["urine","urinary","csf"]},"comparator":"below","amber":4,"red":3,"unit":"mmol/L"},{"id":"base-high-alt","kind":"threshold","enabled":true,"builtin":true,"label":"High ALT \\u2014 transaminitis (red \\u2265320 U/L, amber \\u2265120)","analyte":{"match":["alt","alanine aminotransferase","alanine transaminase"]},"comparator":"above","amber":120,"red":320,"unit":"U/L"},{"id":"base-high-ast","kind":"threshold","enabled":true,"builtin":true,"label":"High AST \\u2014 transaminitis (red \\u2265320 U/L, amber \\u2265120)","analyte":{"match":["ast","aspartate aminotransferase","aspartate transaminase"],"exclude":["fasting"]},"comparator":"above","amber":120,"red":320,"unit":"U/L"},{"id":"base-high-crp","kind":"threshold","enabled":true,"builtin":true,"label":"High CRP \\u2014 possible severe infection (red \\u2265100, amber \\u226520)","analyte":{"match":["crp","c-reactive protein","c reactive protein"]},"comparator":"above","amber":20,"red":100,"unit":"mg/L"},{"id":"base-high-wcc","kind":"threshold","enabled":true,"builtin":true,"label":"High white cell count (amber \\u226512 \\u00d710\\u2079/L)","analyte":{"match":["white cell count","white blood cell count","wbc","leucocyte count","leukocyte count"],"exclude":["urine","urinary","csf","pus"]},"comparator":"above","amber":12,"unit":"\\u00d710\\u2079/L"}]}`;
+
+  let CONFIG = null;
+  let COMPILED_RULES = [];
+
+  const fallbackConfig = () => {
+    try {
+      if (EMBEDDED_DEFAULTS && !EMBEDDED_DEFAULTS.includes('DEFAULTS_PLACEHOLDER')) {
+        return JSON.parse(EMBEDDED_DEFAULTS);
+      }
+    } catch (e) {}
+    return { version: 1, rules: [], thresholds: {}, prefs: {} };
+  };
+
+  // Rule compilation is shared with the Options preview via rule-match.js
+  // (window.TriageLensMatch), loaded immediately before this script in the
+  // manifest, so the preview can never diverge from runtime matching. The
+  // shared compileRule preserves the exact prior behaviour (plain-text = leading
+  // \b stem; regex = both \b; console.warn on dropped/empty patterns; null when
+  // no usable patterns) and additionally records compile errors on `_errors`.
+  const compileRule = (rule) => window.TriageLensMatch.compileRule(rule);
+
+  const recompileRules = () => {
+    COMPILED_RULES = (CONFIG?.rules || []).map(compileRule).filter(Boolean);
+  };
+
+  // Non-destructive defaults migration. A stored config completely shadows the
+  // shipped defaults, so without this users would never receive newly shipped
+  // builtin rules (only fresh installs / destructive resets would). When the
+  // shipped defaults version is newer than the stored config's, append any
+  // builtin rules the user doesn't have (by id), plus missing threshold /
+  // pref / systemChip keys. User customisations are never overwritten, and
+  // builtins the user deliberately deleted (tracked in removedBuiltins by the
+  // options page) are not resurrected. Returns the merged config, or null if
+  // nothing to do.
+  //
+  // Chip labels shipped in a PRIOR version and SINCE CHANGED. An earlier migration baked
+  // the full shipped chip map into each saved config, so once a default label changed the
+  // stored (old) label shadowed the new default forever (e.g. the "Urgent:" result-chip
+  // prefix, retired in v3.75.0 — it kept rendering for existing users). When a stored chip
+  // label still matches a retired default we revert it to the current shipped label.
+  // WHEN YOU CHANGE A SHIPPED CHIP LABEL: (a) add its previous value here, AND (b) bump
+  // defaults.json "version" so this migration actually runs for existing users.
+  const RETIRED_CHIP_LABELS = {
+    'queue.resultUrgent': ['Urgent: {name}'],
+    'queue.resultRuleUrgent': ['Urgent: {name} — {rule}', '{name} — {rule}'],
+    'queue.resultRuleAbnormal': ['{name} — {rule}']
+  };
+  const revertRetiredChipLabels = (chips, shippedChips) => {
+    if (!chips || !shippedChips) return;
+    for (const id of Object.keys(RETIRED_CHIP_LABELS)) {
+      const entry = chips[id];
+      const shippedNow = shippedChips[id];
+      if (entry && shippedNow && RETIRED_CHIP_LABELS[id].indexOf(entry.label) !== -1) {
+        entry.label = shippedNow.label;
+      }
+    }
+  };
+  // Builtin result rules that GAINED an abnormalText positive-flag set in a later shipped
+  // version. The resultRules migration below is append-only (it adds builtins the user
+  // lacks BY ID), so a builtin the user already holds keeps its OLD shape and never
+  // receives the new positive flags — leaving the false-calm hazard those flags fix (e.g. a
+  // positive blood culture reading "...no growth in anaerobic bottle" being calmed). Adding
+  // abnormalText is purely additive (it only ever ADDS a 'review' outcome, never calms), so
+  // backfill the shipped abnormalText onto a held builtin that still lacks one. This also
+  // repairs a rule whose abnormalText was dropped by an older options edit. Kept in
+  // lock-step with options.js; bump defaults.json "version" when you add an id here.
+  const RESULT_RULES_GAINED_ABNORMALTEXT = ['msu-culture', 'base-blood-culture'];
+  const backfillBuiltinAbnormalText = (resultRules, shippedResultRules) => {
+    if (!Array.isArray(resultRules) || !Array.isArray(shippedResultRules)) return;
+    for (const id of RESULT_RULES_GAINED_ABNORMALTEXT) {
+      const held = resultRules.find(r => r && r.id === id && r.builtin);
+      if (!held || (Array.isArray(held.abnormalText) && held.abnormalText.length)) continue;
+      const shippedRule = shippedResultRules.find(r => r && r.id === id);
+      if (shippedRule && Array.isArray(shippedRule.abnormalText) && shippedRule.abnormalText.length) {
+        held.abnormalText = [...shippedRule.abnormalText];
+      }
+    }
+  };
+  // Builtin result-rule fields (label, and threshold values) shipped in a PRIOR version and
+  // SINCE CHANGED. The resultRules merge below is append-by-id only, so a builtin the user
+  // already holds keeps its OLD label/thresholds forever — a changed shipped label or
+  // threshold value never reaches existing users (the resultRules analogue of the
+  // RETIRED_CHIP_LABELS systemChips trap above). For each id we list, per field, the retired
+  // shipped value(s). The revert is ATOMIC per id: only when EVERY listed field still equals a
+  // retired value (i.e. the user has not customised this rule) do we bring the rule fully up to
+  // the current shipped values — so we never overwrite a user's own edit, and never leave a
+  // label that disagrees with the live threshold. v17 surfaced each numeric trigger in the chip
+  // label and lowered the Hb critical red from 100→80 g/L (CSO-approved). Kept in lock-step with
+  // options.js; bump defaults.json "version" when you add an entry here.
+  const RETIRED_RESULTRULE_FIELDS = {
+    'base-low-haemoglobin': { label: ['Critical low haemoglobin'], red: [100] },
+    // v22 added an amber band (6.0–6.4 mmol/L, UKKA Oct 2023 "moderate" hyperkalaemia
+    // band) below the pre-existing red ≥6.5 — a NEW field on a held builtin, which the
+    // append-by-id merge never delivers on its own. Both the ancient (pre-v17) and the
+    // v17 numbered label are listed as retired candidates so either vintage of held rule
+    // (which never carried an amber field) is brought up to the new label + amber value.
+    'base-high-potassium': {
+      label: ['Critical high potassium', 'Critical high potassium (red ≥6.5 mmol/L)'],
+      amber: [undefined]
+    },
+    'base-low-sodium': { label: ['Critical low sodium'] },
+    'base-low-egfr': { label: ['Critical low eGFR'] },
+    'base-low-platelets': { label: ['Critical low platelets'] },
+    'base-low-neutrophils': { label: ['Critical low neutrophils'] },
+    'base-high-inr': { label: ['High INR'] },
+    'base-lithium-toxicity': { label: ['High lithium level — toxicity risk'] },
+    'base-digoxin-toxicity': { label: ['High digoxin level — toxicity risk'] },
+    'base-low-potassium': { label: ['Critical low potassium'] },
+    'base-high-calcium': { label: ['High calcium — hypercalcaemia'] },
+    'base-egfr-amber': { label: ['Low eGFR — significant CKD'] },
+    'base-low-calcium': { label: ['Low adjusted calcium — hypocalcaemia'] },
+    'base-low-magnesium': { label: ['Low magnesium — hypomagnesaemia'] },
+    'base-high-tsh': { label: ['High TSH — possible hypothyroidism'] },
+    'base-low-tsh': { label: ['Suppressed TSH — possible thyrotoxicosis'] },
+    // v22 (CSO calibration pass, TRIAGE-LENS-2026-07-02.md item 3.3) demoted HbA1c ≥48 from
+    // red to amber — 48 mmol/mol is the WHO/NICE NG28 DIAGNOSTIC threshold, not itself a
+    // marker of clinical urgency, and firing red on every newly-diagnostic HbA1c was alert
+    // fatigue. A held rule still at the old red:48/no-amber shape is moved to red:null,
+    // amber:48 (label text is unchanged — "HbA1c ≥48" reads correctly at either severity, so
+    // it is not part of this un-stick).
+    'base-hba1c-diabetes': { red: [48], amber: [undefined] },
+    // v21 tightened the bare "gram positive"/"gram negative"/"candida" substrings (they
+    // matched NEGATIVE phrasing like "No gram negative organisms isolated" and tripped a
+    // false-amber review) to morphology-qualified gram-stain terms and named candida
+    // species. A held rule whose abnormalText still deep-equals this OLD 30-element
+    // shipped array is un-stuck to the new shipped array; a customised array is left alone.
+    'base-blood-culture': {
+      abnormalText: [
+        [
+          'grown in aerobic bottle',
+          'grown in anaerobic bottle',
+          'positive blood culture',
+          'gram positive',
+          'gram negative',
+          'gram-positive',
+          'gram-negative',
+          'bacteraemia',
+          'bacteremia',
+          'fungaemia',
+          'sensitive to',
+          'resistant to',
+          'sensitivities shown',
+          'staphylococcus',
+          'streptococcus',
+          'escherichia',
+          'klebsiella',
+          'enterococcus',
+          'pseudomonas',
+          'haemophilus',
+          'neisseria',
+          'listeria',
+          'salmonella',
+          'candida',
+          'acinetobacter',
+          'serratia',
+          'enterobacter',
+          'proteus',
+          'citrobacter',
+          'stenotrophomonas'
+        ]
+      ]
+    }
+  };
+  // A retired field's candidate value may be a scalar (indexOf works) or, for
+  // abnormalText, an array of candidate arrays — reference-compare via indexOf never
+  // matches two distinct array instances, so deep-compare element-wise when the held
+  // value is itself an array.
+  const arraysShallowEqual = (a, b) =>
+    Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
+  const fieldStillDefault = (candidates, heldValue) => {
+    if (Array.isArray(heldValue)) return candidates.some(c => arraysShallowEqual(c, heldValue));
+    return candidates.indexOf(heldValue) !== -1;
+  };
+  const revertRetiredResultRuleFields = (resultRules, shippedResultRules) => {
+    if (!Array.isArray(resultRules) || !Array.isArray(shippedResultRules)) return;
+    for (const id of Object.keys(RETIRED_RESULTRULE_FIELDS)) {
+      const held = resultRules.find(r => r && r.id === id && r.builtin);
+      const shippedRule = shippedResultRules.find(r => r && r.id === id);
+      if (!held || !shippedRule) continue;
+      const fields = RETIRED_RESULTRULE_FIELDS[id];
+      const stillDefault = Object.keys(fields).every(f => fieldStillDefault(fields[f], held[f]));
+      if (!stillDefault) continue;
+      for (const f of Object.keys(fields)) {
+        if (shippedRule[f] === undefined) continue;
+        held[f] = Array.isArray(shippedRule[f]) ? [...shippedRule[f]] : shippedRule[f];
+      }
+    }
+  };
+  const mergeShippedDefaults = (cfg) => {
+    const shipped = fallbackConfig();
+    if (!cfg || !Array.isArray(cfg.rules)) return null;
+    if ((cfg.version || 0) >= (shipped.version || 0)) return null;
+    const out = { ...cfg, rules: [...cfg.rules] };
+    const have = new Set(out.rules.map(r => r && r.id));
+    const removed = new Set(out.removedBuiltins || []);
+    for (const r of shipped.rules || []) {
+      if (r.builtin && !have.has(r.id) && !removed.has(r.id)) out.rules.push(r);
+    }
+    out.thresholds = { ...(shipped.thresholds || {}), ...(cfg.thresholds || {}) };
+    out.prefs = { ...(shipped.prefs || {}), ...(cfg.prefs || {}) };
+    out.systemChips = { ...(shipped.systemChips || {}), ...(cfg.systemChips || {}) };
+    // Un-stick chip labels frozen at a since-changed shipped default (see RETIRED_CHIP_LABELS).
+    revertRetiredChipLabels(out.systemChips, shipped.systemChips);
+    // Result rules: preserve the user's authored rules and edits, but append any
+    // builtin result rules they don't already have by id (so existing users receive
+    // newly shipped builtins like the MSU/culture rule), unless deliberately removed.
+    out.resultRules = [...(Array.isArray(cfg.resultRules) ? cfg.resultRules : [])];
+    const haveRR = new Set(out.resultRules.map(r => r && r.id));
+    for (const r of shipped.resultRules || []) {
+      if (r.builtin && !haveRR.has(r.id) && !removed.has(r.id)) out.resultRules.push(r);
+    }
+    backfillBuiltinAbnormalText(out.resultRules, shipped.resultRules);
+    // Un-stick result-rule labels/thresholds frozen at a since-changed shipped default.
+    revertRetiredResultRuleFields(out.resultRules, shipped.resultRules);
+    // OIR user test dictionary: a purely user/practice-authored array (built-in
+    // tests live in engine TEST_DEFS, not here). Arrays aren't shallow-merged, so
+    // carry it through explicitly or migration would drop the user's customs.
+    out.oirTests = Array.isArray(cfg.oirTests) ? [...cfg.oirTests] : [...(shipped.oirTests || [])];
+    out.version = shipped.version;
+    return out;
+  };
+
+  const loadConfig = async () => {
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+      try {
+        // Phase 0: use namespaced key; fall back to legacy 'config' key and migrate on first load
+        let r = await chrome.storage.local.get('triagelens.config');
+        if (r['triagelens.config']) {
+          CONFIG = r['triagelens.config'];
+        } else {
+          const legacy = await chrome.storage.local.get('config');
+          CONFIG = legacy.config || fallbackConfig();
+          // Write under new key so future loads skip this branch
+          if (CONFIG && (CONFIG.version || CONFIG.rules || CONFIG.systemChips)) {
+            chrome.storage.local.set({ 'triagelens.config': CONFIG }).catch(() => {});
+          }
+        }
+        const merged = mergeShippedDefaults(CONFIG);
+        if (merged) {
+          CONFIG = merged;
+          chrome.storage.local.set({ 'triagelens.config': CONFIG }).catch(() => {});
+        }
+      } catch (e) {
+        CONFIG = fallbackConfig();
+      }
+    } else if (typeof window !== 'undefined' && window.__TL_CONFIG) {
+      CONFIG = window.__TL_CONFIG;
+    } else {
+      CONFIG = fallbackConfig();
+    }
+    recompileRules();
+    return CONFIG;
+  };
+
+  const watchConfig = (onChange) => {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.onChanged) return;
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      // Accept updates on either key for a clean transition period
+      const newVal = changes['triagelens.config']?.newValue || changes['config']?.newValue;
+      if (!newVal) return;
+      CONFIG = newVal || fallbackConfig();
+      recompileRules();
+      try { onChange(); } catch (e) {}
+    });
+  };
+
+  // Match all enabled rules against the field-data bag for the given page.
+  // fieldsData: { request?: string, problems?: string[], registers?: string[], meds?: string[], allergies?: string[], banner?: string[], consultations?: string[], docs?: string[] }
+  const matchRules = (page, fieldsData) => {
+    const out = [];
+    for (const rule of COMPILED_RULES) {
+      if (!rule.pages?.includes(page)) continue;
+      let matched = false;
+      for (const fname of rule.fields || []) {
+        const fv = fieldsData[fname];
+        if (fv == null) continue;
+        const text = Array.isArray(fv) ? fv.join('\n') : String(fv);
+        if (!text) continue;
+        if (window.TriageLensMatch.ruleMatchesText(rule, text)) { matched = true; break; }
+      }
+      if (matched) out.push(rule);
+    }
+    return out;
+  };
+
+  // Threshold getter (with fallback to defaults baked into builtins)
+  const TH_DEFAULTS = {
+    polypharmacyRed: 15, polypharmacyAmber: 10, bpAgeMonthsLtc: 9, bpAgeMonthsNoLtc: 24,
+    weightAgeMonths: 24, frailtyHitsRed: 3, frailtyHitsAmber: 1, lastContactMonths: 12,
+    recentDischargeRed: 14, recentDischargeAmber: 90, anticholinergicAmber: 3,
+    qofOverdueRed: 2, recentReferralDays: 60, taskAgeAmber: 3, taskAgeRed: 7,
+    elderAge: 80, childAge: 16
+  };
+  const TH = (k) => {
+    const v = CONFIG?.thresholds?.[k];
+    return Number.isFinite(v) ? v : TH_DEFAULTS[k];
+  };
+  const PREF = (k, dflt) => {
+    if (!CONFIG || !CONFIG.prefs) return dflt;
+    const v = CONFIG.prefs[k];
+    return v === undefined ? dflt : v;
+  };
+
+  // ---- System chips (configurable baseline chips, distinct from text-pattern rules) ----
+  // Each chip has stable id, configurable label/kind/actions/enabled. The match
+  // logic is hardcoded (computed against extracted patient/task data); only
+  // *what gets displayed* is user-controlled.
+  //
+  // The shipped defaults are the single source of truth in EMBEDDED_DEFAULTS
+  // (above) — we derive the per-chip fallback map from there rather than keeping
+  // a second hand-maintained copy in sync. (defaults.json is the third copy, kept
+  // identical by test-triage-defaults.js.)
+  const SYS_CHIP_DEFAULTS = fallbackConfig().systemChips || {};
+
+  // Resolve a system chip's current config, falling back to defaults if user
+  // hasn't customised it yet.
+  const findSystemChip = (id) => {
+    const cfg = CONFIG?.systemChips?.[id];
+    const def = SYS_CHIP_DEFAULTS[id];
+    if (!cfg && !def) return null;
+    return { ...(def || {}), ...(cfg || {}) };
+  };
+
+  // Build a chip object for rendering, performing variable substitution on the
+  // configured label. Returns null if the chip is disabled. ruleId is set to
+  // 'system:<id>' so the action menu can find it.
+  const getSystemChip = (id, vars) => {
+    const cfg = findSystemChip(id);
+    if (!cfg || cfg.enabled === false) return null;
+    let text = cfg.label || '';
+    if (vars) {
+      for (const k of Object.keys(vars)) {
+        text = text.split('{' + k + '}').join(String(vars[k]));
+      }
+    }
+    return {
+      kind: cfg.kind || 'info',
+      text,
+      ruleId: 'system:' + id,
+      hasActions: (cfg.actions || []).length > 0
+    };
+  };
+
+  // Memoise the rendered chip HTML per (id, vars). getSystemChip + renderChipHtml
+  // are pure for a given config snapshot, so the queue result-triage hot path
+  // (re-injecting the same chips across many rows / re-renders) skips the repeated
+  // string-building. The memo is cleared whenever config changes (see watchConfig).
+  const _chipHtmlMemo = new Map();
+  const renderSystemChipHtmlMemo = (id, vars) => {
+    const key = id + '|' + JSON.stringify(vars || {});
+    let html = _chipHtmlMemo.get(key);
+    if (html === undefined) {
+      const chip = getSystemChip(id, vars);
+      if (!chip) { _chipHtmlMemo.set(key, null); return null; }
+      html = renderChipHtml(chip);
+      _chipHtmlMemo.set(key, html);
+    }
+    return html;
+  };
+
+  // ============================================================
+  // 1c. PAGE ROUTING
+  // ============================================================
+  const pageType = () => {
+    if (typeof window !== 'undefined' && window.__clinHudForcePage) return window.__clinHudForcePage;
+    const u = location.href;
+
+    // Patient care record (any variant — clinical summary, journal, medication,
+    // results & observations, problems, appointments, admin record, audit etc.)
+    if (/\/care-record\//.test(u)) return 'record';
+    if (/\/patient\/patient\//.test(u)) return 'record';
+    if (/\/administrative-record\//.test(u)) return 'record';
+
+    // Any *list view* across the task system. Medicus has many task types —
+    // medical_patient_request_task, investigation_result_task,
+    // routine_prescription_request_task, miscellaneous_task,
+    // appointments_required_task, patient_questionnaire_response_task etc.
+    // All use the same /tasks/{type}/task-list URL shape.
+    if (/\/tasks\/[^/]+\/task-list/.test(u)) return 'queue';
+
+    // Any other view under /tasks/ — communication threads, investigation
+    // result detail pages, prescription request detail, etc — render as a
+    // detail page so the HUD attaches and rules fire.
+    if (/\/tasks\//.test(u)) return 'detail';
+
+    // Encounter / consultation views
+    if (/\/clinical\/encounter\//.test(u)) return 'detail';
+
+    return null;
+  };
+
+  // ============================================================
+  // 2. DOM EXTRACTION
+  // ============================================================
+  // One-time-per-title console.warn guard (item 1.1, TRIAGE-LENS-2026-07-02.md).
+  // findCardByTitle is called on every run() pass (SPA re-renders fire constantly),
+  // so warning on every miss would spam the console; a Set persists for the
+  // current page load and is cleared by onRoute() on SPA navigation so a genuinely
+  // new page gets its own warning if the card is still missing there.
+  const _cardMissWarned = new Set();
+
+  // Find a Medicus card by its header text. A plain exact match silently drops
+  // the WHOLE card (and everything computed from it) the moment Medicus tweaks a
+  // label or appends a live count ("Active Problems (5)") — a patient-safety
+  // risk, not a cosmetic one, so this is deliberately tiered rather than a single
+  // strict `===`:
+  //   1. exact match after normalising (trim/collapse-whitespace/case-insensitive)
+  //   2. same, with a trailing " (N)" count suffix stripped off the header first
+  //   3. startsWith(title) — but ONLY when exactly one header qualifies; an
+  //      ambiguous prefix (e.g. "Tasks" matching both "Tasks" and "Tasks &
+  //      Actions") must resolve to no match, never to the wrong card.
+  // A still-unresolved title is logged once per page load (see _cardMissWarned)
+  // so a real drift is visible without being silent.
+  const findCardByTitle = (title) => {
+    const headers = [...document.querySelectorAll('h2, h3, h4')];
+    const norm = (s) => String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const wantNorm = norm(title);
+
+    let h2 = headers.find(h => norm(h.textContent) === wantNorm);
+
+    if (!h2) {
+      h2 = headers.find(h => norm(h.textContent).replace(/\s*\(\d+\)$/, '') === wantNorm);
+    }
+
+    if (!h2) {
+      const candidates = headers.filter(h => norm(h.textContent).startsWith(wantNorm));
+      if (candidates.length === 1) h2 = candidates[0];
+    }
+
+    if (!h2) {
+      if (!_cardMissWarned.has(title)) {
+        _cardMissWarned.add(title);
+        console.warn('[TriageLens] card not found: "' + title + '" — extraction for this section will be empty this page load');
+      }
+      return null;
+    }
+    return h2.closest('.m-card-v2') || h2.closest('[class*="m-card"]') || h2.parentElement?.parentElement;
+  };
+
+  const cardContent = (card) => {
+    if (!card) return null;
+    return card.querySelector('.m-card-v2__content, [class*="card-v2__content"], [class*="card__content"]') || card;
+  };
+
+  // innerText polyfill — returns line-broken text from an element. Works in
+  // real browsers (uses native innerText if non-empty) and in jsdom (custom walk).
+  const ROW_TAGS = new Set(['DIV','P','LI','TR','UL','OL','SECTION','HEADER','FOOTER','ARTICLE','H1','H2','H3','H4','H5','H6','BR','TBODY','THEAD','TFOOT','TABLE','BLOCKQUOTE','PRE']);
+  // Curly quotes/apostrophes from pasted clinical letters would otherwise defeat
+  // patterns written with a straight apostrophe (e.g. "can't cope"); normalise
+  // them to ASCII so matching is robust regardless of the source punctuation.
+  const normQuotes = (s) => String(s)
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"');
+
+  const getText = (el) => {
+    if (!el) return '';
+    if (typeof el.innerText === 'string' && el.innerText.length) return normQuotes(el.innerText);
+    const out = [];
+    const walk = (n) => {
+      if (n.nodeType === 3) { out.push(n.textContent); return; }
+      if (n.nodeType !== 1) return;
+      const isRow = ROW_TAGS.has(n.tagName);
+      if (isRow && out.length && !/[\s\n]$/.test(out[out.length - 1])) out.push('\n');
+      const kids = [...n.childNodes];
+      kids.forEach((c, i) => {
+        // Insert a space between adjacent inline element siblings if there's no whitespace
+        if (i > 0 && c.nodeType === 1 && !ROW_TAGS.has(c.tagName)) {
+          const last = out[out.length - 1];
+          if (last && !/\s$/.test(last) && c.textContent.trim()) out.push(' ');
+        }
+        walk(c);
+      });
+      if (isRow && out.length && !/[\s\n]$/.test(out[out.length - 1])) out.push('\n');
+    };
+    walk(el);
+    return normQuotes(out.join('').replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n').trim());
+  };
+  const getLines = (el) => getText(el).split('\n').map(r => r.trim()).filter(Boolean);
+
+  // Extract patient banner data
+  const extractBanner = () => {
+    // Find badges. Exclude HUD's own DOM so its tile labels don't pollute warnings.
+    const allBadges = [...document.querySelectorAll('button, span, div, a')].filter(el => {
+      if (el.children.length > 0) return false;
+      if (el.closest('#' + HUD_ID)) return false;
+      const txt = el.textContent.trim();
+      return /^(Risk to Self|EMIS Imported Warning|Carer|Veteran|Looked After|Safeguarding|DNACPR|ReSPECT)/i.test(txt);
+    });
+    const warnings = allBadges.map(b => b.textContent.trim());
+
+    // Find banner element. Try common Medicus selectors first, then walk up from a badge if any.
+    let bannerEl = document.querySelector('.m-patient-banner, [class*="patient-banner"], [class*="PatientBanner"], .m-banner');
+    if (!bannerEl && allBadges.length > 0) {
+      let p = allBadges[0];
+      for (let i = 0; i < 8 && p; i++) {
+        if (p.tagName === 'HEADER' || /banner|patient-summary/i.test(p.className?.toString() || '')) {
+          bannerEl = p; break;
+        }
+        p = p.parentElement;
+      }
+      if (!bannerEl) bannerEl = allBadges[0].closest('section') || allBadges[0].parentElement?.parentElement;
+    }
+
+    const bannerText = bannerEl?.textContent || '';
+    // Try to spot an age "(NNy" or a DOB string
+    let age = null;
+    const ageMatch = bannerText.match(/\b(\d{1,3})\s*y(?:ears?)?\b/i);
+    if (ageMatch) {
+      const n = +ageMatch[1];
+      if (n > 0 && n < 120) age = n;
+    }
+    if (!age) {
+      const dobMatch = bannerText.match(/(\d{1,2})[\s/.-]([A-Z][a-z]{2}|\d{1,2})[\s/.-](\d{4})/);
+      if (dobMatch) {
+        let mo = dobMatch[2];
+        if (isNaN(+mo)) mo = MONTHS[mo]; else mo = +mo - 1;
+        const dob = new Date(+dobMatch[3], mo, +dobMatch[1]);
+        if (!isNaN(dob)) age = Math.floor((NOW() - dob) / (365.25 * 86400000));
+      }
+    }
+
+    return { warnings: [...new Set(warnings)], age };
+  };
+
+  const extractRegisters = () => {
+    const card = findCardByTitle('Registers');
+    if (!card) return [];
+    const c = cardContent(card);
+    return [...c.querySelectorAll('li, a')].map(el => el.textContent.trim()).filter((t, i, arr) => t && arr.indexOf(t) === i);
+  };
+
+  const DATE_LINE = /^(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}|[A-Z][a-z]{2}\s+\d{4}|\d{4})\*?$/;
+
+  const extractActiveProblems = () => {
+    const card = findCardByTitle('Active Problems');
+    if (!card) return [];
+    const c = cardContent(card);
+    if (!c) return [];
+
+    const problems = [];
+    let currentSection = null;
+    let pendingName = null;
+
+    const rows = getLines(c);
+
+    const flushPending = () => {
+      if (pendingName) {
+        problems.push({ section: currentSection, name: pendingName, date: null });
+        pendingName = null;
+      }
+    };
+
+    for (const row of rows) {
+      if (['Major', 'Minor', 'Unknown Significance'].includes(row)) {
+        flushPending();
+        currentSection = row;
+        continue;
+      }
+      if (row.startsWith('*')) continue;
+      if (/^\*?Not the onset/i.test(row)) continue;
+
+      // Date-only line — pair with pending name
+      if (DATE_LINE.test(row)) {
+        if (pendingName) {
+          problems.push({ section: currentSection, name: pendingName, date: parseDate(row) });
+          pendingName = null;
+        }
+        continue;
+      }
+
+      // Combined "<name> <date>" line
+      const combined = row.match(/^(.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\*?|[A-Z][a-z]{2}\s+\d{4}\*?|\d{4}\*?)$/);
+      if (combined && DATE_LINE.test(combined[2].replace(/\*$/, ''))) {
+        flushPending();
+        problems.push({ section: currentSection, name: combined[1].trim(), date: parseDate(combined[2]) });
+        continue;
+      }
+
+      // Otherwise this is a problem name awaiting a date
+      flushPending();
+      pendingName = row;
+    }
+    flushPending();
+    return problems;
+  };
+
+  const extractMedications = () => {
+    const card = findCardByTitle('Current Medication');
+    if (!card) return { repeats: [], acutes: [], otc: [] };
+    const c = cardContent(card);
+    if (!c) return { repeats: [], acutes: [], otc: [] };
+
+    const repeats = [];
+    const acutes = [];
+    const otc = [];
+    let mode = null;
+
+    const rows = getLines(c);
+    for (const row of rows) {
+      if (/^Current Repeat Medications?$/i.test(row)) { mode = 'repeat'; continue; }
+      if (/^Acute Prescriptions/i.test(row)) { mode = 'acute'; continue; }
+      if (/^Over-?the-?Counter/i.test(row)) { mode = 'otc'; continue; }
+      if (mode === 'repeat') repeats.push(row);
+      else if (mode === 'acute') acutes.push(row);
+      else if (mode === 'otc') otc.push(row);
+    }
+    return { repeats, acutes, otc };
+  };
+
+  const extractTasks = () => {
+    const card = findCardByTitle('Tasks & Actions');
+    if (!card) return { qofOverdue: [], futureActions: [], appts: [], incomplete: [] };
+    const c = cardContent(card);
+    if (!c) return { qofOverdue: [], futureActions: [], appts: [], incomplete: [] };
+
+    const qofOverdue = [];
+    const futureActions = [];
+    const appts = [];
+    const incomplete = [];
+    let mode = null;
+    let pending = null;
+    const flushPending = () => { if (pending) { qofOverdue.push(pending); pending = null; } };
+
+    const rows = getLines(c);
+    for (const raw of rows) {
+      // Strip an "Overdue" token that may appear combined with code or date
+      const hasOverdue = /\bOverdue\b/i.test(raw);
+      const row = raw.replace(/\s*\bOverdue\b\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+
+      // Pure "Overdue" line — flag the pending QOF item
+      if (row === '' && hasOverdue) {
+        if (pending) pending.overdue = true;
+        continue;
+      }
+
+      // Section switches
+      if (/^QOF\s+\d+\/\d+$/i.test(row)) { flushPending(); mode = 'qof'; continue; }
+      if (/^Other Future Actions$/i.test(row)) { flushPending(); mode = 'future'; continue; }
+      if (/^Upcoming Appointments$/i.test(row)) { flushPending(); mode = 'appt'; continue; }
+      if (/^Incomplete Tasks$/i.test(row)) { flushPending(); mode = 'inc'; continue; }
+
+      if (mode === 'qof') {
+        const codeMatch = row.match(/^([A-Z]{2,}\d+):/);
+        if (codeMatch) {
+          flushPending();
+          pending = { code: row, overdue: hasOverdue, date: null };
+          continue;
+        }
+        if (pending && parseDate(row)) {
+          pending.date = parseDate(row);
+          if (hasOverdue) pending.overdue = true;
+          qofOverdue.push(pending);
+          pending = null;
+          continue;
+        }
+        // Code row that already had a date appended? "DM006: ... Mar 2026"
+        const inlineCodeWithDate = row.match(/^([A-Z]{2,}\d+:.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}|[A-Z][a-z]{2}\s+\d{4})$/);
+        if (inlineCodeWithDate) {
+          flushPending();
+          qofOverdue.push({ code: inlineCodeWithDate[1].trim(), overdue: hasOverdue, date: parseDate(inlineCodeWithDate[2]) });
+          continue;
+        }
+      } else if (mode === 'future') {
+        if (/^None\.?$/i.test(row)) continue;
+        if (parseDate(row) && futureActions.length && !futureActions[futureActions.length - 1].date) {
+          futureActions[futureActions.length - 1].date = parseDate(row);
+        } else {
+          futureActions.push({ name: row, date: null });
+        }
+      } else if (mode === 'appt') {
+        if (/^None\.?$/i.test(row)) continue;
+        appts.push(row);
+      } else if (mode === 'inc') {
+        if (/^None\.?$/i.test(row)) continue;
+        incomplete.push(row);
+      }
+    }
+    flushPending();
+    return { qofOverdue, futureActions, appts, incomplete };
+  };
+
+  const extractObservations = () => {
+    const card = findCardByTitle('Observations & Results');
+    if (!card) return {};
+    const c = cardContent(card);
+    if (!c) return {};
+    const obs = {};
+    const rows = getLines(c);
+
+    const isFiltered = (s) => !s || /^(Key Observations|View all|Observations & Results|Recent Results|Recent Observations|None recorded|Measured on)/i.test(s);
+    const PURE_DATE = /^(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})$/;
+    const VAL_DATE  = /^(.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})$/;
+    const FULL      = /^([A-Za-z][A-Za-z0-9]{0,15})\s+(.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})$/;
+    const LABEL     = /^[A-Za-z][A-Za-z0-9 /-]{0,15}$/; // single short label, may include space (e.g. "Pulse rate")
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (isFiltered(row)) continue;
+
+      // Pattern A: "Label Value Date" all combined on one line (single-word label only)
+      let m = row.match(FULL);
+      if (m && parseDate(m[3]) && !obs[m[1]]) {
+        obs[m[1]] = { value: m[2].trim(), date: parseDate(m[3]), raw: row };
+        continue;
+      }
+
+      // Pattern B: "Value Date" — label is on a recent prior unfiltered row
+      m = row.match(VAL_DATE);
+      if (m && parseDate(m[2])) {
+        for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
+          if (isFiltered(rows[j])) continue;
+          if (LABEL.test(rows[j]) && !obs[rows[j]]) {
+            obs[rows[j]] = { value: m[1].trim(), date: parseDate(m[2]), raw: `${rows[j]} ${row}` };
+          }
+          break; // first non-filtered row up is the only candidate
+        }
+        continue;
+      }
+
+      // Pattern C: pure date row — label and value on previous two non-filtered rows
+      if (PURE_DATE.test(row) && i >= 2) {
+        // Walk back skipping filtered rows
+        let lbl = null, val = null;
+        for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
+          if (isFiltered(rows[j])) continue;
+          if (val === null) { val = rows[j]; continue; }
+          if (lbl === null) { lbl = rows[j]; break; }
+        }
+        if (lbl && val && LABEL.test(lbl) && !obs[lbl]) {
+          obs[lbl] = { value: val.trim(), date: parseDate(row), raw: `${lbl} ${val} ${row}` };
+        }
+      }
+    }
+
+    return obs;
+  };
+
+  const extractDocuments = () => {
+    const titles = [...document.querySelectorAll('h2, h3, h4, strong, b, div')].filter(el => /Recent Documents/i.test(el.textContent) && el.textContent.length < 60);
+    if (!titles.length) return [];
+    const t = titles[0];
+    // Use immediate parent (the task-group / subsection) so we don't bleed into adjacent groups like Consultations
+    const container = t.parentElement;
+    if (!container) return [];
+    const rows = getLines(container);
+    const docs = [];
+    const COMBINED = /^(.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})$/;
+
+    let pendingName = null;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (/Recent Documents|View all/i.test(row)) { pendingName = null; continue; }
+
+      // "Name  Date" combined
+      const combined = row.match(COMBINED);
+      if (combined && parseDate(combined[2])) {
+        if (pendingName) pendingName = null;
+        docs.push({ name: combined[1].trim(), date: parseDate(combined[2]) });
+        continue;
+      }
+
+      // Date alone — pair with previous name
+      if (parseDate(row) && /^\d{1,2}\s+[A-Z]|^[A-Z][a-z]{2}\s+\d{4}/.test(row)) {
+        if (pendingName) {
+          docs.push({ name: pendingName, date: parseDate(row) });
+          pendingName = null;
+        }
+        continue;
+      }
+
+      // Otherwise it's a name awaiting a date
+      pendingName = row;
+    }
+    return docs;
+  };
+
+  const extractConsultations = () => {
+    const titles = [...document.querySelectorAll('h2, h3, h4, strong, b, div')].filter(el => /Last 3 Consultations|Recent Consultations/i.test(el.textContent) && el.textContent.length < 60);
+    if (!titles.length) return [];
+    const t = titles[0];
+    const container = t.parentElement;
+    if (!container) return [];
+    const rows = getLines(container);
+    const cons = [];
+    const COMBINED_DATE_RE = /^(.+?)\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})$/;
+
+    let pending = null;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (/Last 3 Consultations|Recent Consultations|View all/i.test(row)) { pending = null; continue; }
+
+      // Case A: "Type  Date" combined on one row, clinician on next row
+      const combined = row.match(COMBINED_DATE_RE);
+      if (combined && parseDate(combined[2])) {
+        if (pending) { cons.push(pending); pending = null; }
+        pending = { type: combined[1].trim(), clinician: '', date: parseDate(combined[2]) };
+        continue;
+      }
+
+      // Case B: pure date row → close out pending entry's date
+      if (parseDate(row) && /^\d{1,2}\s+[A-Z]|^[A-Z][a-z]{2}\s+\d{4}/.test(row)) {
+        if (pending) {
+          if (!pending.date) pending.date = parseDate(row);
+          cons.push(pending);
+          pending = null;
+        } else if (cons.length === 0 && i >= 2) {
+          // Fallback for "Type / Clinician / Date" 3-line shape
+          cons.push({ type: rows[i - 2], clinician: rows[i - 1], date: parseDate(row) });
+        }
+        continue;
+      }
+
+      // Otherwise: this is either a Type (no date yet) or a Clinician line for a pending entry
+      if (pending && !pending.clinician) {
+        pending.clinician = row;
+        cons.push(pending);
+        pending = null;
+      } else {
+        if (pending) cons.push(pending);
+        pending = { type: row, clinician: '', date: null };
+      }
+    }
+    if (pending && pending.date) cons.push(pending);
+    return cons;
+  };
+
+  // ---- Detail page (communication thread) extractors ----
+  // Parse "Label  Value" pairs that may render same-line or split across rows
+  const parseLabelValue = (lines, knownLabels) => {
+    const out = {};
+    const labelRe = new RegExp('^(' + knownLabels.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\s+(.+)$');
+    for (let i = 0; i < lines.length; i++) {
+      const row = lines[i];
+      const m = row.match(labelRe);
+      if (m) {
+        out[m[1]] = m[2].trim();
+      } else if (knownLabels.includes(row) && i + 1 < lines.length && !knownLabels.includes(lines[i + 1])) {
+        out[row] = lines[i + 1].trim();
+      }
+    }
+    return out;
+  };
+
+  const extractTaskDetails = () => {
+    const card = findCardByTitle('Task Details');
+    if (!card) return {};
+    const c = cardContent(card);
+    if (!c) return {};
+    return parseLabelValue(getLines(c), ['Status', 'Priority', 'Due date', 'Assigned to', 'Created']);
+  };
+
+  const extractRequester = () => {
+    const card = findCardByTitle('Requester Details');
+    if (!card) return {};
+    const c = cardContent(card);
+    if (!c) return {};
+    return parseLabelValue(getLines(c), ['Proxy name', 'Relationship to patient', 'Patient mobile', 'Patient email', 'Phone']);
+  };
+
+  const ATTACHMENT_EXT_RE = /\.(pdf|docx?|jpe?g|png|tiff?|heic|gif)$/i;
+
+  // Finds every attachment-shaped <a>/<button> anywhere on a request/
+  // communication task page — NOT scoped to the "Initial Request" card.
+  // Confirmed live 2026-07-22: a communication-thread task can carry a
+  // patient-submitted photo on a REPLY message further down the thread (a
+  // "Reply from Requester" card), not only the opening message — and that
+  // reply card has no h2/h3/h4 heading at all, so findCardByTitle('Initial
+  // Request') never finds it (a card-scoped scan silently missed a real
+  // attachment). Scanning the whole page instead is safe: ATTACHMENT_EXT_RE
+  // only matches genuine file extensions, and a full-page dump on the task
+  // that surfaced this bug found exactly one match (the real attachment,
+  // nothing else in the page's nav/chrome false-positived).
+  const extractAllAttachments = () => {
+    const linked = [...document.querySelectorAll('a')]
+      .filter(a => ATTACHMENT_EXT_RE.test((a.href || '') + ' ' + (a.textContent || '')))
+      .map(a => ({ href: a.href || '', filename: (a.textContent || '').trim() || (a.href || '').split('/').pop() }));
+    // Some task types (confirmed live: communication-thread) render the
+    // attachment as a plain <button> labelled with the filename and NO href at
+    // all — the real download id/URL only exists in that task's overview API
+    // response, not the DOM (docs/learnings-triage-attachment-to-document.md
+    // §8). Record these with href:'' so the attachment-count chip still sees
+    // a real file rather than silently dropping it. The save-as-document
+    // widget that used to resolve the download was removed in v3.268.7.
+    const unresolved = [...document.querySelectorAll('button')]
+      .filter(b => ATTACHMENT_EXT_RE.test((b.textContent || '').trim()))
+      .map(b => ({ href: '', filename: (b.textContent || '').trim() }));
+    // Dedupe by filename — the same attachment can legitimately appear twice
+    // in the DOM/API response (communicationThread's patientRequest vs
+    // operativeChannel duplication, already confirmed at the API layer).
+    const seen = new Set();
+    return linked.concat(unresolved).filter(a => {
+      if (seen.has(a.filename)) return false;
+      seen.add(a.filename);
+      return true;
+    });
+  };
+
+  const extractInitialRequest = () => {
+    const card = findCardByTitle('Initial Request');
+    const c = card ? cardContent(card) : null;
+    const text = c ? getText(c).replace(/^Initial Request\s*/i, '').trim() : '';
+    const attachments = extractAllAttachments();
+    return { text, attachmentCount: attachments.length, attachments };
+  };
+
+  const isDocumentTask = () => /\/tasks\/data\/document\/overview\//.test(location.href);
+
+  const extractDocumentTaskInfo = () => {
+    // Use findCardByTitle (handles both .m-card-v2 and legacy .m-card selectors)
+    const getCardText = (heading) => {
+      const card = findCardByTitle(heading);
+      return card ? getText(card) : '';
+    };
+    const overviewText = getCardText('Task Overview');
+    const detailText   = getCardText('Document Details');
+    const commentText  = getCardText('Internal Comments');
+    const codesText    = getCardText('Codes & Actions');
+
+    // Anchor key match to line-start to avoid substring collisions (e.g. 'Type' in 'Document Type')
+    const field = (text, key, stopRe) => {
+      const re = new RegExp('(?:^|\\n)' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\n?');
+      const m = re.exec(text);
+      if (!m) return '';
+      const rest = text.slice(m.index + m[0].length);
+      const stop = stopRe ? rest.match(stopRe) : null;
+      return (stop ? rest.slice(0, stop.index) : rest.split(/Edit task|Expand|New task|Save/i)[0]).trim();
+    };
+
+    // Strip heading and autocomplete chrome line-by-line (avoid lazy [\s\S]*?suggestions)
+    const codes = codesText
+      .replace(/^Codes & Actions\s*/i, '')
+      .replace(/^Type to enter[^\n]*\n?/gim, '')
+      .trim();
+
+    return {
+      taskDetails: {
+        Status:   field(overviewText, 'Status',   /Priority|Edit task/),
+        Priority: field(overviewText, 'Priority', /Edit task|Due/),
+        Created:  (overviewText.match(/Created\s*(\d{1,2}\s+\w+\s+\d{4})/) || [])[1] || ''
+      },
+      docType:   field(detailText, 'Type',                /Document date|Author/),
+      docDate:   (detailText.match(/Document date\s*(\d{1,2}\s+\w+\s+\d{4})/) || [])[1] || '',
+      author:    field(detailText, 'Author',               /Clinical specialty|Linked/i),
+      specialty: field(detailText, 'Clinical specialty',   /Linked/i),
+      comments:  commentText
+        .replace(/Internal Comments \(\d+\)\s*/i, '')
+        .replace(/New task comment[\s\S]*/i, '')
+        // Strip author attribution lines (Name • timestamp); allow hyphens/apostrophes in names
+        .replace(/^[A-Z][A-Za-z'\-]+(?: [A-Z][A-Za-z'\-]+)+\s*•[^\n]*/gm, '')
+        .trim(),
+      codes
+    };
+  };
+
+  // ---- Extraction-health (item 1.1 leg B, TRIAGE-LENS-2026-07-02.md) ----
+  // Static map of the card titles each page type's extraction genuinely queries
+  // via findCardByTitle. Keep this truthful to the extractors above — if a new
+  // findCardByTitle('...') call is added to record/detail extraction, add its
+  // title here too, or a real drop will go undetected by _missingCards.
+  //   record  — the five cards extractAll() itself reads (extractRegisters,
+  //             extractActiveProblems, extractMedications, extractTasks,
+  //             extractObservations).
+  //   detail  — extractTaskDetails / extractRequester / extractInitialRequest
+  //             (the non-document-task detail extraction in runDetail).
+  //   detail-document — extractDocumentTaskInfo's cards (the isDocumentTask()
+  //             branch of runDetail). NOT the same set as plain "detail":
+  //             a document-task page genuinely has no Task Details/Requester
+  //             Details/Initial Request cards, so treating those as "expected"
+  //             there would flag every document task as unreadable.
+  // Deliberately does NOT include Registers/Active Problems/etc for 'detail' —
+  // those record-summary cards are optional context on a detail page (a
+  // document/communication-thread page may never render them at all), so their
+  // absence there is normal, not a silent failure. See pageReady()'s own
+  // detail-readiness check, which likewise never requires them.
+  const EXPECTED_CARDS_BY_PAGE = {
+    record: ['Registers', 'Active Problems', 'Current Medication', 'Tasks & Actions', 'Observations & Results'],
+    detail: ['Task Details', 'Requester Details', 'Initial Request'],
+    'detail-document': ['Task Overview', 'Document Details', 'Internal Comments', 'Codes & Actions']
+  };
+
+  // Pure (given the current DOM): which of the titles expected for this page are
+  // genuinely ABSENT (findCardByTitle returned null) — never cards that are
+  // present but empty ("None."). A present-but-empty card is a real "nothing to
+  // flag"; a missing card node is "could not read", and the two must never look
+  // the same to a GP scanning the HUD.
+  const computeMissingCards = (pageTypeVal, isDocTask) => {
+    const key = pageTypeVal === 'detail' && isDocTask ? 'detail-document' : pageTypeVal;
+    const expected = EXPECTED_CARDS_BY_PAGE[key] || [];
+    return expected.filter(title => !findCardByTitle(title));
+  };
+
+  const extractAll = (pageTypeVal, isDocTask) => {
+    const pt = pageTypeVal || pageType();
+    return {
+      banner: extractBanner(),
+      registers: extractRegisters(),
+      problems: extractActiveProblems(),
+      meds: extractMedications(),
+      tasks: extractTasks(),
+      obs: extractObservations(),
+      docs: extractDocuments(),
+      cons: extractConsultations(),
+      _missingCards: computeMissingCards(pt, isDocTask)
+    };
+  };
+
+  // ============================================================
+  // 3. SIGNAL COMPUTATION (deterministic; no AI)
+  // ============================================================
+
+  const FRAILTY_TERMS = [
+    'postural hypotension', 'falls', 'fall', 'breathlessness', 'confusion', 'delirium',
+    'double incontinence', 'urinary incontinence', 'urine incontinence', 'faecal incontinence',
+    'dressing', 'unsteadiness', 'dizziness', 'cognitive', 'frail', 'reduced mobility',
+    'pressure sore', 'pressure ulcer', 'malnutrition', 'weight loss', 'sarcopenia'
+  ];
+
+  // Amber frailty fires at a single hit (frailtyHitsAmber defaults to 1), and the
+  // matcher used to be a raw substring. "fall" is a prefix of fallopian, Fallot
+  // and fallen (fallen arches), so those problem names lit the chip. Match the
+  // fall-words we mean; every other term stays on the substring test (so
+  // "confusional" still hits "confusion").
+  function problemNameMatchesFrailtyTerm(name, term) {
+    const n = String(name || '').toLowerCase();
+    const t = String(term || '').toLowerCase();
+    if (!n || !t) return false;
+    if (t === 'fall') return /\b(?:fall|falls|falling)\b/.test(n);
+    return n.includes(t);
+  }
+
+  const HIGH_RISK_DRUGS = [
+    { match: /methotrexate/i, name: 'Methotrexate', monitoring: 'FBC/LFT/U&E q12wk' },
+    { match: /lithium/i, name: 'Lithium', monitoring: 'Level + U&E + TFT q3mo' },
+    { match: /azathioprine/i, name: 'Azathioprine', monitoring: 'FBC/LFT q12wk' },
+    { match: /sulfasalazine/i, name: 'Sulfasalazine', monitoring: 'FBC/LFT q12wk' },
+    { match: /leflunomide/i, name: 'Leflunomide', monitoring: 'FBC/LFT q12wk' },
+    { match: /warfarin/i, name: 'Warfarin', monitoring: 'INR' },
+    { match: /amiodarone/i, name: 'Amiodarone', monitoring: 'TFT/LFT q6mo' },
+    { match: /clozapine/i, name: 'Clozapine', monitoring: 'FBC' },
+    { match: /spironolactone/i, name: 'Spironolactone', monitoring: 'U&E' },
+    { match: /digoxin/i, name: 'Digoxin', monitoring: 'Level + U&E' }
+  ];
+
+  const ANTICOAGS = [/warfarin/i, /apixaban/i, /rivaroxaban/i, /edoxaban/i, /dabigatran/i];
+  const ANTIPLATELETS = [/aspirin/i, /clopidogrel/i, /ticagrelor/i, /prasugrel/i, /dipyridamole/i];
+
+  // Anticholinergic burden is scored by the SINGLE canonical scorer
+  // engine/acb-scores.js (window.ACBScores, loaded ahead of this script in the
+  // manifest content_scripts list). This used to be a separate hardcoded table
+  // here that had drifted from the engine — strong anticholinergics (olanzapine,
+  // quetiapine, clozapine, chlorpromazine, clomipramine, doxepin, diphenhydramine,
+  // procyclidine, trihexyphenidyl) were missing, so a patient on one scored 0 in
+  // the queue HUD but 3 in the record/engine view. One scorer now, no drift.
+
+  // STOPP/START-style deterministic prescribing-safety flags. Pure function over
+  // a list of medication name strings + patient age; returns tile/chip items.
+  // Detection is name-based (no dm+d / ATC class data available), so it sticks to
+  // well-established, low-false-positive combinations and is worded as a review
+  // prompt — decision support, verify against the record.
+  function evaluatePrescribingFlags(meds, age) {
+    const NSAIDS = /ibuprofen|naproxen|diclofenac|celecoxib|etoricoxib|meloxicam|piroxicam|tenoxicam|indometh?acin|sulindac|ketoprofen|dexketoprofen|tiaprofenic|mefenamic|tolfenamic|fenoprofen|aceclofenac|nabumetone|etodolac|flurbiprofen/i;
+    const TOPICAL = /gel|cream|ointment|topical|patch|spray|eye ?drop|ear ?drop|foam/i;
+    const ANTICOAG = /warfarin|apixaban|rivaroxaban|edoxaban|dabigatran|acenocoumarol|phenindione|enoxaparin|dalteparin|tinzaparin|heparin/i;
+    const ANTIPLATELET = /aspirin|clopidogrel|ticagrelor|prasugrel|dipyridamole/i;
+    const ACEI_ARB = /ramipril|lisinopril|perindopril|enalapril|captopril|trandolapril|fosinopril|quinapril|imidapril|cilazapril|losartan|candesartan|valsartan|irbesartan|olmesartan|telmisartan|azilsartan|eprosartan/i;
+    const DIURETIC = /furosemide|frusemide|bumetanide|torasemide|bendroflumethiazide|indapamide|hydrochlorothiazide|chlortalidone|chlorthalidone|metolazone/i;
+    const BENZO_Z = /diazepam|lorazepam|temazepam|nitrazepam|oxazepam|chlordiazepoxide|clonazepam|alprazolam|zopiclone|zolpidem|zaleplon/i;
+    const GASTRO = /omeprazole|lansoprazole|esomeprazole|pantoprazole|rabeprazole|famotidine|cimetidine|nizatidine|ranitidine/i;
+
+    const list = (meds || []).map(m => String(m || ''));
+    const has = (re) => list.some(m => re.test(m));
+    const systemicNSAID = list.some(m => NSAIDS.test(m) && !TOPICAL.test(m));
+    const items = [];
+
+    if (systemicNSAID && has(ANTICOAG)) {
+      items.push({ severity: 'amber', text: 'NSAID + anticoagulant', detail: 'STOPP — major GI bleed risk; review need / gastroprotection' });
+    } else if (systemicNSAID && has(ANTIPLATELET)) {
+      items.push({ severity: 'amber', text: 'NSAID + antiplatelet', detail: 'STOPP — bleed risk; review need / gastroprotection' });
+    }
+    if (systemicNSAID && has(ACEI_ARB) && has(DIURETIC)) {
+      items.push({ severity: 'amber', text: 'Triple whammy (NSAID + ACEi/ARB + diuretic)', detail: 'AKI risk (PINCER / STOPP) — review' });
+    }
+    if (age != null && age >= 80 && has(BENZO_Z)) {
+      items.push({ severity: 'amber', text: 'Benzodiazepine/Z-drug in age ≥80', detail: 'STOPP — falls & sedation risk; consider deprescribing' });
+    }
+    // KD-32 — PINCER #1: NSAID in age ≥65 without gastroprotection
+    // Fail-closed: age must be known (age != null) and ≥65.
+    if (systemicNSAID && age != null && age >= 65 && !has(GASTRO)) {
+      items.push({ severity: 'amber', text: 'NSAID in age ≥65 without gastroprotection', detail: 'PINCER #1 — GI bleed risk; consider PPI cover / review NSAID need' });
+    }
+    return items;
+  }
+
+  const computeSignals = (d) => {
+    const sig = {
+      risk: { level: 'green', items: [] },
+      monitoring: { level: 'green', items: [] },
+      meds: { level: 'green', items: [] },
+      openLoops: { level: 'green', items: [] },
+      carePlan: { level: 'green', items: [] },
+      safeguarding: { level: 'green', items: [] },
+      headerChips: []
+    };
+
+    // ---- HEADER CHIPS ----
+    // All chips now route through getSystemChip so they're user-configurable
+    // (label, severity, enabled, actions). Push only if not null.
+    const pushSys = (id, vars) => {
+      const c = getSystemChip(id, vars);
+      if (c) sig.headerChips.push(c);
+    };
+
+    if (d.banner.age) pushSys('record.age', { age: d.banner.age });
+    if (d.tasks && Array.isArray(d.tasks.incomplete) && d.tasks.incomplete.length) {
+      sig.openLoops.level = 'amber';
+      sig.openLoops.items.push({
+        severity: 'amber',
+        text: `${d.tasks.incomplete.length} incomplete task${d.tasks.incomplete.length > 1 ? 's' : ''}`,
+        detail: d.tasks.incomplete.join('; '),
+      });
+    }
+    return sig;
+  };
+
+  // Apply user rules: merge matching rules into header chips & bump tiles.
+  // Also returns the matched rules separately so the renderer can attach
+  // action-menu handlers to their chips.
+  // requireCtx (item 3.5, optional) — { ageYears?, sex?, medsText?, problemsText? }.
+  // A rule with a `require` clause this ctx cannot confirm is EXCLUDED from `matched`
+  // (fails closed) — the SAME gate the queue applies in decorateOneRow, applied here
+  // for the detail/record HUD rule chips. Never suppresses another, un-gated rule.
+  // Item 4.3 (TRIAGE-LENS-2026-07-02.md) — green sorts LAST (after info): green is
+  // the "confidently routine, nothing to check" signal, so it must never visually
+  // outrank even an informational chip. Mirrors RULE_KIND_RANK below (queue path) —
+  // keep both in lock-step if this ordering ever changes.
+  const applyRules = (sig, page, fieldsData, requireCtx) => {
+    const rawMatched = matchRules(page, fieldsData);
+    const matcherReq = typeof window !== 'undefined' && window.TriageLensMatch && window.TriageLensMatch.ruleRequireMet;
+    const matched = matcherReq
+      ? rawMatched.filter((r) => matcherReq(r, requireCtx || {}))
+      : rawMatched;
+    // Red chips must never trail amber/info ones: order by severity (stable
+    // sort preserves config order within the same severity).
+    matched.sort((a, b) =>
+      (RULE_CHIP_SEVERITY[a.kind] ?? 9) - (RULE_CHIP_SEVERITY[b.kind] ?? 9));
+    sig.ruleChips = [];
+    const bumpLevel = (cur, lvl) => ({ green: 0, amber: 1, red: 2, info: 0 })[lvl] > ({ green: 0, amber: 1, red: 2, info: 0 })[cur] ? lvl : cur;
+    for (const rule of matched) {
+      sig.ruleChips.push({
+        kind: rule.kind,
+        text: rule.label,
+        ruleId: rule.id,
+        hasActions: (rule.actions || []).length > 0
+      });
+      if (rule.bumpsTile && sig[rule.bumpsTile] && (rule.kind === 'red' || rule.kind === 'amber')) {
+        const tile = sig[rule.bumpsTile];
+        tile.level = bumpLevel(tile.level, rule.kind);
+        tile.items.push({
+          severity: rule.kind,
+          text: 'Rule: ' + rule.label,
+          detail: 'Matched user rule (configurable in settings)'
+        });
+      }
+    }
+    return sig;
+  };
+
+  // ---- Request-side signals (detail page) ----
+  const computeRequestSignals = (taskDetails, requester, initialReq) => {
+    const t = taskDetails || {};
+    const r = requester || {};
+    const ir = initialReq || { text: '', attachmentCount: 0, attachments: [] };
+
+    const out = { chips: [], snippet: '' };
+    const pushOut = (id, vars) => {
+      const c = getSystemChip(id, vars);
+      if (c) out.chips.push(c);
+    };
+
+    // Status chip — pick the right id based on status text
+    if (t.Status) {
+      let id = 'detail.statusOther';
+      if (/awaiting/i.test(t.Status)) id = 'detail.statusAwaiting';
+      else if (/reply received/i.test(t.Status)) id = 'detail.statusReplyReceived';
+      else if (/closed|completed|resolved/i.test(t.Status)) id = 'detail.statusClosed';
+      pushOut(id, { status: t.Status });
+    }
+
+    // Priority - only flag if escalated
+    if (t.Priority && /high|urgent/i.test(t.Priority)) {
+      pushOut('detail.priority', { priority: t.Priority });
+    }
+
+    // Days open from Created timestamp
+    if (t.Created) {
+      const m = t.Created.match(/(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})/);
+      if (m) {
+        const d = parseDate(m[0]);
+        const days = daysAgo(d);
+        if (Number.isFinite(days)) {
+          if (days === 0) pushOut('detail.today');
+          else if (days >= TH('taskAgeRed')) pushOut('detail.daysOpenRed', { days });
+          else if (days >= TH('taskAgeAmber')) pushOut('detail.daysOpenAmber', { days });
+          else pushOut('detail.daysOpenInfo', { days });
+        }
+      }
+    }
+
+    // Proxy relationship
+    const rel = r['Relationship to patient'];
+    if (rel && !/self/i.test(rel)) pushOut('detail.proxy', { relationship: rel });
+
+    // Attachments — the count chip only. The save-as-document widget that read
+    // window.__msTriageAttachments / window.__msTaskCreatedDate was removed in
+    // v3.268.7; those globals are no longer written.
+    if (ir.attachmentCount > 0) pushOut('detail.attachments', { count: ir.attachmentCount });
+
+    // Snippet of request body for context (truncated, configurable via prefs)
+    if (ir.text && PREF('showRequestSnippet', true)) {
+      const body = ir.text.replace(/\s+/g, ' ').trim();
+      const max = PREF('snippetMaxChars', 240);
+      out.snippet = body.length > max ? body.slice(0, max) + '…' : body;
+    }
+
+    return out;
+  };
+
+  // ============================================================
+  // 3b. MONITORING-DUE OVERLAY CHIP
+  // ============================================================
+  // Surfaces high-risk-drug monitoring that is overdue / due-soon on
+  // single-patient views (record / detail), reusing the SAME Sentinel engine
+  // Sentinel itself uses (window.SentinelDataFetcher + window.SentinelRules +
+  // canonical rules/drug-rules.json). The overlay computes nothing clinical
+  // itself — it only filters + formats what the rules engine returns. If any
+  // global is missing or the fetch fails, we emit NO chip (never a false
+  // "all clear", never a false "overdue").
+
+  // Pure filter/format step — kept as a standalone function so it can be
+  // unit-tested in isolation (see test-monitoring-chip.js). Given the chip
+  // array from SentinelRules.evaluatePatient, returns { count, level, items }
+  // for the action-needed drug-monitoring entries, or null when none.
+  function selectMonitoringDue(chips) {
+    if (!Array.isArray(chips)) return null;
+    // Substantiated-overdue (we have dated bloods and they're late) and missing
+    // (no recognised monitoring test on record at all) are surfaced together.
+    // no_data on a high-risk drug is clinically a red flag — but we must word it
+    // honestly ("no recent FBC/…") and never imply an overdue value we can't see.
+    const ACTION = ['overdue', 'stale', 'due_soon'];
+    const due = chips.filter(c => c && c.type === 'drug-monitoring' &&
+      (ACTION.includes(c.status) || c.status === 'no_data'));
+    if (due.length === 0) return null;
+
+    // Build an honest detail line for a no_data chip: name the specific tests
+    // that have no value on record (not a blanket "no bloods", since a drug like
+    // leflunomide also wants BP/weight which a practice may simply not code).
+    const missingDetail = (c) => {
+      const missing = (c.tests || [])
+        .filter(t => t && t.status === 'no_data')
+        .map(t => t.name)
+        .filter(Boolean);
+      if (!missing.length) return 'no monitoring on record';
+      return 'no recent ' + missing.join(', ');
+    };
+
+    const items = due.map(c => ({
+      // Engine emits `drugName`; tolerate `displayName` for forward-compat.
+      name: c.displayName || c.drugName || c.label || 'Medication',
+      status: c.status,
+      // Human detail: for no_data, name the missing tests; otherwise use the
+      // engine's readable summary (tolerate a flat `detail` field too).
+      detail: c.status === 'no_data'
+        ? missingDetail(c)
+        : (c.detail || (c.evidence && c.evidence.summary) || c.status)
+    }));
+    // Red when anything is substantiated-overdue/severely-overdue, OR when a
+    // high-risk drug has no recognised monitoring at all (no_data). Amber only
+    // when the sole finding is due-soon.
+    const level = due.some(c => c.status === 'overdue' || c.status === 'stale' || c.status === 'no_data')
+      ? 'red' : 'amber';
+    return { count: due.length, level, items };
+  }
+
+  // Cache the canonical drug-rules JSON across navigations (do not refetch).
+  let _monitoringRulesCache = null;
+  // Last computed monitoring result + the token it belongs to, so a HUD
+  // re-render can re-paint the chip from cache (it lives outside the base
+  // template and would otherwise be wiped) without waiting for a refetch.
+  let _lastMonitoring = null; // { token, result|null }
+  // Evaluation memo for the record HUD (engine/eval-cache.js). Skips re-running
+  // engine.evaluatePatient when freshly-fetched data is byte-identical to the
+  // last run; self-invalidating via the input hash, so never a stale all-clear.
+  const _monEvalCache =
+    (typeof window !== 'undefined' && window.SentinelEvalCache && window.SentinelEvalCache.createEvalCache())
+    || { get() { return undefined; }, set(t, h, v) { return v; }, invalidate() {} };
+  // Dynamic action lists for system chips whose actions are built at runtime
+  // (keyed by the 'system:<id>' ruleId so findRuleById can resolve them).
+  const _dynamicSysActions = {};
+  const MONITORING_CHIP_IDS = ['record.monitoringDueRed', 'record.monitoringDueAmber', 'detail.monitoringDueRed', 'detail.monitoringDueAmber'];
+  // Drop any retained per-patient monitoring note (clinical text must not
+  // outlive the patient it belongs to).
+  const clearMonitoringDynActions = () => { MONITORING_CHIP_IDS.forEach(k => { delete _dynamicSysActions['system:' + k]; }); };
+  const removeMonitoringChipEl = () => { hudEl?.querySelectorAll?.('.ch-monitoring-chip').forEach(el => el.remove()); };
+
+  const loadMonitoringRules = async () => {
+    if (_monitoringRulesCache) return _monitoringRulesCache;
+    try {
+      if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.getURL) return null;
+      const url = chrome.runtime.getURL('rules/drug-rules.json');
+      const doc = await fetch(url).then(r => r.json());
+      _monitoringRulesCache = (doc && doc.rules) || [];
+      return _monitoringRulesCache;
+    } catch (e) {
+      log('monitoring rules load failed', e);
+      return null;
+    }
+  };
+
+  // Items 4.1/4.2 (TRIAGE-LENS-2026-07-02.md) — the CSO-signed reception pathway
+  // set (rules/reception-pathways.json), fetched ONCE per session for the
+  // reception-match engine (window.SentinelReceptionMatch, engine/reception-match.js).
+  // Unlike loadMonitoringRules above this is read by decorateOneRow's SYNCHRONOUS,
+  // DOM-driven chip pass (CLAUDE.md's "age/decoration" durability rule) rather than
+  // by an async-fetch chip family — so this cache is a plain module `let`, kicked
+  // off ONCE at module init (see loadConfig().then(...) below) and read as-is
+  // (possibly still null) on every decorateOneRow call. That's safe: the live
+  // queue's MutationObserver churns constantly and refreshQueueChips wipes + fully
+  // rebuilds every row's chips on every cycle, so the very next churn after the
+  // fetch resolves picks the pathway chip up — exactly like CONFIG itself before
+  // its first chrome.storage.local.get resolves.
+  let _receptionPathwaysData = null; // { pathways, closingQuestions, … } | null
+  let _receptionPathwaysFetchStarted = false;
+  const ensureReceptionPathwaysLoaded = () => {
+    if (_receptionPathwaysData || _receptionPathwaysFetchStarted) return;
+    _receptionPathwaysFetchStarted = true;
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.getURL) return;
+    const url = chrome.runtime.getURL('rules/reception-pathways.json');
+    fetch(url)
+      .then((r) => r.json())
+      .then((doc) => {
+        _receptionPathwaysData = doc && Array.isArray(doc.pathways) ? doc : null;
+      })
+      .catch((e) => {
+        log('reception pathways load failed', e);
+      });
+  };
+
+  // Async: fetch patient data via Sentinel, evaluate, and return the
+  // selectMonitoringDue() result (or null). Guards every global access.
+  const computeMonitoringChip = async () => {
+    // Lite build: drug-monitoring chips are not shipped. Do not fetch the record.
+    return null;
+  };
+
+  // Identity token captured before the await — pageType + best-effort patient
+  // id/URL — so a result that resolves after the user navigated away (or to a
+  // different patient) is discarded rather than injected against the wrong page.
+  // Patient-granular: fetchPatientData resolves the patient from location.href,
+  // so the full URL is the identity. (Do NOT use the sticky lastPatientUrl — it
+  // only updates on /care-record/ pages, so two different task-detail patients
+  // would otherwise alias to the same token and a slow fetch could paint the
+  // wrong patient's chip.)
+  const monitoringToken = () => pageType() + '|' + location.href;
+
+  // Kick off the async monitoring computation after the synchronous HUD render.
+  // Captures the page/patient token before awaiting; on resolve, discards if the
+  // token changed (staleness guard), otherwise injects the chip into the already
+  // rendered HUD without a full re-render (deduped by ruleId).
+  const runMonitoringChip = () => {
+    const token = monitoringToken();
+    // Navigated to a different patient/page: drop the previous patient's cached
+    // result and any retained note before doing anything else.
+    if (_lastMonitoring && _lastMonitoring.token !== token) {
+      _lastMonitoring = null;
+      _monEvalCache.invalidate(); // drop all memoised evals on patient/page change
+      clearMonitoringDynActions();
+    }
+    // Re-paint instantly from cache for the same patient — the HUD was just
+    // rebuilt (innerHTML) and wiped the injected chip, so without this the chip
+    // flickers out until the (re)fetch resolves.
+    if (_lastMonitoring && _lastMonitoring.token === token && _lastMonitoring.result) {
+      injectMonitoringChip(_lastMonitoring.result);
+    }
+    computeMonitoringChip().then(result => {
+      // Staleness guard: page/patient changed while we were fetching.
+      if (monitoringToken() !== token) { log('monitoring chip discarded (stale)'); return; }
+      _lastMonitoring = { token, result };
+      if (result) {
+        injectMonitoringChip(result);
+      } else {
+        // No monitoring due for this patient now — clear any cached chip/note.
+        clearMonitoringDynActions();
+        removeMonitoringChipEl();
+      }
+    }).catch(e => log('monitoring chip error', e));
+  };
+
+  // Inject (or replace) the monitoring chip into the live HUD chips row.
+  const injectMonitoringChip = (result) => {
+    const pt = pageType();
+    if (pt !== 'record' && pt !== 'detail') return;
+    const id = pt + (result.level === 'red' ? '.monitoringDueRed' : '.monitoringDueAmber');
+    const chip = getSystemChip(id, { count: result.count });
+    if (!chip) return;
+    // Build the dynamic note action listing each item, one per line.
+    const noteLines = result.items.map(it => `${it.name} — ${it.detail}`);
+    noteLines.push('');
+    noteLines.push('Decision support — verify against the record.');
+    _dynamicSysActions[chip.ruleId] = [
+      { type: 'note', label: 'Monitoring detail', text: noteLines.join('\n') }
+    ];
+    chip.hasActions = true;
+    const hud = hudEl;
+    if (!hud || !hud.isConnected) return;
+    const row = hud.querySelector('.ch-chips');
+    if (!row) return;
+    // Dedupe: remove any previously injected monitoring chip (either severity)
+    // before adding the current one.
+    row.querySelectorAll('.ch-monitoring-chip').forEach(el => el.remove());
+    // If the "No flags" / "Not fully assessed" placeholder is the only thing
+    // present, clear it — a real chip firing means there IS something to show,
+    // whichever placeholder headlineNoFlagsChipHtml() picked.
+    const placeholder = row.querySelector('.ch-chip-info, .ch-chip-not-assessed');
+    if (placeholder && row.children.length === 1 && /No flags|Not fully assessed/i.test(placeholder.textContent)) {
+      placeholder.remove();
+    }
+    const tmp = document.createElement('div');
+    tmp.innerHTML = renderChipHtml(chip);
+    const el = tmp.firstElementChild;
+    if (!el) return;
+    el.classList.add('ch-monitoring-chip');
+    el.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      showActionMenu(el, el.dataset.ruleId);
+    });
+    row.appendChild(el);
+  };
+
+  // ============================================================
+  // 4. RENDERING + PIP
+  // ============================================================
+
+  const HUD_ID = 'medicus-clinical-hud';
+
+  // Persistent state
+  let hudEl = null;          // the HUD <aside>; survives doc moves
+  let pipWindow = null;      // active Document PiP window if popped out
+  let lastSignals = null;    // for tile click handlers when re-binding
+  let lastPatientUrl = '';   // sticky link target — set whenever we successfully extract a patient
+  let lastPatientName = '';
+
+  const inPip = () => !!pipWindow && !pipWindow.closed;
+  const hudDoc = () => inPip() ? pipWindow.document : document;
+  const hudHost = () => inPip() ? pipWindow.document.body : document.body;
+  const pipSupported = () => typeof window.documentPictureInPicture !== 'undefined';
+
+  // Extract patient display name from document.title.
+  // Medicus uses "Patient Care Record, Mrs Elizabeth Waring | Medicus".
+  // Updates the sticky cache only when we actually find one.
+  const extractPatientName = () => {
+    const t = document.title || '';
+    let m = t.match(/Patient Care Record,\s+([^|]+?)\s*\|/i);
+    let name = '';
+    if (m) name = m[1].trim();
+    else {
+      m = t.match(/^([^|]+?)\s*\|\s*Medicus/i);
+      if (m && m[1].trim().length < 80 && !/dashboard|workflow|home/i.test(m[1])) name = m[1].trim();
+    }
+    if (name) {
+      lastPatientName = name;
+      // Cache URL only when we know we're on a patient page
+      if (/\/care-record\//i.test(location.href)) lastPatientUrl = location.href;
+    }
+    // Return the display name — fall back to last known so pill stays sticky
+    return name || lastPatientName;
+  };
+
+  // ---- Extraction-health (item 1.1 leg B) — pure helpers, unit-testable
+  // without a DOM or a full renderHUD() call. ----
+
+  // Which cards each HUD tile's signal is computed from (see computeSignals).
+  // Conservative & manual — kept next to the tile map itself, not derived, so a
+  // reviewer can see at a glance whether a new signal source needs adding here.
+  // Non-card sources (banner warnings, the docs/consultations free-text search)
+  // are deliberately excluded: they're never gated by findCardByTitle, so their
+  // absence is not an extraction failure this mechanism can detect.
+  const TILE_CARD_SOURCES = {
+    risk: ['Active Problems', 'Registers'],
+    monitoring: ['Tasks & Actions', 'Observations & Results'],
+    meds: ['Current Medication'],
+    openLoops: ['Tasks & Actions'],
+    carePlan: ['Registers', 'Active Problems'],
+    safeguarding: ['Registers']
+  };
+
+  // Pure: is this tile's CURRENT clear/zero state actually "we never read the
+  // data" rather than "we read it and it's genuinely clear"? Only fires when
+  // EVERY card this tile draws from is missing AND the tile found nothing —
+  // a tile that already has a real finding (e.g. risk's docs-derived recent-
+  // discharge check, which isn't card-gated) keeps showing that finding rather
+  // than being masked by an unrelated missing card.
+  const tileNotAssessed = (key, signal, missingCards) => {
+    const sources = TILE_CARD_SOURCES[key];
+    if (!sources || !sources.length || !signal) return false;
+    if (signal.items && signal.items.length > 0) return false;
+    const missing = missingCards || [];
+    return sources.every(title => missing.includes(title));
+  };
+
+  // Pure: the header-chips-row placeholder when no chip fired. A missing card
+  // must never render identically to a genuine "No flags" — that's the whole
+  // point of item 1.1 (H-005: "not assessed" must never look like "normal").
+  const headlineNoFlagsChipHtml = (missingCards) => {
+    if (missingCards && missingCards.length) {
+      return '<span class="ch-chip ch-chip-not-assessed" title="Could not read: ' +
+        escapeHtml(missingCards.join(', ')) + '">Not fully assessed</span>';
+    }
+    return '<span class="ch-chip ch-chip-info">No flags</span>';
+  };
+
+  // Pure: the grey footer line naming which cards could not be read this pass.
+  const missingCardsFooterHtml = (missingCards) => {
+    if (!missingCards || !missingCards.length) return '';
+    return `<div class="ch-missing-footer">Could not read: ${escapeHtml(missingCards.join(', '))}</div>`;
+  };
+
+  const tile = (key, label, signal, missingCards) => {
+    if (tileNotAssessed(key, signal, missingCards)) {
+      return `
+    <div class="ch-tile ch-not-assessed" data-tile="${key}" title="Could not read the card(s) this tile needs">
+      <div class="ch-tile-label">${label}</div>
+      <div class="ch-tile-status">—</div>
+      <div class="ch-tile-count">Not assessed</div>
+    </div>`;
+    }
+    return `
+    <div class="ch-tile ch-${signal.level}" data-tile="${key}">
+      <div class="ch-tile-label">${label}</div>
+      <div class="ch-tile-status">${signal.level === 'green' && signal.items.length === 0 ? '—' : signal.level.toUpperCase()}</div>
+      <div class="ch-tile-count">${signal.items.length ? signal.items.length + ' signal' + (signal.items.length > 1 ? 's' : '') : ''}</div>
+    </div>`;
+  };
+
+  const detailList = (items) => {
+    if (!items.length) return '<div class="ch-detail-empty">No flags</div>';
+    return items.map(it => `
+      <div class="ch-detail-row ch-${it.severity}">
+        <div class="ch-detail-text">${escapeHtml(it.text)}</div>
+        ${it.detail ? `<div class="ch-detail-sub">${escapeHtml(it.detail)}</div>` : ''}
+      </div>`).join('');
+  };
+
+  const _HTML_ESC = { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' };
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => _HTML_ESC[c]);
+
+  const ensureHudEl = () => {
+    const doc = hudDoc();
+    const host = hudHost();
+    if (!hudEl || !hudEl.isConnected || hudEl.ownerDocument !== doc) {
+      // Either first run, detached, or in the wrong doc — (re-)create / re-attach
+      if (hudEl && hudEl.parentElement) hudEl.parentElement.removeChild(hudEl);
+      if (!hudEl || hudEl.ownerDocument !== doc) {
+        hudEl = doc.createElement('aside');
+        hudEl.id = HUD_ID;
+      }
+      host.appendChild(hudEl);
+    }
+    return hudEl;
+  };
+
+  // ---- Chip rendering with optional action menu trigger ----
+  // chip: { kind, text, ruleId?, hasActions? }
+  const renderChipHtml = (chip) => {
+    const ruleAttr = chip.ruleId ? ` data-rule-id="${escapeHtml(chip.ruleId)}"` : '';
+    const cursorClass = chip.hasActions ? ' ch-chip-actionable' : '';
+    const chevron = chip.hasActions ? ' <span class="ch-chev">▾</span>' : '';
+    return `<span class="ch-chip ch-chip-${escapeHtml(chip.kind)}${cursorClass}"${ruleAttr} title="${escapeHtml(chip.text)}">${escapeHtml(chip.text)}${chevron}</span>`;
+  };
+
+  // ---- Action menu popover ----
+  // Anchored to document.body so it works in HUD, queue rows, and the request
+  // panel. One menu open at a time (shared singleton — the rule-match menu
+  // below, item 2.1/2.3/2.5 of TRIAGE-LENS-2026-07-02.md, reuses this SAME
+  // activeActionMenu/closeActionMenu pair rather than a second one, so that
+  // (a) only one popover is ever open across the whole extension and (b) its
+  // "note" action back-button — wired to closeActionMenu() inside
+  // executeAction below — closes the right menu regardless of which caller
+  // opened it). Dismiss on outside click, Esc, or scroll (item 2.5's "menu
+  // element" requirement); activeAnchorEl lets refreshQueueChips notice when
+  // a still-open menu's anchor chip has been wiped out from under it by the
+  // next churn cycle (CLAUDE.md rule #3) and close rather than float over a
+  // dead reference.
+  let activeActionMenu = null;
+  let activeAnchorEl = null;
+  const closeActionMenu = () => {
+    if (activeActionMenu) {
+      activeActionMenu.remove();
+      activeActionMenu = null;
+    }
+    activeAnchorEl = null;
+    document.removeEventListener('click', onDocClickForMenu, true);
+    document.removeEventListener('keydown', onKeydownForMenu, true);
+    window.removeEventListener('scroll', onScrollForMenu, true);
+  };
+  const onDocClickForMenu = (e) => {
+    if (!activeActionMenu) return;
+    if (activeActionMenu.contains(e.target)) return;
+    closeActionMenu();
+  };
+  const onKeydownForMenu = (e) => {
+    if (e.key === 'Escape') closeActionMenu();
+  };
+  const onScrollForMenu = (e) => {
+    // The menu itself scrolls (max-height + overflow-y cap in the embedded
+    // CSS) — its own internal scroll must not close it. Only a scroll
+    // OUTSIDE the open menu dismisses.
+    if (activeActionMenu && e && e.target instanceof Element && activeActionMenu.contains(e.target)) return;
+    closeActionMenu();
+  };
+  const armActionMenuDismissal = () => {
+    setTimeout(() => document.addEventListener('click', onDocClickForMenu, true), 0);
+    document.addEventListener('keydown', onKeydownForMenu, true);
+    window.addEventListener('scroll', onScrollForMenu, true);
+  };
+
+  const findRuleById = (id) => {
+    if (!id) return null;
+    if (id.startsWith('system:')) {
+      const sysId = id.slice(7);
+      const sys = findSystemChip(sysId);
+      if (!sys) return null;
+      // Runtime-built actions (e.g. the monitoring-due note) take precedence
+      // over the static config actions for this chip.
+      const dynamic = _dynamicSysActions[id];
+      return {
+        id, label: sys.label, kind: sys.kind,
+        actions: dynamic || sys.actions || []
+      };
+    }
+    if (!CONFIG || !CONFIG.rules) return null;
+    return CONFIG.rules.find(r => r.id === id) || null;
+  };
+
+  const showActionMenu = (anchor, ruleId) => {
+    closeActionMenu();
+    const rule = findRuleById(ruleId);
+    if (!rule) return;
+    const actions = rule.actions || [];
+    const r = anchor.getBoundingClientRect();
+
+    const menu = document.createElement('div');
+    menu.className = 'ch-action-menu';
+    menu.style.position = 'fixed';
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 320)) + 'px';
+    menu.style.zIndex = '2147483647';
+
+    const header = document.createElement('div');
+    header.className = 'ch-action-menu-head';
+    header.innerHTML = `<span class="ch-chip ch-chip-${escapeHtml(rule.kind)}">${escapeHtml(rule.label)}</span>`;
+    menu.appendChild(header);
+
+    if (!actions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ch-action-menu-empty';
+      empty.textContent = 'No actions configured for this rule.';
+      menu.appendChild(empty);
+    }
+
+    actions.forEach((a) => {
+      const item = document.createElement('div');
+      item.className = 'ch-action-menu-item ch-action-menu-item-' + escapeHtml(a.type || 'note');
+      const iconMap = { link: '🔗', snippet: '📋', note: '📌' };
+      item.innerHTML = `<span class="ch-action-icon">${iconMap[a.type] || '•'}</span><span class="ch-action-label">${escapeHtml(a.label || '(unlabelled)')}</span>`;
+      item.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        executeAction(a, item, menu);
+      });
+      menu.appendChild(item);
+    });
+
+    document.body.appendChild(menu);
+    activeActionMenu = menu;
+    activeAnchorEl = anchor;
+    armActionMenuDismissal();
+  };
+
+  const isSafeActionUrl = (url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const executeAction = (action, anchorEl, menuEl) => {
+    if (!action) return;
+    if (action.type === 'link' && action.url) {
+      if (!isSafeActionUrl(action.url)) {
+        log('executeAction: blocked unsafe action.url', action.url);
+        closeActionMenu();
+        return;
+      }
+      try { window.open(action.url, '_blank', 'noopener'); } catch (e) {}
+      closeActionMenu();
+      return;
+    }
+    if (action.type === 'snippet' && action.text) {
+      const text = action.text;
+      const writeClipboard = async () => {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+          }
+          if (anchorEl) {
+            const orig = anchorEl.innerHTML;
+            anchorEl.innerHTML = '<span class="ch-action-icon">✓</span><span class="ch-action-label">Copied</span>';
+            setTimeout(() => { try { anchorEl.innerHTML = orig; } catch(e){} closeActionMenu(); }, 700);
+          } else {
+            closeActionMenu();
+          }
+        } catch (e) {
+          if (anchorEl) {
+            anchorEl.innerHTML = '<span class="ch-action-icon">✗</span><span class="ch-action-label">Copy failed</span>';
+          }
+        }
+      };
+      writeClipboard();
+      return;
+    }
+    if (action.type === 'note' && action.text) {
+      // Replace menu body with the note text, with a back button
+      menuEl.innerHTML = '';
+      const head = document.createElement('div');
+      head.className = 'ch-action-menu-head';
+      head.innerHTML = `<button class="ch-action-back" type="button">← Back</button><span class="ch-action-note-title">${escapeHtml(action.label || 'Note')}</span>`;
+      menuEl.appendChild(head);
+      const body = document.createElement('div');
+      body.className = 'ch-action-menu-note';
+      body.textContent = action.text;
+      menuEl.appendChild(body);
+      head.querySelector('.ch-action-back').addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        closeActionMenu();
+      });
+    }
+  };
+
+  // ---- Rule-match menu (queue rule chips — items 2.1/2.3/2.5,
+  // TRIAGE-LENS-2026-07-02.md) ----
+  // Reuses the SAME activeActionMenu/closeActionMenu singleton as
+  // showActionMenu/executeAction above — only one popover open at a time —
+  // so link/snippet/note actions clicked from here run through the existing,
+  // already-hardened executeAction unchanged (scheme-checked links, clipboard
+  // snippets, note view). This block only builds what goes INSIDE the popover
+  // for a queue row's matched rules: an evidence line ahead of the actions,
+  // and — when more than one rule matched — a list view to drill through
+  // them. `rules` is the row's RANKED matched (compiled) rule array and
+  // `previewText` the row's request text, both closure-captured by
+  // decorateOneRow at decoration time. buildEvidenceEl below recomputes full
+  // evidence (term/context/qualifier) lazily, on menu open — decorateOneRow's
+  // own rankRuleMatches call (item 3.4) only computes the qualifier up front,
+  // to rank/label chips; it never builds the full evidence text.
+  const buildEvidenceEl = (rule, previewText) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'ch-rule-menu-evidence';
+    const ev = window.TriageLensMatch.ruleMatchEvidence(rule, previewText || '');
+    if (!ev) {
+      wrap.classList.add('ch-rule-menu-evidence-empty');
+      wrap.textContent = 'No matching text found in the current request.';
+      return wrap;
+    }
+    const label = document.createElement('div');
+    label.className = 'ch-rule-menu-evidence-label';
+    label.textContent = 'Matched text';
+    wrap.appendChild(label);
+    const p = document.createElement('p');
+    p.className = 'ch-rule-menu-evidence-text';
+    // The request text is UNTRUSTED (patient/reception-typed) — built with
+    // createElement/textContent only, NEVER innerHTML of it (a prior
+    // attribute-injection XSS was fixed in this area; CLAUDE.md pins that
+    // discipline for this surface). ev.term is a verbatim substring of
+    // ev.context (both derived from the same source string), so a plain
+    // indexOf finds it; if the term happens to recur earlier in the same
+    // sentence the FIRST occurrence is highlighted — a cosmetic edge case,
+    // not a correctness/safety one.
+    const idx = ev.context.indexOf(ev.term);
+    if (idx === -1) {
+      p.appendChild(document.createTextNode(ev.context));
+    } else {
+      p.appendChild(document.createTextNode(ev.context.slice(0, idx)));
+      const strong = document.createElement('strong');
+      strong.appendChild(document.createTextNode(ev.context.slice(idx, idx + ev.term.length)));
+      p.appendChild(strong);
+      p.appendChild(document.createTextNode(ev.context.slice(idx + ev.term.length)));
+    }
+    wrap.appendChild(p);
+    // Item 3.4 — surface WHY a match was demoted (never why it was hidden —
+    // it never is). ev.qualifierTerm is our own compiled negator/past-phrase
+    // list, not request text, so a plain textContent template literal is fine.
+    if (ev.qualifier) {
+      const q = document.createElement('p');
+      q.className = 'ch-rule-menu-evidence-qualifier ch-rule-menu-evidence-qualifier-' + ev.qualifier;
+      const qLabel = ev.qualifier === 'negated' ? 'negation detected' : 'past-reference detected';
+      q.textContent = `${qLabel}: "${ev.qualifierTerm}"`;
+      wrap.appendChild(q);
+    }
+    return wrap;
+  };
+
+  const RULE_MENU_ACTION_ICONS = { link: '🔗', snippet: '📋', note: '📌' };
+
+  const renderRuleMenuActionItems = (rule) => {
+    const box = document.createDocumentFragment();
+    const actions = rule.actions || [];
+    if (!actions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ch-action-menu-empty';
+      empty.textContent = 'No actions configured for this rule.';
+      box.appendChild(empty);
+      return box;
+    }
+    actions.forEach((a) => {
+      const item = document.createElement('div');
+      item.className = 'ch-action-menu-item ch-action-menu-item-' + (a.type || 'note');
+      item.setAttribute('role', 'menuitem');
+      item.setAttribute('tabindex', '0');
+      const icon = document.createElement('span');
+      icon.className = 'ch-action-icon';
+      icon.textContent = RULE_MENU_ACTION_ICONS[a.type] || '•';
+      const label = document.createElement('span');
+      label.className = 'ch-action-label';
+      label.textContent = a.label || '(unlabelled)';
+      item.appendChild(icon);
+      item.appendChild(label);
+      const activate = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        executeAction(a, item, activeActionMenu);
+      };
+      item.addEventListener('click', activate);
+      item.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') activate(e);
+      });
+      box.appendChild(item);
+    });
+    return box;
+  };
+
+  // Detail view: one rule's evidence + actions. `showBack` is true only when
+  // reached by drilling into the "+N" list view, so the top chip's own
+  // (single-rule) detail view has no back target.
+  const renderRuleMenuDetail = (rule, previewText, rules, showBack) => {
+    if (!activeActionMenu) return;
+    activeActionMenu.innerHTML = '';
+    activeActionMenu.setAttribute(
+      'aria-label',
+      `${rule.label} — ${rule.kind} alert` +
+        (rule._qualifier ? `, ${RULE_QUALIFIER_ARIA[rule._qualifier]}` : '')
+    );
+    const head = document.createElement('div');
+    head.className = 'ch-action-menu-head';
+    if (showBack) {
+      const back = document.createElement('button');
+      back.className = 'ch-action-back';
+      back.type = 'button';
+      back.textContent = '← Back';
+      back.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        renderRuleMenuList(rules, previewText);
+      });
+      head.appendChild(back);
+    }
+    const badge = document.createElement('span');
+    badge.className = 'ch-chip ch-chip-' + rule.kind;
+    badge.textContent = rule.label;
+    head.appendChild(badge);
+    activeActionMenu.appendChild(head);
+    activeActionMenu.appendChild(buildEvidenceEl(rule, previewText));
+    activeActionMenu.appendChild(renderRuleMenuActionItems(rule));
+  };
+
+  // List view: every matched rule on this row (item 2.5's "+N" overflow),
+  // each row drilling into its own detail view via renderRuleMenuDetail.
+  const renderRuleMenuList = (rules, previewText) => {
+    if (!activeActionMenu) return;
+    activeActionMenu.innerHTML = '';
+    activeActionMenu.setAttribute('aria-label', `Matched rules, ${rules.length} total`);
+    const head = document.createElement('div');
+    head.className = 'ch-action-menu-head';
+    head.textContent = `Matched rules (${rules.length})`;
+    activeActionMenu.appendChild(head);
+    const list = document.createElement('div');
+    list.className = 'ch-rule-menu-list';
+    rules.forEach((r) => {
+      const item = document.createElement('div');
+      item.className = 'ch-rule-menu-list-item';
+      item.setAttribute('role', 'menuitem');
+      item.setAttribute('tabindex', '0');
+      const badge = document.createElement('span');
+      badge.className = 'ch-chip ch-chip-' + r.kind;
+      badge.textContent = r.kind;
+      const label = document.createElement('span');
+      label.className = 'ch-rule-menu-list-label';
+      label.textContent = r.label;
+      item.appendChild(badge);
+      // Item 3.4 — the qualifier badge is metadata computed by rankRuleMatches
+      // (r._qualifier); a rule reached via the top-chip/direct showRuleMatchMenu
+      // path (no rankRuleMatches pass) simply has no badge here — still fully
+      // shown, never suppressed.
+      if (r._qualifier) {
+        const qBadge = document.createElement('span');
+        qBadge.className = 'ch-rule-menu-list-qualifier ch-rule-menu-list-qualifier-' + r._qualifier;
+        qBadge.textContent = RULE_QUALIFIER_LABEL[r._qualifier];
+        item.appendChild(qBadge);
+      }
+      item.appendChild(label);
+      const activate = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        renderRuleMenuDetail(r, previewText, rules, true);
+      };
+      item.addEventListener('click', activate);
+      item.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') activate(e);
+      });
+      list.appendChild(item);
+    });
+    activeActionMenu.appendChild(list);
+  };
+
+  // Entry point wired to the queue rule-match chips (decorateOneRow below).
+  // `openList` is true for the "+N" overflow chip (straight to the full
+  // list), false for the top chip (straight to its own detail — matches the
+  // pre-2.5 single-chip behaviour when there's only one matched rule).
+  const showRuleMatchMenu = (anchor, rules, previewText, openList) => {
+    closeActionMenu();
+    if (!rules || !rules.length) return;
+    const r = anchor.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.className = 'ch-action-menu ch-rule-menu';
+    menu.setAttribute('role', 'menu');
+    menu.style.position = 'fixed';
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 340)) + 'px';
+    menu.style.zIndex = '2147483647';
+    document.body.appendChild(menu);
+    activeActionMenu = menu;
+    activeAnchorEl = anchor;
+    if (openList && rules.length > 1) {
+      renderRuleMenuList(rules, previewText);
+    } else {
+      renderRuleMenuDetail(rules[0], previewText, rules, false);
+    }
+    armActionMenuDismissal();
+  };
+
+  // ---- Pathway menu — Pharmacy First divert + missing-info ask-back (items
+  // 4.1/4.2, TRIAGE-LENS-2026-07-02.md) ----
+  // Reuses the SAME activeActionMenu/closeActionMenu singleton as
+  // showActionMenu/showRuleMatchMenu above (only one popover open at a time),
+  // and reuses renderRuleMenuActionItems/executeAction verbatim for every
+  // "copy" button so the clipboard-write + "Copied" confirmation + safe
+  // execCommand fallback is EXACTLY the same code path already hardened for
+  // the rule-chip snippet actions and lab-file-button.js's fileAndMessage
+  // handoff — no new clipboard code.
+  //
+  // DECISION-SUPPORT SURFACING ONLY: rules/reception-pathways.json's own
+  // header states this "captures a structured history only — does not
+  // triage, diagnose, or advise beyond red-flag escalation." Every action
+  // offered here is either read-only information or a PREPARE-ONLY draft —
+  // nothing is ever sent, filed, or auto-advised. `pathway`/red-flag `ask`/
+  // `escalate` text is CSO-signed config content (trusted), but this menu
+  // still builds everything via createElement/textContent, never innerHTML —
+  // the same discipline buildEvidenceEl applies to genuinely untrusted
+  // request text, kept here for consistency and because buildAskBackText's
+  // output is partly templated around that same request-derived match state.
+
+  // A single-item "actions list" wrapping one prepare-only copy draft, reusing
+  // renderRuleMenuActionItems's existing snippet-action rendering + click
+  // wiring (which calls the real, already-hardened executeAction).
+  const buildCopySnippetActionsEl = (text, label) =>
+    renderRuleMenuActionItems({ actions: [{ type: 'snippet', label, text }] });
+
+  // Plain-text, prepare-only Pharmacy First redirect draft ("this looks
+  // suitable for Pharmacy First: …"). Built HERE, not in
+  // engine/reception-match.js (matching-only, out of scope to edit) — this is
+  // pure UI-layer templating around the pathway's own CSO-signed
+  // pharmacyFirst.note, with no independent clinical content of its own.
+  const buildPharmacyFirstRedirectText = (pathway, pfElig) => {
+    const title = (pathway && pathway.title) || 'this presentation';
+    const lines = [];
+    lines.push(`This looks suitable for Pharmacy First (${title}).`);
+    if (pfElig && pfElig.ageNote) lines.push(pfElig.ageNote);
+    lines.push(
+      'Prepared draft only — please review before use. A clinician or care navigator still confirms suitability; this is not a referral and not a clinical decision.'
+    );
+    return lines.join('\n') + '\n';
+  };
+
+  // The PROMINENT "patient may have already mentioned a red flag" banner
+  // (item 4.2's escalation-note requirement) — a safety signal the keyword
+  // rule chips might miss, so it renders FIRST in the menu, ahead of both the
+  // Pharmacy First and ask-back sections. `flaggedInText` entries are
+  // { id, ask, escalate } from redFlagGaps (CSO-signed content).
+  const buildPathwayEscalationEl = (flaggedInText) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'ch-pathway-escalation';
+    const head = document.createElement('div');
+    head.className = 'ch-pathway-escalation-head';
+    head.textContent = '⚠ Patient may have already mentioned:';
+    wrap.appendChild(head);
+    flaggedInText.forEach((rf) => {
+      const line = document.createElement('div');
+      line.className = 'ch-pathway-escalation-line';
+      line.textContent = (rf && rf.ask ? rf.ask : rf && rf.id) + ' — escalate ' + ((rf && rf.escalate) || '?') + ' if confirmed';
+      wrap.appendChild(line);
+    });
+    return wrap;
+  };
+
+  const buildPathwaySectionHead = (label) => {
+    const head = document.createElement('div');
+    head.className = 'ch-pathway-section-head';
+    head.textContent = label;
+    return head;
+  };
+
+  // Pharmacy First section — the pathway's own note, then the prepare-only
+  // redirect draft (shown inline AND offered as a one-click copy).
+  const buildPharmacyFirstSectionEl = (pathway, pfElig) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'ch-pathway-section';
+    wrap.appendChild(buildPathwaySectionHead('Pharmacy First'));
+    const note = document.createElement('p');
+    note.className = 'ch-pathway-note';
+    note.textContent =
+      (pfElig && pfElig.ageNote) ||
+      'Age criteria met for Pharmacy First — a clinician or care navigator still confirms suitability.';
+    wrap.appendChild(note);
+    const redirectText = buildPharmacyFirstRedirectText(pathway, pfElig);
+    const draft = document.createElement('p');
+    draft.className = 'ch-pathway-draft';
+    draft.textContent = redirectText;
+    wrap.appendChild(draft);
+    wrap.appendChild(buildCopySnippetActionsEl(redirectText, 'Copy Pharmacy First message'));
+    return wrap;
+  };
+
+  // Ask-back section — the gap questions (what the request text does NOT yet
+  // cover) plus a one-click copy of the full buildAskBackText() draft. Shown
+  // even when there are zero gaps (buildAskBackText's own "no outstanding
+  // questions" line) so the section is never silently missing.
+  const buildAskBackSectionEl = (pathway, gapsData, closingQuestions) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'ch-pathway-section';
+    wrap.appendChild(buildPathwaySectionHead('Ask-back — not yet mentioned'));
+    const gaps = (gapsData && gapsData.gaps) || [];
+    if (gaps.length) {
+      const list = document.createElement('ul');
+      list.className = 'ch-pathway-gap-list';
+      gaps.forEach((g) => {
+        const li = document.createElement('li');
+        li.textContent = (g && g.ask) || (g && g.id) || '';
+        list.appendChild(li);
+      });
+      wrap.appendChild(list);
+    } else {
+      const none = document.createElement('p');
+      none.className = 'ch-pathway-note';
+      none.textContent = 'No outstanding red-flag questions identified from the request text.';
+      wrap.appendChild(none);
+    }
+    const askBackText = window.SentinelReceptionMatch.buildAskBackText(pathway, gaps, closingQuestions);
+    wrap.appendChild(buildCopySnippetActionsEl(askBackText, 'Copy ask-back draft'));
+    return wrap;
+  };
+
+  // Entry point wired to the queue's Pharmacy First / Ask-back chips
+  // (decorateOneRow below). `pfElig`/`gapsData`/`closingQuestions` are
+  // ALREADY COMPUTED by decorateOneRow (closure-captured, same convention as
+  // showRuleMatchMenu's rankedRules/previewText) — never recomputed here, so
+  // the menu always reflects exactly what the chip itself was rendered from.
+  const showPathwayMenu = (anchor, pathway, previewText, pfElig, gapsData, closingQuestions) => {
+    closeActionMenu();
+    if (!pathway) return;
+    const r = anchor.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.className = 'ch-action-menu ch-pathway-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', `${pathway.title || 'Reception pathway'} — Pharmacy First / ask-back`);
+    menu.style.position = 'fixed';
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 340)) + 'px';
+    menu.style.zIndex = '2147483647';
+    document.body.appendChild(menu);
+    activeActionMenu = menu;
+    activeAnchorEl = anchor;
+
+    const head = document.createElement('div');
+    head.className = 'ch-action-menu-head';
+    const badge = document.createElement('span');
+    badge.className = 'ch-chip ch-chip-info';
+    badge.textContent = pathway.title || 'Reception pathway';
+    head.appendChild(badge);
+    menu.appendChild(head);
+
+    const disclaimer = document.createElement('div');
+    disclaimer.className = 'ch-pathway-disclaimer';
+    disclaimer.textContent =
+      'Decision support only — offers information and prepares drafts. It never diagnoses, advises beyond red-flag escalation, or sends anything.';
+    menu.appendChild(disclaimer);
+
+    const flaggedInText = (gapsData && gapsData.flaggedInText) || [];
+    if (flaggedInText.length) {
+      menu.appendChild(buildPathwayEscalationEl(flaggedInText));
+    }
+    if (pfElig && pfElig.eligible === true) {
+      menu.appendChild(buildPharmacyFirstSectionEl(pathway, pfElig));
+    }
+    menu.appendChild(buildAskBackSectionEl(pathway, gapsData, closingQuestions));
+
+    armActionMenuDismissal();
+  };
+
+  const renderHUD = (data, signals, requestSignals) => {
+    lastSignals = signals;
+    const hud = ensureHudEl();
+    const minimised = hud.classList.contains('ch-min');
+    let collapsed = false;
+    try { collapsed = (typeof localStorage !== 'undefined' && localStorage.getItem('ch-collapsed') === '1'); } catch (e) {}
+    const patient = extractPatientName();
+
+    const requestPanel = (rs) => {
+      if (!rs || (!rs.chips?.length && !rs.snippet)) return '';
+      return `
+        <div class="ch-request">
+          <div class="ch-request-head">REQUEST</div>
+          ${rs.chips.length ? `<div class="ch-request-row">${rs.chips.map(c => renderChipHtml(c)).join('')}</div>` : ''}
+          ${rs.snippet ? `<div class="ch-request-snippet">${escapeHtml(rs.snippet)}</div>` : ''}
+        </div>`;
+    };
+
+    // Combine header chips + rule chips for the chips row
+    const allHeaderChips = [
+      ...signals.headerChips,
+      ...(signals.ruleChips || [])
+    ];
+
+    const showTiles = PREF('showBuiltInTiles', true);
+    const showFoot = PREF('showFootStats', true);
+    // Item 1.1 leg B — cards findCardByTitle genuinely could not find this pass.
+    // Drives: the headline chip chooser (never a green/info "No flags" when we
+    // know something wasn't read), the grey footer line, and each tile's
+    // "not assessed" fallback below.
+    const missingCards = data._missingCards || [];
+
+    hud.innerHTML = `
+      <header class="ch-head">
+        <div class="ch-title">Triage Lens <span class="ch-ver">v${VERSION}</span></div>
+        <div class="ch-actions">
+          ${pipSupported() ? `<button class="ch-btn" data-act="${inPip() ? 'unpip' : 'pip'}" title="${inPip() ? 'Return to tab' : 'Pop out (always-on-top)'}">${inPip() ? '↙' : '↗'}</button>` : ''}
+          <button class="ch-btn" data-act="refresh" title="Re-scan">↻</button>
+          <button class="ch-btn" data-act="settings" title="Open settings">⚙</button>
+          <button class="ch-btn" data-act="min" title="Minimise">${minimised ? '▢' : '_'}</button>
+        </div>
+      </header>
+      <div class="ch-body">
+        ${patient ? `<button class="ch-patient" data-act="focus-tab" title="Bring source tab to front">${escapeHtml(patient)} →</button>` : ''}
+        ${requestPanel(requestSignals)}
+        <div class="ch-chips">
+          ${allHeaderChips.length ? allHeaderChips.map(c => renderChipHtml(c)).join('') : headlineNoFlagsChipHtml(missingCards)}
+        </div>
+        ${missingCardsFooterHtml(missingCards)}
+        ${showTiles && signals.openLoops && signals.openLoops.items && signals.openLoops.items.length ? `<div class="ch-grid">
+          ${tile('openLoops', 'Open loops', signals.openLoops, missingCards)}
+        </div>
+        <div class="ch-detail" id="ch-detail">
+          <div class="ch-detail-head">Open tasks on this record</div>
+        </div>` : ''}
+        ${showFoot ? `<div class="ch-foot">
+          ${data.registers.length} registers · ${data.problems.length} problems · ${data.meds.repeats.length} repeats · ${data.docs.length} recent docs
+        </div>` : ''}
+      </div>`;
+
+    // Tile detail
+    hud.querySelectorAll('.ch-tile').forEach(t => {
+      t.addEventListener('click', () => {
+        hud.querySelectorAll('.ch-tile').forEach(x => x.classList.remove('ch-tile-sel'));
+        t.classList.add('ch-tile-sel');
+        const key = t.dataset.tile;
+        const sig = lastSignals[key];
+        const labels = { risk: 'Risk', monitoring: 'Monitoring', meds: 'Meds', openLoops: 'Open loops', carePlan: 'Care plan', safeguarding: 'Safeguarding' };
+        hud.querySelector('#ch-detail').innerHTML = `
+          <div class="ch-detail-head">${labels[key]}</div>
+          ${detailList(sig.items)}`;
+      });
+    });
+
+    // Header buttons
+    const refreshBtn = hud.querySelector('[data-act="refresh"]');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => run(true));
+    const minBtn = hud.querySelector('[data-act="min"]');
+    if (minBtn) minBtn.addEventListener('click', () => {
+      hud.classList.toggle('ch-min');
+      try { localStorage.setItem('ch-collapsed', hud.classList.contains('ch-min') ? '1' : '0'); } catch (e) {}
+    });
+    const pipBtn = hud.querySelector('[data-act="pip"]');
+    if (pipBtn) pipBtn.addEventListener('click', enterPip);
+    const unpipBtn = hud.querySelector('[data-act="unpip"]');
+    if (unpipBtn) unpipBtn.addEventListener('click', exitPip);
+    const focusBtn = hud.querySelector('[data-act="focus-tab"]');
+    if (focusBtn) focusBtn.addEventListener('click', focusSourceTab);
+    const settingsBtn = hud.querySelector('[data-act="settings"]');
+    if (settingsBtn) settingsBtn.addEventListener('click', () => {
+      try {
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.openOptionsPage) {
+          chrome.runtime.openOptionsPage();
+        } else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) {
+          window.open(chrome.runtime.getURL('options/options.html'), '_blank');
+        }
+      } catch (e) { console.warn('[TL] settings open failed', e); }
+    });
+
+    // Rule chip click handlers — open action menu
+    hud.querySelectorAll('[data-rule-id]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        showActionMenu(el, el.dataset.ruleId);
+      });
+    });
+
+    if (collapsed) hud.classList.add('ch-min');
+  };
+
+  const injectStylesInto = (doc, id = 'ch-style') => {
+    if (!EMBEDDED_CSS || EMBEDDED_CSS.indexOf('CSS_PLACEHOLDER') !== -1) return; // build error guard
+    if (doc.getElementById(id)) return;
+    const style = doc.createElement('style');
+    style.id = id;
+    style.textContent = EMBEDDED_CSS;
+    (doc.head || doc.documentElement).appendChild(style);
+  };
+
+  const PIP_BODY_CSS = 'margin:0;background:#f0f3f7;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+  const PIP_HUD_CSS = 'position:static !important;top:auto !important;right:auto !important;left:auto !important;width:100% !important;max-height:none !important;border-radius:0 !important;border:none !important;box-shadow:none !important;';
+
+  const enterPip = async () => {
+    if (inPip() || !pipSupported()) return;
+    try {
+      pipWindow = await window.documentPictureInPicture.requestWindow({ width: 360, height: 600 });
+      pipWindow.document.title = 'Triage Lens — ' + (extractPatientName() || 'Patient');
+      pipWindow.document.body.setAttribute('style', PIP_BODY_CSS);
+      injectStylesInto(pipWindow.document);
+
+      // Stash docked positioning, switch to fill-window for PiP
+      ensureHudEl();
+      hudEl.dataset.dockedStyle = hudEl.getAttribute('style') || '';
+      hudEl.setAttribute('style', PIP_HUD_CSS);
+
+      pipWindow.addEventListener('pagehide', () => {
+        // Return HUD to source tab and restore docked positioning
+        pipWindow = null;
+        if (hudEl) {
+          hudEl.setAttribute('style', hudEl.dataset.dockedStyle || '');
+          delete hudEl.dataset.dockedStyle;
+          if (!hudEl.isConnected) document.body.appendChild(hudEl);
+          restorePosition(hudEl);
+        }
+        run(true);
+      });
+
+      run(true);
+    } catch (e) {
+      console.error('[ClinHUD] PiP failed', e);
+      pipWindow = null;
+    }
+  };
+
+  const exitPip = () => { if (inPip()) pipWindow.close(); };
+
+  // Bring the originating browser tab to the front and, if it has navigated
+  // away from the patient that the HUD was bound to, return it there.
+  // From a PiP child the click handler still runs in source-tab JS context, so
+  // `window`, `location` and `document` here all refer to the source tab.
+  const focusSourceTab = () => {
+    try {
+      if (lastPatientUrl && location.href !== lastPatientUrl) {
+        location.href = lastPatientUrl;
+      }
+      window.focus();
+    } catch (e) {}
+  };
+
+  // ============================================================
+  // 5. RUN, OBSERVE, DRAG, QUEUE DECORATION
+  // ============================================================
+
+  let lastRun = 0;
+
+  const hideHud = () => {
+    if (hudEl && hudEl.parentElement) hudEl.parentElement.removeChild(hudEl);
+  };
+
+  // Build a bag of field values for rule matching from extracted patient data
+  const buildFieldsData = (data, requestText) => {
+    const safe = (arr, prop) => (arr || []).map(x => (prop ? (x && x[prop]) || '' : x || '')).filter(Boolean);
+    return {
+      request: requestText || '',
+      problems: safe(data?.problems, 'name'),
+      registers: data?.registers || [],
+      meds: [...safe(data?.meds?.repeats), ...safe(data?.meds?.acutes), ...safe(data?.meds?.otc)],
+      allergies: data?.banner?.warnings || [],
+      banner: data?.banner?.warnings || [],
+      consultations: safe(data?.cons || [], 'type').concat(safe(data?.cons || [], 'clinician')),
+      docs: safe(data?.docs || [], 'name')
+    };
+  };
+
+  // Item 3.5 — build the require-gate ctx { ageYears?, sex?, medsText?, problemsText? }
+  // for the detail/record HUD from the SAME extracted data buildFieldsData already
+  // reshaped (meds/problems are already flat string arrays there — no re-extraction).
+  //   ageYears — extractBanner() (DOM scan of the patient banner) parses an age from
+  //              an "(NNy" token or a DOB string. Same source the record/detail HUD
+  //              already displays.
+  //   sex      — NOT currently extracted anywhere on this page (extractBanner only
+  //              returns { warnings, age }) — always undefined here, so a
+  //              require:{sex} clause fails closed on every surface today.
+  //   medsText/problemsText — joined from fieldsData.meds / fieldsData.problems
+  //              (extractMedications / extractActiveProblems), the same "Current
+  //              Medication" / "Active Problems" cards the HUD renders.
+  const buildRequireCtx = (data, fieldsData) => ({
+    ageYears: Number.isFinite(data?.banner?.age) ? data.banner.age : undefined,
+    sex: undefined,
+    medsText: Array.isArray(fieldsData?.meds) ? fieldsData.meds.join(' ') : '',
+    problemsText: Array.isArray(fieldsData?.problems) ? fieldsData.problems.join(' ') : '',
+  });
+
+  // ---- Per-page handlers ----
+  const runRecord = () => {
+    const data = extractAll('record', false);
+    const signals = computeSignals(data);
+    const fieldsData = buildFieldsData(data, '');
+    applyRules(signals, 'record', fieldsData, buildRequireCtx(data, fieldsData));
+    renderHUD(data, signals, null);
+    restorePosition(hudEl);
+    enableDrag(hudEl);
+    runMonitoringChip();
+    armLateCardWatch('record', false, data._missingCards);
+    log('record rendered', { data, signals });
+  };
+
+  const runDetail = () => {
+    // Resolved up front (URL-only check) so extractAll() knows which detail
+    // expected-card set applies (item 1.1 leg B — a document task and a
+    // request/communication task expect different cards).
+    const docTask = isDocumentTask();
+    const data = extractAll('detail', docTask);
+    armLateCardWatch('detail', docTask, data._missingCards);
+    const signals = computeSignals(data);
+
+    const docInfo = docTask ? extractDocumentTaskInfo() : null;
+
+    let taskDetails, requester, initialReq;
+    if (docInfo) {
+      taskDetails = docInfo.taskDetails;
+      requester = {};
+      const parts = [docInfo.docType, docInfo.specialty || docInfo.author, docInfo.comments, docInfo.codes]
+        .filter(Boolean);
+      initialReq = { text: parts.join(' — '), attachmentCount: 0, attachments: [] };
+    } else {
+      taskDetails = extractTaskDetails();
+      requester = extractRequester();
+      initialReq = extractInitialRequest();
+    }
+
+    const detailFieldsData = buildFieldsData(data, initialReq.text || '');
+    applyRules(signals, 'detail', detailFieldsData, buildRequireCtx(data, detailFieldsData));
+    const requestSignals = computeRequestSignals(taskDetails, requester, initialReq);
+
+    if (docInfo) {
+      const newChips = [];
+      if (docInfo.docType) {
+        const c = getSystemChip('detail.docType', { docType: docInfo.docType });
+        if (c) newChips.push(c);
+      }
+      if (docInfo.specialty) {
+        const c = getSystemChip('detail.docSpecialty', { specialty: docInfo.specialty });
+        if (c) newChips.push(c);
+      }
+      if (newChips.length) requestSignals.chips.unshift(...newChips);
+    }
+
+    renderHUD(data, signals, requestSignals);
+    restorePosition(hudEl);
+    enableDrag(hudEl);
+    runMonitoringChip();
+    runOutstandingMatch();
+    runDetailVerdict();
+    log('detail rendered', { data, signals, taskDetails, initialReq, docInfo });
+  };
+
+  // ============================================================
+  // 2c. Outstanding Investigation Requests — smart match
+  // ============================================================
+  // a contributor's alternative to Medicus's blunt "Match all": instead of clearing
+  // EVERY outstanding request, decide PER request whether THIS report satisfies
+  // it (same test/panel AND request predates the sample-taken date) and:
+  //   - annotate every row inline — ✓ resulted (this report covers it) vs
+  //     ⏳ still outstanding (so a buried coeliac/HFE/CCP screen is visible, not
+  //     silently cleared);
+  //   - auto-tick ONLY the confident, predating matches (autoTick === true), once
+  //     per task. Tentative / unrecognised / post-dating rows are never ticked.
+  // All matching logic lives in engine/outstanding-match.js (pure + unit-tested);
+  // this adapter only reads the card + report and applies the verdict.
+  //
+  // SPA durability: the card is a Quasar re-rendering component, so annotations
+  // are idempotent and re-applied by a scoped observer (mirrors the removed
+  // select-all injector). Auto-tick fires once per taskUuid — if the clinician
+  // unticks a row we must not re-tick it.
+  const OIR_CARD_SEL = '[data-testid="test-outstanding-investigation-requests"]';
+  // taskUuid → normalised report (in-memory, page-scoped). Avoids re-fetching the
+  // report on every observer tick.
+  const _oirReportCache = new Map();
+  // taskUuid → patient observationHistory (normaliseObservationHistory output).
+  // Used to detect requests that were resulted ELSEWHERE in the record (not by
+  // this report). Cached so the dashboard isn't re-fetched on every observer tick.
+  const _oirHistoryCache = new Map();
+  // taskUuid -> the request rows (by label) we have ALREADY auto-ticked — never re-tick those (respects manual
+  // unticks). It used to be a bare "this task was handled" flag set on the FIRST pass, whether or not anything was
+  // ticked: the first pass often runs before the catalogue (or the report) has settled and has no confident rows, and
+  // every later pass — the one that finally turns rows green — was then refused (Clinician A, 2026-10-03: "show in green but
+  // not being ticked"). Now only rows that were actually ticked are remembered.
+  const _oirAutoTicked = new Map();
+  // taskUuid → patientUuid (resolved once by fetchOutstandingHistory, used by
+  // annotateOutstandingRow to make elsewhere badges clickable — item 8).
+  const _oirPatientCache = new Map();
+  let _oirObserver = null;
+  let _oirRaf = false;
+
+  // Date formatter for verdict dates. Absolute "DD Mon YYYY" by default; switches
+  // to a coarse relative form ("3 months ago") when the user prefers it
+  // (oirDateFormat). Used in badge text and the confirm dialog.
+  const fmtOirRelative = (iso) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso));
+    if (!m) return String(iso);
+    const then = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+    const days = Math.round((Date.now() - then) / 86400000);
+    if (days <= 0) return 'today';
+    if (days === 1) return 'yesterday';
+    if (days < 14) return `${days} days ago`;
+    if (days < 56) return `${Math.round(days / 7)} weeks ago`;
+    if (days < 730) return `${Math.round(days / 30)} months ago`;
+    return `${Math.round(days / 365)} years ago`;
+  };
+  const fmtOirDate = (iso) => {
+    if (!iso) return '';
+    if (PREF('oirDateFormat', 'absolute') === 'relative') return fmtOirRelative(iso);
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso));
+    if (!m) return String(iso);
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${m[3]} ${months[+m[2] - 1] || '?'} ${m[1]}`;
+  };
+
+  // Built-in defs + the user/practice test dictionary (CONFIG.oirTests), merged
+  // once per match. mergeTestDefs is append-only on built-ins (see engine).
+  const oirTestDefs = () => {
+    const OM = window.SentinelOutstandingMatch;
+    if (!OM) return null;
+    const user = CONFIG && Array.isArray(CONFIG.oirTests) ? CONFIG.oirTests : [];
+    return user.length ? OM.mergeTestDefs(OM.TEST_DEFS, user) : OM.TEST_DEFS;
+  };
+  // Match options assembled from user prefs — dictionary, confidence floor,
+  // look-back ceiling. Passed to both matchOutstanding and enrichWithHistory.
+  const oirMatchOpts = () => ({
+    testDefs: oirTestDefs(),
+    confidenceFloor: PREF('oirConfidenceFloor', 'default'),
+    lookbackMonths: PREF('oirLookbackMonths', 0),
+  });
+
+  // ---- Catalogue engine (Phase D) ------------------------------------------
+  // pref oirEngine: 'legacy' (default) | 'catalogue'. The catalogue engine
+  // (engine/outstanding-match-catalogue.js) only changes RECOGNITION; the
+  // clearing rules, auto-tick gate and audit trail are the legacy ones. It reads
+  // the ACTING catalogue only (approved entries), and ANY problem — catalogue
+  // unreadable, invalid, empty, engine error — falls back to the legacy engine
+  // for that card, so the practice never ends up with no matcher.
+  let _oirCatalogueIndex = null;
+  // Which report groups answer which tests, from the catalogue engine's last run (null under the legacy engine) — handed
+  // to the Companion's "Investigation results" table by publishOirState below.
+  let _oirLastGroups = null;
+  let _oirCataloguePromise = null;
+  let _oirCatalogueSettled = false;
+  const resetOirCatalogue = () => {
+    _oirCatalogueIndex = null;
+    _oirCataloguePromise = null;
+    _oirCatalogueSettled = false;
+  };
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes['labcatalogue.practice']) resetOirCatalogue(); // approvals/edits change the acting catalogue
+      });
+    }
+  } catch (_) {
+    /* no storage events — the index is reloaded on the next page load */
+  }
+  const oirCatalogueWanted = () => PREF('oirEngine', 'legacy') === 'catalogue';
+  const ensureOirCatalogue = () => {
+    if (_oirCataloguePromise) return _oirCataloguePromise;
+    const EC = window.OutstandingMatchCatalogue;
+    if (!EC || typeof window.labcatalogueLoadEffective !== 'function') {
+      _oirCatalogueSettled = true;
+      return (_oirCataloguePromise = Promise.resolve(null));
+    }
+    _oirCataloguePromise = window
+      .labcatalogueLoadEffective()
+      .then((eff) => {
+        _oirCatalogueIndex = EC.buildActingIndex(eff && eff.catalogue);
+        if (!_oirCatalogueIndex) log('OIR catalogue engine: no usable acting catalogue — using the current engine');
+        return _oirCatalogueIndex;
+      })
+      .catch((e) => {
+        log('OIR catalogue engine: load failed — using the current engine', e && e.message);
+        _oirCatalogueIndex = null;
+        return null;
+      })
+      .then((ix) => {
+        _oirCatalogueSettled = true;
+        return ix;
+      });
+    return _oirCataloguePromise;
+  };
+  // Verdicts from the catalogue engine, or null when the caller must use the legacy engine.
+  const matchWithCatalogue = (requests, report, opts) => {
+    _oirLastGroups = null;
+    if (!oirCatalogueWanted() || !_oirCatalogueIndex) return null;
+    const EC = window.OutstandingMatchCatalogue;
+    const OM = window.SentinelOutstandingMatch;
+    if (!EC || !OM || !report || !report.catalogueReport) return null;
+    try {
+      const sampleDate = OM.reportCoverage(report, opts).sampleDate || null;
+      const r = EC.matchOutstandingCatalogue(requests, report.catalogueReport, {
+        index: _oirCatalogueIndex,
+        sampleDate,
+        confidenceFloor: opts.confidenceFloor,
+      });
+      if (!r || !r.ok) {
+        log('OIR catalogue engine: fell back to the current engine —', r && r.error);
+        return null;
+      }
+      if (DEBUG) {
+        try {
+          const leg = OM.matchOutstanding(requests, report, opts);
+          r.verdicts.forEach((v, i) => {
+            const l = leg[i];
+            if (l && (l.status !== v.status || l.autoTick !== v.autoTick)) {
+              log('OIR engines differ', v.name, 'catalogue:', v.status, v.confidence, 'legacy:', l.status, l.confidence);
+            }
+          });
+        } catch (_) {
+          /* debug only */
+        }
+      }
+      _oirLastGroups = Array.isArray(r.groups) ? r.groups : null;
+      return r.verdicts;
+    } catch (e) {
+      log('OIR catalogue engine threw — using the current engine', e && e.message);
+      return null;
+    }
+  };
+  // Compact " · 18 ug/L LOW" suffix for a matched result, shown on the inline flag
+  // when the user opts in (oirShowValueOnBadge).
+  const oirValueStr = (v) => {
+    if (!v || !v.matchedValue) return '';
+    const unit = v.matchedUnit ? ` ${v.matchedUnit}` : '';
+    const ab = v.matchedAbnormal ? ` ${v.matchedAbnormal.toUpperCase()}` : '';
+    return ` · ${v.matchedValue}${unit}${ab}`;
+  };
+  // Append a tick-off to the local OIR audit log (ring buffer, last 200).
+  // Machine-local governance record; never auto-restored (see backup allowlist).
+  // `kind` distinguishes WHO/WHAT initiated the write, all going through this
+  // one path/storage key/cap so the options audit viewer (renderOirAudit)
+  // picks every kind up automatically:
+  //   'bulk'       — clinician-confirmed bulk tick-off (confirmBulkTickOff)
+  //   'auto'       — machine auto-tick of confident, report-covered rows
+  //                  (performOirAutoTick) — see H-036 in docs/HAZARD-LOG.md
+  //   'auto-review'  — the auto-tick toast's Review action (performOirAutoReview).
+  //                  NOTE: this does NOT mean the tick was reversed — ticking
+  //                  writes to Medicus immediately and can't be undone from
+  //                  here (see confirmBulkTickOff's own dialog text) — it
+  //                  records that the clinician asked to review what was
+  //                  auto-ticked.
+  const recordOirAudit = (verdicts, taskUuid, kind) => {
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+      const patientUuid = taskUuid ? _oirPatientCache.get(taskUuid) : undefined;
+      const entry = {
+        ts: new Date().toISOString(),
+        kind: kind || 'bulk',
+        taskUuid: taskUuid || null,
+        patientUuid: patientUuid || null,
+        count: verdicts.length,
+        engine: verdicts.some((v) => v.engine === 'catalogue') ? 'catalogue' : 'legacy',
+        items: verdicts.map((v) => ({
+          name: v.name,
+          key: v.key || null,
+          labMessageKind: v.labMessageKind || null,
+          date: v.elsewhereDate || null,
+          value: v.matchedValue || null,
+          unit: v.matchedUnit || null,
+          abnormal: v.matchedAbnormal || null,
+        })),
+      };
+      chrome.storage.local.get('triagelens.oir.auditLog', (r) => {
+        const arr = Array.isArray(r['triagelens.oir.auditLog']) ? r['triagelens.oir.auditLog'] : [];
+        arr.unshift(entry);
+        chrome.storage.local.set({ 'triagelens.oir.auditLog': arr.slice(0, 200) });
+      });
+    } catch (e) {
+      log('OIR audit write failed', e.message);
+    }
+  };
+
+  // ---- Auto-tick toast (undo/review affordance) --------------------------
+  // Non-blocking, informational toast shown after a machine auto-tick fires.
+  // IMPORTANT — this is NOT a true undo: ticking an OIR checkbox writes to
+  // Medicus server-side immediately (see confirmBulkTickOff's own confirm
+  // text: "This cannot be undone from here"), so re-clicking the checkbox
+  // would either do nothing or falsely reassure the clinician the request is
+  // back on the outstanding list. Per the "never fake an undo" rule, the
+  // toast's action instead SCROLLS TO + FLASHES the ticked row(s) so the
+  // clinician can review them and, if genuinely needed, re-request via
+  // Medicus directly — and says so in its own copy.
+  const OIR_TOAST_MS = 15000;
+  let _oirToastEl = null;
+  let _oirToastTimer = null;
+
+  const removeOirToast = () => {
+    if (_oirToastTimer) {
+      clearTimeout(_oirToastTimer);
+      _oirToastTimer = null;
+    }
+    if (_oirToastEl && _oirToastEl.parentElement) _oirToastEl.remove();
+    _oirToastEl = null;
+  };
+
+  // Scrolls to + flashes the auto-ticked row(s) and records the review as an
+  // audit entry (kind: 'auto-review'). Standalone/testable — see
+  // recordOirAudit's kind doc for why this does not claim a reversal.
+  const performOirAutoReview = (verdicts, boxes, taskUuid) => {
+    const first = (boxes || []).find(Boolean);
+    if (first && typeof first.scrollIntoView === 'function') {
+      try {
+        first.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    (boxes || []).forEach((b) => {
+      if (!b) return;
+      const row = (typeof b.closest === 'function' && b.closest('label.m-checkbox, .q-checkbox')) || b;
+      if (row && row.classList) {
+        row.classList.add('ch-oir-flash');
+        setTimeout(() => row.classList.remove('ch-oir-flash'), 2600);
+      }
+    });
+    log('OIR auto-tick review', { count: (boxes || []).length });
+    if (PREF('oirAuditLog', true)) recordOirAudit(verdicts, taskUuid, 'auto-review');
+  };
+
+  const showOirAutoTickToast = (verdicts, taskUuid, boxes) => {
+    if (typeof document === 'undefined') return;
+    removeOirToast();
+    const el = document.createElement('div');
+    el.className = 'ch-oir-toast';
+    const msg = document.createElement('div');
+    msg.className = 'ch-oir-toast-msg';
+    const names = verdicts
+      .map((v) => v.name)
+      .filter(Boolean)
+      .join(', ');
+    msg.textContent = `Auto-ticked: ${names} — resulted in this report`;
+    el.appendChild(msg);
+    // A sample-problem lab message completes the OLD request (a repeat needs a new request anyway) — but say so.
+    const problemNames = verdicts
+      .filter((v) => v.labMessageKind === 'sample-problem')
+      .map((v) => v.name)
+      .filter(Boolean);
+    if (problemNames.length) {
+      const warn = document.createElement('div');
+      warn.className = 'ch-oir-toast-note';
+      warn.textContent = `Lab reports a sample problem for ${problemNames.join(', ')} — this may need repeating.`;
+      el.appendChild(warn);
+    }
+    const note = document.createElement('div');
+    note.className = 'ch-oir-toast-note';
+    note.textContent = 'This writes to Medicus immediately and can’t be undone from here.';
+    el.appendChild(note);
+    const actions = document.createElement('div');
+    actions.className = 'ch-oir-toast-actions';
+    const reviewBtn = document.createElement('button');
+    reviewBtn.type = 'button';
+    reviewBtn.className = 'ch-oir-toast-btn';
+    reviewBtn.textContent = 'Review';
+    reviewBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      performOirAutoReview(verdicts, boxes, taskUuid);
+      removeOirToast();
+    };
+    actions.appendChild(reviewBtn);
+    el.appendChild(actions);
+    document.body.appendChild(el);
+    _oirToastEl = el;
+    requestAnimationFrame(() => el.classList.add('ch-oir-toast-show'));
+    _oirToastTimer = setTimeout(() => {
+      if (_oirToastEl) _oirToastEl.classList.remove('ch-oir-toast-show');
+      setTimeout(removeOirToast, 300);
+    }, OIR_TOAST_MS);
+  };
+
+  // Filters confident, report-covered verdicts, ticks their checkboxes,
+  // audits (kind: 'auto') and surfaces the review toast above. Gated by the
+  // oirAutoTick pref — default OFF (2026-08-22 clinical-safety audit R2:
+  // ticking writes to Medicus server-side with no per-instance confirmation,
+  // so a machine-initiated write must be a deliberate practice opt-in, per
+  // the intended-purpose statement's "no write is automatic" boundary and
+  // CSN §6.1 W22). Turning it on is a practice decision recorded in prefs;
+  // off leaves the inline flags and the clinician-confirmed bulk tick-off.
+  // Standalone/testable — kept out of applyOutstandingMatch's body so it can
+  // be extracted and unit-tested without the rest of the match pipeline.
+  const performOirAutoTick = (verdicts, rows, taskUuid) => {
+    void verdicts;
+    void rows;
+    void taskUuid;
+    return [];
+  };
+
+  // Read the outstanding-request rows from the card.
+  // Supports both the current Medicus native-checkbox markup (label.m-checkbox >
+  // input.m-checkbox__native + span.checkbox-label) and the legacy Quasar markup
+  // (.q-checkbox with aria-labelledby). Returns [{ box, label, labelEl }] in DOM
+  // order; index is the stable request id used throughout the match pipeline.
+  const readOutstandingRows = (card) => {
+    const rows = [];
+
+    // Current Medicus component (replaces Quasar from ~v3.143)
+    const mCheckboxes = card.querySelectorAll('label.m-checkbox');
+    if (mCheckboxes.length) {
+      mCheckboxes.forEach((labelEl) => {
+        const box = labelEl.querySelector('input.m-checkbox__native');
+        if (!box) return;
+        const spanEl = labelEl.querySelector('.checkbox-label');
+        const label = (spanEl ? spanEl.textContent : labelEl.textContent).replace(/\s+/g, ' ').trim();
+        rows.push({ box, label, labelEl: spanEl || labelEl });
+      });
+      return rows;
+    }
+
+    // Legacy Quasar component (.q-checkbox with aria-labelledby)
+    card.querySelectorAll('.q-checkbox').forEach((box) => {
+      let label = '';
+      let labelEl = null;
+      const id = box.getAttribute('aria-labelledby');
+      if (id) {
+        id.split(/\s+/).forEach((one) => {
+          const el = one && document.getElementById(one);
+          if (el) {
+            label += (label ? ' ' : '') + el.textContent;
+            labelEl = el;
+          }
+        });
+      }
+      if (!label) label = box.textContent || '';
+      rows.push({ box, label: label.replace(/\s+/g, ' ').trim(), labelEl });
+    });
+    return rows;
+  };
+
+  // Staggered tick of one or more rows. Handles both native checkboxes (.checked)
+  // and legacy Quasar checkboxes (aria-checked). Vue reactivity is async — a tight
+  // loop drops most updates, hence the 30 ms stagger.
+  const tickRows = (boxes) => {
+    let i = 0;
+    const next = () => {
+      if (i >= boxes.length) return;
+      const b = boxes[i++];
+      const isChecked = b ? (b.type === 'checkbox' ? b.checked : b.getAttribute('aria-checked') === 'true') : true;
+      if (b && !isChecked) b.click();
+      setTimeout(next, 30);
+    };
+    next();
+  };
+
+  // SAFETY GATE: clearing an outstanding investigation is a clinical action with
+  // real consequences (a chase-up disappears from the worklist). Results found
+  // ELSEWHERE in the record (not in this report) are NEVER auto-ticked — the
+  // clinician reviews the full enumerated list and confirms once, via this bulk
+  // dialog. Returns true if confirmed.
+  const confirmBulkTickOff = (verdicts) => {
+    const OIR = (typeof window !== 'undefined' && window.OirWriteCore) || null;
+    const msg = OIR
+      ? OIR.buildBulkTickConfirmMessage(verdicts, fmtOirDate)
+      : `Tick off ${verdicts.length} request(s) found in the patient's record? Ticking writes to Medicus and cannot be undone from here.`;
+    return confirm(msg);
+  };
+
+  // Inject (idempotently) the per-row verdict badge, anchored to THAT row's own
+  // label element so every row is flagged in place.
+  // (Earlier the badge was appended to the shared list container and de-duped
+  // card-wide, so only ONE badge ever existed — it collapsed to the bottom of the
+  // card showing the last row's verdict. Anchoring per row + keying the de-dupe by
+  // row index fixes that: each row gets its own inline flag.)
+  // patientUuid (may be undefined) makes resulted-elsewhere badges clickable.
+  const annotateOutstandingRow = (rowMeta, verdict, patientUuid) => {
+    const box = rowMeta.box;
+    // Per-row anchor: insert the badge right after the row's own label element.
+    const anchor = rowMeta.labelEl || box.closest('.q-checkbox, label.m-checkbox') || box;
+    const scope = anchor.parentElement || anchor;
+    const rowKey = String(verdict.id != null ? verdict.id : '');
+    let badge = scope.querySelector(`:scope > .ch-oir-flag[data-oir-row="${rowKey}"]`);
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'ch-oir-flag';
+      badge.dataset.oirRow = rowKey;
+      anchor.insertAdjacentElement('afterend', badge);
+    }
+
+    const status = verdict.status;
+    const resulted = status === 'resulted';
+    const elsewhere = status === 'resulted_elsewhere';
+    const outstanding = !resulted && !elsewhere;
+    const tentative = (resulted || elsewhere) && verdict.confidence === 'tentative';
+    const date = verdict.elsewhereDate ? fmtOirDate(verdict.elsewhereDate) : '';
+
+    badge.classList.toggle('ch-oir-resulted', resulted && !tentative);
+    badge.classList.toggle('ch-oir-tentative', resulted && tentative);
+    badge.classList.toggle('ch-oir-elsewhere', elsewhere && !tentative);
+    badge.classList.toggle('ch-oir-elsewhere-tentative', elsewhere && tentative);
+    badge.classList.toggle('ch-oir-outstanding', outstanding);
+
+    const val = PREF('oirShowValueOnBadge', false) ? oirValueStr(verdict) : '';
+    let badgeText;
+    if (resulted) {
+      badgeText = tentative ? '✓? resulted? (this report)' : '✓ resulted (this report)';
+    } else if (elsewhere) {
+      if (tentative) {
+        badgeText = date ? `↩? possible result ${date}${val} · in record` : `↩? possible result${val} · in record`;
+      } else {
+        badgeText = date ? `↩ completed ${date}${val} · in record` : `↩ found in record${val}`;
+      }
+    } else {
+      badgeText = '⏳ outstanding';
+    }
+    badge.textContent = badgeText;
+    badge.title = verdict.reason || '';
+
+    // Clickable elsewhere badge → open patient care record (no per-observation
+    // deep link exists in the API, so the care record is the closest target).
+    if (elsewhere && patientUuid) {
+      badge.style.cursor = 'pointer';
+      badge.classList.add('ch-oir-clickable');
+      badge.title = (verdict.reason ? verdict.reason + ' — ' : '') + 'click to open patient record';
+      if (!badge.dataset.oirLinked) {
+        badge.dataset.oirLinked = '1';
+        badge.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation(); // do not toggle the Quasar checkbox
+          window.open('/care-record/' + patientUuid, '_blank', 'noopener');
+        });
+      }
+    } else if (!elsewhere) {
+      badge.style.cursor = '';
+      badge.classList.remove('ch-oir-clickable');
+    }
+  };
+
+  // The bulk "Tick off results found in record" action bar — one gated button that
+  // ticks every CONFIDENT resulted-elsewhere row at once, after the clinician
+  // reviews the full enumerated list in confirmBulkTickOff. Tentative finds are
+  // flagged inline only (never bulk-ticked — verify and tick manually). Idempotent:
+  // reuses the existing bar, removes it when nothing is pending.
+  const updateBulkBar = (card, foundVerdicts, rows, taskUuid) => {
+    let bar = card.querySelector('.ch-oir-bulk');
+    const OIR = (typeof window !== 'undefined' && window.OirWriteCore) || null;
+    const pending = OIR
+      ? OIR.pendingBulkTickVerdicts(foundVerdicts, rows)
+      : foundVerdicts.filter((v) => {
+          const box = rows[v.id] && rows[v.id].box;
+          if (!box) return false;
+          return box.type === 'checkbox' ? !box.checked : box.getAttribute('aria-checked') !== 'true';
+        });
+    if (!pending.length) {
+      if (bar) bar.remove();
+      return;
+    }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'ch-oir-bulk';
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ch-oir-bulk-btn';
+      bar.appendChild(b);
+      card.appendChild(bar);
+    }
+    const btn = bar.querySelector('.ch-oir-bulk-btn');
+    const n = pending.length;
+    btn.textContent = `Tick off ${n} result${n > 1 ? 's' : ''} found in record`;
+    // onclick (not addEventListener) so re-application never stacks handlers.
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (confirmBulkTickOff(pending)) {
+        log('OIR bulk tick-off', { count: pending.length });
+        if (PREF('oirAuditLog', true)) recordOirAudit(pending, taskUuid, 'bulk');
+        tickRows(pending.map((v) => rows[v.id].box));
+        bar.remove();
+      }
+    };
+  };
+
+  // Apply the engine verdict to the live card: annotate every row inline, auto-tick
+  // the confident report-covered rows (once per task), and surface results found
+  // elsewhere in the record via inline flags + the gated bulk tick-off bar.
+  // `history` (may be null) enables the resulted-elsewhere enrichment.
+  // Publish what the matcher decided, for the Companion's "Investigation results" table (Clinician A, 2026-10-04): per request
+  // whether this report answers it, which of the report's groups does, and whether its row is ticked — plus, from the
+  // catalogue engine, every report group with the tests it answers (empty = answers no request on this card). Read-only
+  // data, same pattern as window.__chLabFileState; the Companion renders it and decides nothing. `path` lets a reader
+  // discard state that belongs to a page it has already left.
+  const publishOirState = (taskUuid, rows, verdicts) => {
+    try {
+      // One line per request saying what the matcher decided and WHY (ch-debug only; the logger prints each distinct line
+      // once per page). The "not in the catalogue" reason is the one that means its wording is not on any test's
+      // "How it is requested in Medicus" list.
+      verdicts.forEach((v) =>
+        log('OIR verdict:', v.name, '→', v.status, v.confidence || '', '|', v.reason || '', '|', v.engine || 'legacy', v.matchedHeadings ? v.matchedHeadings.join('/') : '')
+      );
+      window.__chOirState = {
+        path: location.pathname,
+        taskUuid: taskUuid || null,
+        groups: _oirLastGroups,
+        requests: verdicts.map((v) => {
+          const row = rows[v.id];
+          return {
+            label: row ? row.label : v.name,
+            name: v.name,
+            status: v.status,
+            confidence: v.confidence || null,
+            autoTick: !!v.autoTick,
+            ticked: !!(row && row.box && row.box.checked),
+            matchedHeadings: Array.isArray(v.matchedHeadings) ? v.matchedHeadings : [],
+            investigationId: v.investigationId || null,
+            reason: v.reason || '',
+            engine: v.engine || 'legacy',
+          };
+        }),
+      };
+      document.dispatchEvent(new CustomEvent('ch-oir-state'));
+    } catch (_) {
+      /* the table is optional; never let it affect matching */
+    }
+  };
+
+  const applyOutstandingMatch = () => {
+    return;
+  };
+
+  // Fetch the patient's full observation history for this task (cached), so
+  // resulted-elsewhere detection can run. Best-effort: failure leaves history
+  // null and the card still works (report-only matching).
+  // item 8: also caches patientUuid into _oirPatientCache so annotateOutstandingRow
+  // can make resulted-elsewhere badges clickable (opens care record).
+  const fetchOutstandingHistory = (ctx, taskUuid) => {
+    const API = window.SentinelApiClient;
+    const NORM = window.SentinelNormalisers;
+    if (_oirHistoryCache.has(taskUuid)) return Promise.resolve(_oirHistoryCache.get(taskUuid));
+    return API.resolveTaskToPatient(ctx.apiBase, ctx.taskTypeSlug, taskUuid)
+      .then((patientUuid) => {
+        if (!patientUuid) return null;
+        // item 8: cache patientUuid before fetchAll so it's available even if fetchAll fails
+        _oirPatientCache.set(taskUuid, patientUuid);
+        return API.fetchAll(ctx.apiBase, patientUuid).then((apiResults) => {
+          const normalised = NORM.normaliseAll(apiResults, {
+            url: location.href,
+            title: '',
+            view: null,
+            patientUuid,
+            resolutionSource: 'oir-history',
+          });
+          return Array.isArray(normalised.observationHistory) ? normalised.observationHistory : [];
+        });
+      })
+      .then((history) => {
+        _oirHistoryCache.set(taskUuid, history);
+        return history;
+      })
+      .catch((e) => {
+        log('OIR match: history fetch threw', e.message);
+        _oirHistoryCache.set(taskUuid, null);
+        return null;
+      });
+  };
+
+  // Entry point — fetch the report for this task (cached) + patient history, then
+  // apply the match.
+  const runOutstandingMatch = () => {
+    if (!PREF('oirEnabled', true)) {
+      teardownOutstandingObserver();
+      return;
+    }
+    const API = window.SentinelApiClient;
+    const NORM = window.SentinelNormalisers;
+    if (!API || !NORM || !window.SentinelOutstandingMatch) return;
+    const card = document.querySelector(OIR_CARD_SEL);
+    if (!card) {
+      teardownOutstandingObserver();
+      return;
+    }
+    setupOutstandingObserver();
+    const ctx = API.detectMedicusContext(location.href);
+    if (!ctx || !ctx.taskUuid || !ctx.taskTypeSlug) return;
+    const taskUuid = ctx.taskUuid;
+
+    // Catalogue engine selected: load the acting catalogue first (once), so the FIRST pass — which is the only one
+    // that can auto-tick — already uses the engine the practice chose. A failed load settles to null = legacy.
+    if (oirCatalogueWanted() && !_oirCatalogueSettled) {
+      ensureOirCatalogue().then(() => runOutstandingMatch());
+      return;
+    }
+
+    const cached = _oirReportCache.get(taskUuid);
+    if (cached) {
+      applyOutstandingMatch(card, cached, taskUuid, _oirHistoryCache.get(taskUuid));
+      // History may not have arrived on the first pass — fetch then re-apply.
+      if (!_oirHistoryCache.has(taskUuid)) {
+        fetchOutstandingHistory(ctx, taskUuid).then((history) => {
+          const liveCard = document.querySelector(OIR_CARD_SEL);
+          if (liveCard) applyOutstandingMatch(liveCard, cached, taskUuid, history);
+        });
+      }
+      return;
+    }
+    const overviewURL = `/tasks/data/${ctx.taskTypeSlug}/overview/${taskUuid}`;
+    Promise.all([
+      API.fetchInvestigationReport(ctx.apiBase, overviewURL).then((raw) => {
+        const normalised = NORM.normaliseInvestigationReport(raw);
+        // Keep the catalogue-shaped view (codes, headings, performer — no values) beside the normalised report so the
+        // catalogue engine sees the same payload. Non-enumerable: nothing else iterates or serialises it.
+        try {
+          if (normalised && window.LabCatalogue) {
+            Object.defineProperty(normalised, 'catalogueReport', {
+              value: window.LabCatalogue.fromInvestigationReportPayload(raw),
+              enumerable: false,
+            });
+          }
+        } catch (_) {
+          /* legacy engine still works without it */
+        }
+        return normalised;
+      }),
+      fetchOutstandingHistory(ctx, taskUuid),
+    ])
+      .then(([report, history]) => {
+        _oirReportCache.set(taskUuid, report);
+        // Re-find the card (the DOM may have re-rendered while we fetched).
+        const liveCard = document.querySelector(OIR_CARD_SEL);
+        if (liveCard) applyOutstandingMatch(liveCard, report, taskUuid, history);
+      })
+      .catch((e) => log('OIR match: report/history fetch threw', e.message));
+  };
+
+  // Scoped observer: re-apply annotations when Quasar re-renders the card. Annotation
+  // is idempotent; auto-tick is guarded by _oirAutoTicked so it never re-fires.
+  const setupOutstandingObserver = () => {
+    if (_oirObserver) return;
+    _oirObserver = new MutationObserver(() => {
+      if (_oirRaf) return;
+      _oirRaf = true;
+      requestAnimationFrame(() => {
+        _oirRaf = false;
+        const API = window.SentinelApiClient;
+        if (!API) return;
+        const card = document.querySelector(OIR_CARD_SEL);
+        const ctx = API.detectMedicusContext(location.href);
+        const report = ctx && ctx.taskUuid ? _oirReportCache.get(ctx.taskUuid) : null;
+        const history = ctx && ctx.taskUuid ? _oirHistoryCache.get(ctx.taskUuid) : null;
+        if (card && report) applyOutstandingMatch(card, report, ctx.taskUuid, history);
+      });
+    });
+    _oirObserver.observe(document.body, { childList: true, subtree: true });
+  };
+
+  const teardownOutstandingObserver = () => {
+    if (_oirObserver) {
+      _oirObserver.disconnect();
+      _oirObserver = null;
+    }
+    _oirRaf = false;
+  };
+
+  // ---- Queue triage status bar (item 1.2, TRIAGE-LENS-2026-07-02.md) ----
+  // Replaces the old passive "absence is not a verdict" legend with a live,
+  // interactive strip: recomputed counts, jump-to-next-alert, and a focus
+  // toggle. Implementation (computeQueueTriageCounts / nextAlertRowIndex /
+  // updateQueueStatusBar / applyQueueFocusClass) lives further down, grouped
+  // with the severity row tint code (item 1.3) it reads from — see
+  // "Queue triage status bar" below.
+
+  const runQueue = () => {
+    teardownQueueObserver();
+    hideHud();
+    // Clear row-to-UUID mapping so stale UUIDs from a previous queue never
+    // inject chips onto wrong rows in the new queue before the fresh
+    // ch-task-list-data event arrives. Prune cache entries older than 2×TTL.
+    _queueRowUuids.clear();
+    // Arm the leading-edge first result-triage pass for this queue entry: the next
+    // bridge task-list event fires the pass immediately instead of via the 150ms debounce.
+    _firstResultPassPending = true;
+    const pruneTs = Date.now() - 2 * _MON_CACHE_TTL;
+    for (const [uuid, entry] of _queueMonCache) {
+      // Audit M1: entries with NO ts (bridge-created, never fetched — the
+      // majority of a large queue) used to escape the prune entirely; evict
+      // them once their createdAt passes the same horizon.
+      const anchor = entry.ts || entry.createdAt;
+      if (anchor && anchor < pruneTs) _queueMonCache.delete(uuid);
+    }
+    const resultPruneTs = Date.now() - 2 * _RESULT_CACHE_TTL;
+    for (const [uuid, entry] of _queueResultCache) {
+      const anchor = entry.ts || entry.createdAt;
+      if (anchor && anchor < resultPruneTs) {
+        _queueResultCache.delete(uuid);
+        // B2: the pending-index entry is a pointer to this severity entry — it dies
+        // with its source (never serve a chip from a pruned result).
+        if (_pendingIndex) _pendingIndex.drop(uuid);
+      }
+    }
+    // Audit M1: cap the outstanding-investigation caches — _oirHistoryCache
+    // holds a FULL observation history per lab-task patient and none of the
+    // four had any eviction, so a duty-doctor tab retained every patient's
+    // payload all day. FIFO-cap is enough: entries are re-fetched on demand.
+    const _capMap = (m, cap) => {
+      while (m.size > cap) m.delete(m.keys().next().value);
+    };
+    _capMap(_oirReportCache, 50);
+    _capMap(_oirHistoryCache, 50);
+    _capMap(_oirPatientCache, 200);
+    _capMap(_taskPatientCache, 400);
+    _capMap(_oirAutoTicked, 500);
+    // Queue re-entry resets the jump cycle (item 1.2) — a "last jumped-to row"
+    // from a previous queue visit has no meaning against a fresh row set.
+    _queueStatusJumpPos = null;
+    _queueStatusLastRed = 0;
+    _queueStatusLastAmber = 0;
+    // Re-assert the session-local focus-alerts toggle (module state, survives
+    // navigation) onto this fresh queue visit.
+    applyQueueFocusClass();
+    updateQueueStatusBar();
+    decorateQueueRows();
+    setupQueueObserver();
+    scheduleQueueMonitoring();
+    scheduleQueueResultTriage();
+    // B2: cross-link any red/amber result graded earlier this session (results
+    // queue) onto this queue's request rows. No-op on the results queue itself and
+    // when the index is empty; rides the shared resolve cache + its own 8-row cap.
+    scheduleQueuePending();
+    // B3: repeat-contact chip (tier-1 session + tier-2 rolling ledger). Rides the
+    // shared resolve cache; request queues only. B5: aged-request carry-over —
+    // task-keyed, no resolve/fetch. Both record into the local ledgers here.
+    scheduleQueueRepeatContact();
+    scheduleQueueCarryOver();
+  };
+
+  // ---- Late-card settle-watch (record/detail extraction race) ----
+  // Medicus lazy-renders the lower record cards ('Observations & Results',
+  // 'Documents & Consultations') AFTER pageReady()'s first-card/banner signal,
+  // and the route watcher's 250ms/1200ms reruns can both land too early on a
+  // slow load — leaving those sections empty for the whole page visit (the
+  // findCardByTitle once-per-load warning is this race being reported). When an
+  // extraction pass reports expected-but-absent cards (_missingCards), poll
+  // cheaply for up to 12s and re-extract as soon as any of them appears. The
+  // watch self-terminates (deadline, or nothing missing) and is disarmed on
+  // route change.
+  let _lateCardTimer = null;
+  let _lateCardKey = '';
+  let _lateCardDeadline = 0;
+  const LATE_CARD_POLL_MS = 500;
+  const LATE_CARD_WINDOW_MS = 12000;
+
+  const disarmLateCardWatch = () => {
+    if (_lateCardTimer) clearTimeout(_lateCardTimer);
+    _lateCardTimer = null;
+    _lateCardKey = '';
+  };
+
+  const armLateCardWatch = (pageTypeVal, isDocTask, missing) => {
+    if (!missing || missing.length === 0) {
+      disarmLateCardWatch();
+      return;
+    }
+    const key = location.href + '|' + missing.join(',');
+    if (_lateCardTimer && key === _lateCardKey) return; // already watching this exact state
+    disarmLateCardWatch();
+    _lateCardKey = key;
+    _lateCardDeadline = Date.now() + LATE_CARD_WINDOW_MS;
+    const tick = () => {
+      _lateCardTimer = null;
+      if (Date.now() > _lateCardDeadline) return; // give up — matches old behaviour
+      const nowMissing = computeMissingCards(pageTypeVal, isDocTask);
+      if (nowMissing.length < missing.length) {
+        // A late card landed — re-extract. The rerun re-arms with the smaller
+        // set if anything is still missing (new key, so the guard above passes).
+        run(true);
+        return;
+      }
+      _lateCardTimer = setTimeout(tick, LATE_CARD_POLL_MS);
+    };
+    _lateCardTimer = setTimeout(tick, LATE_CARD_POLL_MS);
+  };
+
+  const run = (force = false) => {
+    try {
+      const now = Date.now();
+      if (!force && now - lastRun < 400) return;
+      lastRun = now;
+      const type = pageType();
+      // If we've navigated away from the queue, release the observer so the
+      // next queue visit always rebuilds it against a fresh container.
+      if (type !== 'queue') teardownQueueObserver();
+      // The outstanding-match observer AND the verdict banner (item 2.4) are
+      // detail-page-only; release/clear both elsewhere so neither can linger
+      // into a differently-typed page (e.g. back to the queue).
+      if (type !== 'detail') {
+        teardownOutstandingObserver();
+        removeDetailVerdictBanner();
+        _detailVerdictTaskUuid = null;
+        // Audit H7 (2026-07-18): the attempted set gates re-computation but was
+        // never cleared, so once a task's cached verdict expired (5-min TTL) the
+        // banner could NEVER come back this session — a red "N urgent" banner
+        // the GP saw earlier silently stopped reappearing. Clearing on leaving
+        // the detail page restores the documented "per page-visit" semantics.
+        _detailVerdictAttempted.clear();
+      }
+      if (type === 'record') runRecord();
+      else if (type === 'detail') runDetail();
+      else if (type === 'queue') runQueue();
+      else hideHud();
+    } catch (e) {
+      console.error('[ClinHUD] error', e);
+    }
+  };
+
+  // ---- Queue chip decoration ----
+  // Renders age + days-open + category + read-time chips inline at the top of
+  // the request preview row beneath each queue row. AG Grid virtualises rows,
+  // so we re-decorate any time the row container mutates.
+
+  // ---- Queue monitoring chips (fetch-intercepted UUIDs) ----
+  // The task-list fetch/XHR interception runs in the MAIN world (page-world.js);
+  // it re-dispatches 'ch-task-list-data' to the listener below.
+  //
+  // SECURITY: 'ch-task-list-data' is a window CustomEvent that crosses the
+  // MAIN-world / isolated-world boundary. Any script on the Medicus page —
+  // including XSS payloads — can forge these events. The bridged data is
+  // therefore UNTRUSTED and is validated and capped below before use.
+  // It is ONLY used to trigger re-fetches from the authenticated Medicus API;
+  // row UUIDs are never rendered into the DOM or trusted as authoritative data.
+
+  // rowIndex → taskUuid for the current queue load. runQueue clears this on every
+  // queue (re)entry, which keeps the FETCH path from chasing a previous queue's tasks.
+  const _queueRowUuids = new Map();
+  // Durable mirror, written ONLY by the bridge task-list event (never cleared by
+  // runQueue). Used to RE-INJECT cached result chips after the SPA's re-renders —
+  // runQueue's churn keeps emptying _queueRowUuids, and that emptying is exactly what
+  // made the chips flash-and-vanish. The bridge owns this map's whole lifecycle.
+  const _durableRowMap = new Map();
+  // taskUuid → { taskTypeSlug, result, ts } — session-level cache with TTL
+  const _queueMonCache = new Map();
+  const _MON_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  let _queueMonRunning = false;
+  let _queueMonGeneration = 0; // incremented on each new data arrival
+
+  // taskUuid → { overviewURL, priorityDisplay, unmatched, sev, error, ts } —
+  // result-triage cache. `error: true` (item 1.1 leg D) marks a row whose fetch
+  // or evaluation genuinely failed (sev stays null either way — a definitive
+  // "nothing due" clear and a failed check both leave sev null; `error`
+  // distinguishes them for rendering + retry cadence).
+  const _queueResultCache = new Map();
+  // 30 minutes (audit H11, 2026-07-18 — was 5): on a long queue the churn
+  // scheduler re-verified every unchanged row each TTL expiry (~19k overview
+  // GETs/day at 200 rows). Result content for a posted task is effectively
+  // immutable; the bridge handler below additionally DROPS a row's cached
+  // severity the moment its priorityDisplay changes (the one cheap change
+  // signal the task-list payload carries), so a genuinely updated row
+  // re-fetches immediately rather than waiting out the TTL.
+  const _RESULT_CACHE_TTL = 30 * 60 * 1000;
+  // Error entries get a much shorter TTL than a real result so a transient
+  // fetch/eval failure retries soon instead of showing "couldn't check" for
+  // the full 5 minutes.
+  const _RESULT_ERROR_TTL = 60 * 1000; // 60 seconds
+  let _queueResultRunning = false;
+  let _queueResultGeneration = 0;
+
+  // ---- B-substrate: ONE shared task→patient resolve cache (per tab) ----
+  // Every fetch-driven queue chip family (monitoring, patient-flag, and the B2
+  // pending cross-link) needs the SAME taskUuid→patientUuid link. Before this,
+  // monitoring and patient-flag each resolved independently. This single map is
+  // the shared substrate: resolvePatientForTask() serves a cache hit for free and
+  // fetches at most once per taskUuid across ALL consumers, so adding B2/B4 to a
+  // request queue does not multiply the resolve fan-out. The link is immutable
+  // (a task never changes patient), so a long TTL just bounds memory; runQueue
+  // FIFO-caps it. `patientUuid: null` is cached too (a genuine "no patient"), so a
+  // failed resolve isn't re-fetched every pass.
+  const _taskPatientCache = new Map(); // taskUuid -> { patientUuid: string|null, ts }
+  const _TASK_PATIENT_TTL = 30 * 60 * 1000;
+  // Synchronous read: returns the fresh { patientUuid, ts } entry or null (unknown /
+  // expired). Callers use this to decide "cache hit (free) vs miss (counts against
+  // the per-pass fetch cap)" — exactly the pattern the monitoring/PA passes use.
+  const getCachedPatientForTask = (taskUuid) => {
+    const r = _taskPatientCache.get(taskUuid);
+    if (r && r.ts && (Date.now() - r.ts) <= _TASK_PATIENT_TTL) return r;
+    return null;
+  };
+  // Async resolve-or-fetch. A cache hit returns immediately with zero fetch. A miss
+  // does ONE credentialed resolve via the shared api-client (itself TTL-cached) and
+  // stores the result (including a null). Callers cap how many MISSES they trigger
+  // per pass (see the 8-row cap pattern) — this function does not self-throttle.
+  const resolvePatientForTask = async (taskTypeSlug, taskUuid) => {
+    if (!taskUuid) return null;
+    const cached = getCachedPatientForTask(taskUuid);
+    if (cached) return cached.patientUuid;
+    const API = window.SentinelApiClient;
+    const ctx = API && API.detectMedicusContext(location.href);
+    if (!API || !ctx || !taskTypeSlug) return null;
+    const patientUuid = (await API.resolveTaskToPatient(ctx.apiBase, taskTypeSlug, taskUuid)) || null;
+    _taskPatientCache.set(taskUuid, { patientUuid, ts: Date.now() });
+    return patientUuid;
+  };
+
+  // ---- B2: pending-abnormal-lab cross-link index ----
+  // A patientUuid→worst-severity index DERIVED from _queueResultCache (keyed by
+  // taskUuid). Populated when a result is graded red/amber on the results queue
+  // (computeQueueRowResult carries report.patientUuid; the scheduler + detail-verdict
+  // paths mirror it + gradedTs onto the cache entry, then call pendingIndexSync).
+  // Every index entry is a POINTER to a live _queueResultCache severity entry and
+  // MUST die with it — see pendingIndexSync + the four teardown hooks
+  // (runQueue TTL prune, bridge priorityDisplay invalidation, config invalidation,
+  // and a re-grade to null/error). The H6 sort canary drops the rowIndex maps, NOT
+  // _queueResultCache, so the index legitimately survives it — chip PLACEMENT is
+  // gated by the durable map instead (reinjectCachedPendingChips), so a reordered
+  // grid can never land a pending chip on the wrong row.
+  const _pendingIndex = window.PendingResultIndex ? window.PendingResultIndex.create() : null;
+  // Reconcile one task's index membership with its current _queueResultCache entry.
+  // Called at every point the entry's severity is (re)written. An entry that is
+  // red/amber AND carries a resolved patientUuid AND is not an error is indexed;
+  // ANY other state (null/none sev, error, missing patient, absent entry) is a drop.
+  const pendingIndexSync = (taskUuid) => {
+    if (!_pendingIndex || !taskUuid) return;
+    const entry = _queueResultCache.get(taskUuid);
+    const sev = entry && entry.sev;
+    const level = sev && typeof sev === 'object' && (sev.level === 'red' || sev.level === 'amber') ? sev.level : null;
+    const patientUuid = entry && entry.patientUuid;
+    if (entry && !entry.error && level && patientUuid) {
+      _pendingIndex.set(taskUuid, patientUuid, level, entry.gradedTs || entry.ts || Date.now());
+    } else {
+      _pendingIndex.drop(taskUuid);
+    }
+  };
+  // Current queue's task-type slug (set by the bridge). B2 is a REQUEST-queue
+  // cross-link ONLY — never shown on the results queue itself (the row's own
+  // result chip already covers it). A results queue whose slug matches this is
+  // skipped by the pending pass + reinject.
+  let _currentQueueSlug = null;
+  const isResultQueueSlug = (slug) => /investigation|result/i.test(String(slug || ''));
+
+  // Recently-parsed investigation reports, NEWEST FIRST, served to the options-page
+  // result-rule inspector on demand ("Load a recent result" instead of paste-a-JSON).
+  // IG requirement: IN-MEMORY ONLY — never written to chrome.storage or anywhere at
+  // rest. Page-scoped lifetime; hard-capped to avoid unbounded growth.
+  const _recentInspectResults = [];
+  const _RECENT_INSPECT_CAP = 20;
+
+  // Pure helper — shape the in-memory store into the cross-context response contract.
+  // The store is already in contract shape; return a defensive shallow copy (newest
+  // first). Empty store is normal → { ok: true, results: [] }. Exported for tests.
+  function mapRecentInspectResponse(store) {
+    return { ok: true, results: Array.isArray(store) ? store.slice() : [] };
+  }
+
+  // Pure helper — choose which cached queue rows to fetch ON DEMAND for the inspector.
+  // Given [taskUuid, overviewURL] candidate pairs (the bridge caches an overviewURL for
+  // every queue row it sees, regardless of whether result chips are enabled), the set of
+  // ids we already hold a parsed copy of, and a fetch cap, return the subset to fetch:
+  // pairs with a non-empty overviewURL, not already held, in order, capped. Exported for tests.
+  function selectOnDemandFetchTargets(candidates, haveIds, cap) {
+    // Duck-type a Set (any object with .has) rather than `instanceof Set`, which is
+    // fragile across realm/context boundaries; otherwise build one from an array.
+    const have =
+      haveIds && typeof haveIds.has === 'function' ? haveIds : new Set(Array.isArray(haveIds) ? haveIds : []);
+    const out = [];
+    if (!Array.isArray(candidates)) return out;
+    for (const pair of candidates) {
+      if (!Array.isArray(pair)) continue;
+      const uuid = pair[0];
+      const overviewURL = pair[1];
+      if (!uuid || typeof overviewURL !== 'string' || !overviewURL) continue;
+      if (have.has(uuid)) continue;
+      out.push([uuid, overviewURL]);
+      if (typeof cap === 'number' && cap >= 0 && out.length >= cap) break;
+    }
+    return out;
+  }
+
+  // Max reports fetched per on-demand inspector click. A deliberate user action, so a
+  // small sequential fan-out is fine; caps the authenticated-fetch burst.
+  const _RECENT_INSPECT_ONDEMAND_MAX = 12;
+
+  // On-demand collector: actively fetch + parse the open queue's results so the
+  // inspector works even when result-triage chips are DISABLED or the background pass
+  // hasn't run this session. Uses the overviewURLs the bridge has already cached for the
+  // queue (no dependency on chips being on or the user having scrolled). Best-effort and
+  // fully guarded — any failure leaves the existing in-memory store untouched. IN-MEMORY
+  // ONLY (IG): nothing is persisted, exactly as the passive capture path.
+  async function collectRecentInspectOnDemand() {
+    const API = window.SentinelApiClient;
+    const NORM = window.SentinelNormalisers;
+    if (!API || !NORM) {
+      log('recent-inspect on-demand: globals not loaded');
+      return;
+    }
+    const ctx = API.detectMedicusContext(location.href);
+    if (!ctx) {
+      log('recent-inspect on-demand: no medicus context');
+      return;
+    }
+    const candidates = [];
+    for (const [taskUuid, entry] of _queueResultCache) {
+      if (entry && entry.overviewURL) candidates.push([taskUuid, entry.overviewURL]);
+    }
+    const have = new Set(_recentInspectResults.map((e) => e && e.id));
+    const todo = selectOnDemandFetchTargets(candidates, have, _RECENT_INSPECT_ONDEMAND_MAX);
+    for (const [taskUuid, overviewURL] of todo) {
+      let raw;
+      try {
+        raw = await API.fetchInvestigationReport(ctx.apiBase, overviewURL);
+      } catch (e) {
+        log('recent-inspect on-demand: fetch threw', e.message);
+        continue;
+      }
+      let report;
+      try {
+        report = NORM.normaliseInvestigationReport(raw);
+      } catch (e) {
+        log('recent-inspect on-demand: normalise threw', e.message);
+        continue;
+      }
+      if (report && Array.isArray(report.results) && report.results.length) {
+        insertRecentInspect(
+          _recentInspectResults,
+          buildRecentInspectEntry(report, taskUuid, Date.now()),
+          _RECENT_INSPECT_CAP
+        );
+      }
+    }
+  }
+
+  // Serve recently-parsed investigation results to the options-page inspector.
+  // House style mirrors content-scripts/sentinel.js: accept only this extension's own
+  // contexts. We fetch ON DEMAND (async) so the inspector populates from the open queue
+  // even when chips are off / the passive pass never ran, then respond — return true to
+  // keep the channel open for the async sendResponse. Wrapped defensively so a thrown
+  // handler can never break the host page.
+  try {
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      // Only accept messages from this extension's own contexts.
+      if (!sender || sender.id !== chrome.runtime.id) return;
+      if (msg && msg.action === 'getRecentInvestigationResults') {
+        (async () => {
+          try {
+            await collectRecentInspectOnDemand();
+          } catch (e) {
+            log('getRecentInvestigationResults: on-demand collect threw', e.message);
+          }
+          try {
+            sendResponse(mapRecentInspectResponse(_recentInspectResults));
+          } catch (e) {
+            log('getRecentInvestigationResults: sendResponse threw', e.message);
+          }
+        })();
+        return true; // keep the channel open for the async response
+      }
+      // Ignore unrelated actions.
+      return false;
+    });
+  } catch (e) {
+    log('onMessage listener registration failed', e.message);
+  }
+  // Leading-edge gate: the FIRST result-triage pass per queue entry fires immediately
+  // from the bridge handler (skipping the 150ms debounce) so time-to-first-chip drops
+  // ~150ms and the fetch overlaps the grid's first paint. Set true in runQueue (where
+  // _queueRowUuids is cleared), cleared the first time the bridge fires the pass.
+  let _firstResultPassPending = false;
+
+  // Rate-limit constants for ch-task-list-data: max events acted on per window,
+  // and the reset period. Defends against a forged-event flood fanning out into
+  // unbounded authenticated API calls.
+  const _BRIDGE_MAX_EVENTS_PER_WINDOW = 10;
+  const _BRIDGE_WINDOW_MS = 5000;
+  let _bridgeEventCount = 0;
+  let _bridgeWindowTimer = null;
+
+  // UUID shape: 8-4-4-4-12 hex, case-insensitive
+  const _BRIDGE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // taskTypeSlug: alphanumeric + underscores/hyphens, reasonable length
+  const _BRIDGE_SLUG_RE = /^[a-zA-Z0-9_-]{1,80}$/;
+  // overviewURL: relative path only — /tasks/data/<slug>/overview/<uuid>
+  const _OVERVIEW_URL_RE = /^\/tasks\/data\/[A-Za-z0-9_-]+\/overview\/[0-9a-f-]+$/;
+  // Maximum rows processed from a single event (cap to prevent fan-out DoS)
+  const _BRIDGE_MAX_ROWS = 500;
+
+  // Pure rate-limit check. The listener increments _bridgeEventCount first;
+  // the 11th event in a window is refused. Exported for tests.
+  const bridgeEventAllowed = (count) => count <= _BRIDGE_MAX_EVENTS_PER_WINDOW;
+
+  // Pure shape check for an untrusted ch-task-list-data detail. Returns null
+  // when the payload is the wrong shape or the slug is illegal. Caps to
+  // _BRIDGE_MAX_ROWS before per-row checks. Does not touch the DOM or the
+  // caches — the listener applies the result. Exported for tests.
+  function validateTaskListDetail(detail) {
+    const { rows, taskTypeSlug } = detail || {};
+    if (!Array.isArray(rows) || typeof taskTypeSlug !== 'string') return null;
+    if (!_BRIDGE_SLUG_RE.test(taskTypeSlug)) return null;
+    const cappedRows = rows.length > _BRIDGE_MAX_ROWS ? rows.slice(0, _BRIDGE_MAX_ROWS) : rows;
+    const accepted = [];
+    for (const row of cappedRows) {
+      if (!row || typeof row !== 'object') continue;
+      const { rowIndex, taskUuid } = row;
+      if (typeof rowIndex !== 'number' || !Number.isFinite(rowIndex) || rowIndex < 0 || (rowIndex | 0) !== rowIndex) continue;
+      if (typeof taskUuid !== 'string' || !_BRIDGE_UUID_RE.test(taskUuid)) continue;
+      const rawOverview = row.overviewURL;
+      const rawPriority = row.priorityDisplay;
+      const rawUnmatched = row.unmatched;
+      const overviewURL = (typeof rawOverview === 'string' && _OVERVIEW_URL_RE.test(rawOverview))
+        ? rawOverview : '';
+      const rowSlugMatch = overviewURL.match(/^\/tasks\/data\/([A-Za-z0-9_-]+)\//);
+      const rowTaskTypeSlug = (rowSlugMatch && rowSlugMatch[1]) || taskTypeSlug;
+      const priorityDisplay = String(rawPriority != null ? rawPriority : '').slice(0, 40);
+      const unmatched = !!rawUnmatched;
+      accepted.push({ rowIndex, taskUuid, overviewURL, priorityDisplay, unmatched, rowTaskTypeSlug });
+    }
+    return { taskTypeSlug, accepted };
+  }
+
+  // Debounce timer for scheduleQueueMonitoring to coalesce rapid event bursts.
+  let _bridgeMonDebounceTimer = null;
+  const _BRIDGE_DEBOUNCE_MS = 150;
+  // Debounce timer for scheduleQueueResultTriage
+  let _bridgeResultDebounceTimer = null;
+  // Debounce timer for scheduleQueuePaFlags (patient-flag chips)
+  let _bridgePaDebounceTimer = null;
+  // Debounce timer for scheduleQueuePending (B2 pending cross-link chips)
+  let _bridgePendingDebounceTimer = null;
+  // Debounce timers for scheduleQueueRepeatContact (B3) / scheduleQueueCarryOver (B5)
+  let _bridgeRepeatDebounceTimer = null;
+  let _bridgeCarryDebounceTimer = null;
+
+  window.addEventListener('ch-task-list-data', (e) => {
+    // --- Rate-limit: count events in a rolling window ---
+    _bridgeEventCount++;
+    if (!_bridgeWindowTimer) {
+      _bridgeWindowTimer = setTimeout(() => {
+        _bridgeEventCount = 0;
+        _bridgeWindowTimer = null;
+      }, _BRIDGE_WINDOW_MS);
+    }
+    if (!bridgeEventAllowed(_bridgeEventCount)) {
+      log('ch-task-list-data: rate limit exceeded, ignoring event');
+      return;
+    }
+
+    // --- Type/shape validation (bridged data is UNTRUSTED) ---
+    const parsed = validateTaskListDetail(e.detail);
+    if (!parsed) return;
+    if (pageType() !== 'queue') return;
+    const { taskTypeSlug, accepted } = parsed;
+
+    // Remember which queue we're on so B2's pending cross-link can gate itself to
+    // REQUEST queues (never the results queue, where the row's own result chip shows).
+    _currentQueueSlug = taskTypeSlug;
+    _queueRowUuids.clear();
+    _durableRowMap.clear();
+    // A fresh task-list payload is authoritative for the grid's CURRENT state,
+    // so re-baseline the sort canary (H6): without this, a server-side sort
+    // whose fetch lands before the observer notices the new header classes
+    // would have its freshly-correct maps dropped by the canary a tick later.
+    _queueSortSig = undefined;
+    // Cap and per-row shape checks live in validateTaskListDetail.
+    for (const row of accepted) {
+      const { rowIndex, taskUuid, overviewURL, priorityDisplay, unmatched, rowTaskTypeSlug } = row;
+      _queueRowUuids.set(rowIndex, taskUuid);
+      _durableRowMap.set(rowIndex, taskUuid);
+
+      // The slug for THIS ROW's own /overview/ endpoint. A queue's rows are
+      // not all the queue's type — a medical_patient_request_task queue serves
+      // communication-thread rows — and resolving a row against the QUEUE's
+      // slug 404s (live-confirmed 2026-08-04: every monitoring resolve on the
+      // requests queue died silently). The row's validated overviewURL names
+      // its true type; the queue slug is only the fallback when a row has none.
+      if (!_queueMonCache.has(taskUuid)) _queueMonCache.set(taskUuid, { taskTypeSlug: rowTaskTypeSlug, createdAt: Date.now() });
+      // Only store/update entry if we don't have a fresh sev already
+      const existing = _queueResultCache.get(taskUuid);
+      if (!existing) {
+        // createdAt lets the prune below evict never-fetched rows too (audit
+        // M1: ts-less bridge entries used to accumulate for the tab's lifetime).
+        _queueResultCache.set(taskUuid, { overviewURL, priorityDisplay, unmatched, createdAt: Date.now() });
+      } else {
+        // Update metadata but keep cached sev if still fresh. If the row's
+        // priorityDisplay CHANGED, the task itself changed — drop the cached
+        // severity so it re-fetches now (audit H11 invalidation signal).
+        if (existing.priorityDisplay !== priorityDisplay && existing.sev !== undefined) {
+          delete existing.sev;
+          delete existing.ts;
+          delete existing.gradedTs;
+          delete existing.patientUuid;
+          // B2: the task changed — its old graded severity is no longer valid, so
+          // its pending-index pointer must die with the invalidated source entry.
+          if (_pendingIndex) _pendingIndex.drop(taskUuid);
+        }
+        existing.overviewURL = overviewURL;
+        existing.priorityDisplay = priorityDisplay;
+        existing.unmatched = unmatched;
+      }
+    }
+
+    // Debounce the monitoring trigger to coalesce event bursts into a single pass
+    clearTimeout(_bridgeMonDebounceTimer);
+    _bridgeMonDebounceTimer = setTimeout(scheduleQueueMonitoring, _BRIDGE_DEBOUNCE_MS);
+    // Patient-flag chips ride the same debounce cadence (defined below —
+    // safe: this callback only fires after the whole IIFE has evaluated).
+    clearTimeout(_bridgePaDebounceTimer);
+    _bridgePaDebounceTimer = setTimeout(scheduleQueuePaFlags, _BRIDGE_DEBOUNCE_MS);
+    // B2 pending cross-link chips ride the same debounce cadence (defined below).
+    clearTimeout(_bridgePendingDebounceTimer);
+    _bridgePendingDebounceTimer = setTimeout(scheduleQueuePending, _BRIDGE_DEBOUNCE_MS);
+    // B3 repeat-contact + B5 carry-over ride the same debounce cadence — the
+    // task-list event is the coalescing point for both ledger writes and chips.
+    clearTimeout(_bridgeRepeatDebounceTimer);
+    _bridgeRepeatDebounceTimer = setTimeout(scheduleQueueRepeatContact, _BRIDGE_DEBOUNCE_MS);
+    clearTimeout(_bridgeCarryDebounceTimer);
+    _bridgeCarryDebounceTimer = setTimeout(scheduleQueueCarryOver, _BRIDGE_DEBOUNCE_MS);
+    // Result triage trigger. _queueRowUuids/_durableRowMap are already populated by the
+    // synchronous loop above, so the leading-edge FIRST pass per queue entry can fire
+    // immediately (skipping the 150ms debounce) to overlap the grid's first paint. The
+    // _queueResultRunning latch + the post-Promise.all generation re-run coalesce this
+    // leading call with any trailing debounced one (the trailing one early-returns while
+    // the first runs, then re-runs once), so it cannot double-fetch. Subsequent events
+    // for this queue entry use the debounce as before.
+    if (_firstResultPassPending) {
+      _firstResultPassPending = false;
+      clearTimeout(_bridgeResultDebounceTimer);
+      scheduleQueueResultTriage();
+    } else {
+      clearTimeout(_bridgeResultDebounceTimer);
+      _bridgeResultDebounceTimer = setTimeout(scheduleQueueResultTriage, _BRIDGE_DEBOUNCE_MS);
+    }
+  });
+
+  const computeQueueRowMonitoring = async () => {
+    // Lite build: queue drug-monitoring chips are not shipped.
+    return null;
+  };
+
+  const injectQueueMonitoringChip = (rowIndex, result) => {
+    return;
+  };
+
+  const scheduleQueueMonitoring = async () => {
+    // Lite build: do not fetch a patient record to paint a monitoring chip.
+    return;
+  };
+
+  // Durable re-injection of already-cached monitoring chips, mirroring
+  // reinjectCachedResultChips below for result-triage chips (see CLAUDE.md
+  // chip-injection rule #4). runQueue clears _queueRowUuids on every re-entry while
+  // still on the queue page, so gating re-injection on it loses chips whose severity
+  // is still valid in _queueMonCache. This walks the durable rowIndex->taskUuid map
+  // for the rows currently ON SCREEN (AG-Grid virtualises the rest), looks up the
+  // cached result keyed by taskUuid, and re-injects via the row-index path
+  // unconditionally on every refresh. injectQueueMonitoringChip de-dupes via
+  // queueChipHost's marker check, so this is safe to call every time.
+  const reinjectCachedMonitoringChips = () => {
+    // Lite build: cached monitoring chips are not re-injected.
+    return;
+  };
+
+  // ---- Queue patient-flag chips (Patient Alerts, H-042) ----
+  // Practice-recorded per-patient flags (patientAlerts.byPatient, owned by the
+  // Pt Alerts side-panel tab) shown on queue rows so "interpreter required" /
+  // "safeguarding concern" is visible BEFORE the task is opened or the patient
+  // phoned. Mirror of the monitoring pipeline: task→patient resolution via the
+  // SHARED B-substrate cache (resolvePatientForTask / getCachedPatientForTask —
+  // deduped with the monitoring + pending passes), and durable re-injection on
+  // every refreshQueueChips via _durableRowMap (CLAUDE.md chip rule #4). Flag
+  // CONTENT is looked up fresh from the store at inject time, so an edit in the
+  // panel updates the queue on the next churn without any refetch. Matching here
+  // is by resolved patient UUID ONLY — the queue has no trustworthy NHS/DOB
+  // surface, and a name is never a match key. Read-only: never writes the store.
+  let _paQueueStore = null; // null until loaded; then the byPatient object
+  let _queuePaRunning = false;
+  let _queuePaGeneration = 0;
+
+  const loadPaQueueStore = () => {
+    try {
+      chrome.storage.local.get('patientAlerts.byPatient', (r) => {
+        _paQueueStore = r && r['patientAlerts.byPatient'] && typeof r['patientAlerts.byPatient'] === 'object'
+          ? r['patientAlerts.byPatient'] : {};
+      });
+    } catch (_) { _paQueueStore = {}; }
+  };
+  loadPaQueueStore();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes['patientAlerts.byPatient']) return;
+      const nv = changes['patientAlerts.byPatient'].newValue;
+      _paQueueStore = nv && typeof nv === 'object' ? nv : {};
+      // Content changed: wipe + re-inject so edited/removed flags update immediately.
+      if (pageType() === 'queue') refreshQueueChips();
+    });
+  } catch (_) { /* storage unavailable — chips simply stay absent */ }
+
+  const injectQueuePaChip = (rowIndex, patientUuid) => {
+    const LK = window.PatientAlertsLookup;
+    if (!LK || !patientUuid || !_paQueueStore) return;
+    const entry = _paQueueStore[patientUuid];
+    const summary = entry ? LK.summariseFlags(entry.alerts) : null;
+    if (!summary) return;
+    const row = document.querySelector(`.ag-row[row-index="${rowIndex}"]:not(.ag-full-width-row)`);
+    if (!row) return;
+    const host = queueChipHost(row, '.ch-q-pa');
+    if (!host) return; // absent row or chip already present (idempotent)
+    const level = summary.severity === 'red' ? 'red' : 'amber';
+    const span = document.createElement('span');
+    span.className = `ch-q-pa ch-q-pa-${level}` + (host.inPreview ? '' : ' ch-q-pa-inline');
+    // textContent only — flag labels are user-authored free text, never innerHTML.
+    const flag = document.createElement('span');
+    flag.className = 'ch-q-pa-flag';
+    flag.textContent = '⚑';
+    span.appendChild(flag);
+    const label = document.createElement('span');
+    label.className = 'ch-q-pa-label';
+    label.textContent = summary.topLabel + (summary.more > 0 ? ` +${summary.more}` : '');
+    span.appendChild(label);
+    span.title = 'Practice alerts: ' + summary.all.join(' · ') + ' — recorded in the Pt Alerts tab, not the clinical record.';
+    // Always prepend (see injectResultChip — appended nodes are reconciled away).
+    host.target.insertBefore(span, host.target.firstChild);
+    refreshPulseOnRow(row);
+  };
+
+  const scheduleQueuePaFlags = async () => {
+    const gen = ++_queuePaGeneration;
+    if (_queuePaRunning) return;
+    _queuePaRunning = true;
+    const API = window.SentinelApiClient;
+    const ctx = API ? API.detectMedicusContext(location.href) : null;
+    const MAX = 12; // resolution is one cached GET per task — cheaper than the monitoring pass
+    let done = 0;
+    for (const [rowIndex, taskUuid] of _queueRowUuids) {
+      if (done >= MAX || pageType() !== 'queue' || _queuePaGeneration !== gen) break;
+      // Shared resolve cache: a hit costs nothing (monitoring/pending may have
+      // resolved it already); only a MISS counts against this pass's cap.
+      let cached = getCachedPatientForTask(taskUuid);
+      if (!cached) {
+        if (!API || !ctx) break;
+        const monEntry = _queueMonCache.get(taskUuid);
+        const slug = (monEntry && monEntry.taskTypeSlug) || _currentQueueSlug;
+        if (!slug) continue;
+        await resolvePatientForTask(slug, taskUuid);
+        cached = getCachedPatientForTask(taskUuid);
+        done++;
+      }
+      if (cached && cached.patientUuid) injectQueuePaChip(rowIndex, cached.patientUuid);
+    }
+    _queuePaRunning = false;
+    if (_queuePaGeneration !== gen) scheduleQueuePaFlags();
+  };
+
+  // Durable re-injection from the rowIndex→taskUuid map on every refresh —
+  // the flag-chip equivalent of reinjectCachedMonitoringChips (rule #4).
+  const reinjectCachedPaChips = () => {
+    const scope = queueScope();
+    scope.querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)').forEach((row) => {
+      const ri = row.getAttribute('row-index');
+      if (ri == null) return;
+      const taskUuid = _durableRowMap.get(Number(ri));
+      if (!taskUuid) return;
+      const cached = getCachedPatientForTask(taskUuid);
+      if (!cached || !cached.patientUuid) return;
+      injectQueuePaChip(Number(ri), cached.patientUuid);
+    });
+  };
+
+  // ---- B2: pending-abnormal-lab cross-link chips ----
+  // On a REQUEST queue, if a row's patient has a red/amber result graded THIS
+  // session (while the clinician was on the results queue) still sitting in the
+  // pending index, chip it. Escalate-only, always carries its data age. Mirror of
+  // the patient-flag pipeline: shared resolve cache + durable-map re-inject.
+  const injectQueuePendingChip = (rowIndex, patientUuid, selfTaskUuid) => {
+    if (!_pendingIndex || !patientUuid) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return; // never on the results queue itself
+    const hit = _pendingIndex.query(patientUuid);
+    if (!hit) return;
+    // Belt-and-braces: never cross-link a task to its OWN graded result (the pass is
+    // gated off result queues, so in practice the request row's uuid is never indexed).
+    if (selfTaskUuid && hit.taskUuids.length === 1 && hit.taskUuids[0] === selfTaskUuid) return;
+    const id = 'queue.' + (hit.worstSev === 'red' ? 'pendingResultRed' : 'pendingResultAmber');
+    const PRI = window.PendingResultIndex;
+    const ageLabel = PRI ? PRI.formatAge(Date.now() - hit.gradedTs) : '';
+    const chip = getSystemChip(id, { age: ageLabel, count: hit.count });
+    if (!chip) return; // chip disabled or (pre-regen) not yet in config — fail closed
+    const row = document.querySelector(`.ag-row[row-index="${rowIndex}"]:not(.ag-full-width-row)`);
+    if (!row) return;
+    const host = queueChipHost(row, '.ch-q-pending');
+    if (!host) return; // absent row or chip already present (idempotent)
+    // Surface the top analyte from the worst source entry's cached detail (Phase-2
+    // detail array), when present — the "why", not just the severity + age.
+    let topAnalyte = '';
+    for (const t of hit.taskUuids) {
+      const e = _queueResultCache.get(t);
+      if (e && Array.isArray(e.detail) && e.detail[0] && e.detail[0].name) {
+        topAnalyte = String(e.detail[0].name);
+        if (e.sev && e.sev.level === hit.worstSev) break; // prefer the worst-severity one
+      }
+    }
+    const span = document.createElement('span');
+    span.className = 'ch-q-pending' + (host.inPreview ? '' : ' ch-q-pending-inline');
+    span.setAttribute('role', 'note');
+    span.innerHTML = renderChipHtml(chip);
+    const agoPhrase = ageLabel ? 'graded ' + ageLabel + ' ago' : 'graded earlier this session';
+    span.title =
+      (hit.worstSev === 'red' ? 'Pending urgent result' : 'Pending abnormal result') +
+      (topAnalyte ? ' (' + topAnalyte + ')' : '') +
+      ' for this patient — ' + agoPhrase + ' on the results queue and not yet actioned. ' +
+      'Data age: ' + (ageLabel || 'recent') + '. Cross-linked from this session only.';
+    // Always PREPEND (Vue reconciles away trailing foreign nodes — CLAUDE.md rule 1).
+    host.target.insertBefore(span, host.target.firstChild);
+    refreshPulseOnRow(row);
+  };
+
+  // Fetch-scheduling pass (mirrors scheduleQueuePaFlags). Gated OFF the results
+  // queue and skipped entirely when the index is empty (escalate-only, cheap).
+  // Rides the SHARED resolve cache — hits are free, only new resolves count against
+  // the 8-row cap, so on a request queue it shares that fan-out with monitoring/PA
+  // rather than doubling it.
+  let _queuePendingRunning = false;
+  let _queuePendingGeneration = 0;
+  const scheduleQueuePending = async () => {
+    if (!_pendingIndex) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return;
+    if (_pendingIndex.size() === 0) return; // nothing graded to cross-link
+    const gen = ++_queuePendingGeneration;
+    if (_queuePendingRunning) return;
+    _queuePendingRunning = true;
+    const API = window.SentinelApiClient;
+    const ctx = API ? API.detectMedicusContext(location.href) : null;
+    const MAX = 8; // cap NEW resolves per pass (shared-cache hits are free)
+    let done = 0;
+    for (const [rowIndex, taskUuid] of _queueRowUuids) {
+      if (pageType() !== 'queue' || _queuePendingGeneration !== gen) break;
+      let cached = getCachedPatientForTask(taskUuid);
+      if (!cached) {
+        if (done >= MAX) continue;
+        if (!API || !ctx) break;
+        const monEntry = _queueMonCache.get(taskUuid);
+        const slug = (monEntry && monEntry.taskTypeSlug) || _currentQueueSlug;
+        if (!slug) continue;
+        await resolvePatientForTask(slug, taskUuid);
+        cached = getCachedPatientForTask(taskUuid);
+        done++;
+      }
+      if (cached && cached.patientUuid) injectQueuePendingChip(rowIndex, cached.patientUuid, taskUuid);
+    }
+    _queuePendingRunning = false;
+    if (_queuePendingGeneration !== gen) scheduleQueuePending();
+  };
+
+  // Durable re-injection from the rowIndex→taskUuid map on every refresh — the
+  // pending-chip equivalent of reinjectCachedPaChips (CLAUDE.md rule #4). Because
+  // it rides the durable map, the H6 sort canary (which drops that map) halts
+  // pending injection on a reordered grid even though the index itself survives.
+  const reinjectCachedPendingChips = () => {
+    if (!_pendingIndex || isResultQueueSlug(_currentQueueSlug)) return;
+    const scope = queueScope();
+    scope.querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)').forEach((row) => {
+      const ri = row.getAttribute('row-index');
+      if (ri == null) return;
+      const taskUuid = _durableRowMap.get(Number(ri));
+      if (!taskUuid) return;
+      const cached = getCachedPatientForTask(taskUuid);
+      if (!cached || !cached.patientUuid) return;
+      injectQueuePendingChip(Number(ri), cached.patientUuid, taskUuid);
+    });
+  };
+
+  // ---- B3 repeat-contact + B5 aged-request carry-over ledgers ----
+  // Two escalate-only queue chips backed by the pure shared/contact-ledger.js:
+  //   B3 (.ch-q-repeat) — "3rd contact in 14d" (tier-2 rolling ledger) / "2 open
+  //       requests · this patient" (tier-1, this tab session). Patient-keyed, so
+  //       it rides the SHARED resolve substrate (getCachedPatientForTask), gated
+  //       to REQUEST queues, capped like the pending pass.
+  //   B5 (.ch-q-carry) — "carried over 4d". Task-keyed only (taskUuid + first/
+  //       last-seen day + slug — NO patient identity, NO fetch), so it needs no
+  //       resolve: it reads _durableRowMap/_queueRowUuids directly.
+  // ONE storage surface pattern: two chrome.storage.local keys under the `ledger.`
+  // prefix (contactLog / taskAge), memory-mirrored here for synchronous reinject,
+  // persisted by a debounced dirty-checked flush (never a write per observer tick).
+  // Both keys follow the Event Ledger's deliberately-NOT-backed-up doctrine (device-
+  // local history; a restore onto another machine would fabricate a false "seen
+  // here" trail — allowlisted in test-backup-coverage.js).
+  const CL = window.ContactLedger || null;
+  // Memory mirrors (loaded from storage on init, pruned on load). `null` slug map
+  // never used here — the mirrors are plain objects the pure ops mutate in place.
+  let _contactLogMem = {};
+  let _taskAgeMem = {};
+  // Tier-1 session state: patientUuid → Set(taskUuid) of OPEN request tasks SEEN
+  // this tab session across ALL queues. Deliberately NOT cleared by runQueue (the
+  // cross-queue "both queues" signal), only bounded. Never persisted (session-only,
+  // and only ever claims what was actually observed this session).
+  const _sessionContacts = new Map();
+  const _SESSION_CONTACTS_CAP = 800;
+  // Dirty flags + one coalescing flush timer — batch per task-list event, not per
+  // mutation-observer tick (mirrors the submissions.ledger dirty-check, M9).
+  let _contactLogDirty = false;
+  let _taskAgeDirty = false;
+  let _ledgerFlushTimer = null;
+  const _LEDGER_FLUSH_MS = 1500;
+
+  const loadContactLedgers = () => {
+    if (!CL) return;
+    try {
+      chrome.storage.local.get([CL.constants.CONTACT_KEY, CL.constants.TASK_KEY], (r) => {
+        const now = new Date();
+        _contactLogMem = CL.pruneContacts(CL.sanitiseContactStore(r && r[CL.constants.CONTACT_KEY]), now);
+        _taskAgeMem = CL.pruneTasks(CL.sanitiseTaskStore(r && r[CL.constants.TASK_KEY]), now);
+      });
+    } catch (_) {
+      _contactLogMem = {};
+      _taskAgeMem = {};
+    }
+  };
+  if (CL) loadContactLedgers();
+
+  const scheduleLedgerFlush = () => {
+    if (!CL || (!_contactLogDirty && !_taskAgeDirty)) return;
+    if (_ledgerFlushTimer) return; // already pending — coalesce
+    _ledgerFlushTimer = setTimeout(() => {
+      _ledgerFlushTimer = null;
+      const now = new Date();
+      const writes = {};
+      if (_contactLogDirty) {
+        CL.pruneContacts(_contactLogMem, now);
+        writes[CL.constants.CONTACT_KEY] = _contactLogMem;
+        _contactLogDirty = false;
+      }
+      if (_taskAgeDirty) {
+        CL.pruneTasks(_taskAgeMem, now);
+        writes[CL.constants.TASK_KEY] = _taskAgeMem;
+        _taskAgeDirty = false;
+      }
+      try {
+        chrome.storage.local.set(writes);
+      } catch (_) {
+        /* storage unavailable — mirrors stay in memory for this session */
+      }
+    }, _LEDGER_FLUSH_MS);
+  };
+
+  // Compute the repeat-contact chip for a patient: prefer tier-2 (rolling ledger,
+  // the deterioration signal) over tier-1 (session). Returns { id, vars } or null.
+  const repeatContactChipFor = (patientUuid) => {
+    if (!CL || !patientUuid) return null;
+    const ledgerCount = CL.countRecentContacts(_contactLogMem, patientUuid, new Date(), CL.constants.CONTACT_WINDOW_DAYS);
+    if (ledgerCount >= CL.constants.CONTACT_MIN_COUNT) {
+      return {
+        id: 'queue.repeatContact',
+        vars: { count: ledgerCount, nth: CL.ordinal(ledgerCount), days: CL.constants.CONTACT_WINDOW_DAYS },
+        tier: 2,
+        count: ledgerCount,
+      };
+    }
+    const sess = _sessionContacts.get(patientUuid);
+    const sessCount = sess ? sess.size : 0;
+    if (sessCount >= 2) {
+      return { id: 'queue.repeatContactSession', vars: { count: sessCount }, tier: 1, count: sessCount };
+    }
+    return null;
+  };
+
+  const injectQueueRepeatChip = (rowIndex, patientUuid) => {
+    if (!CL || !patientUuid) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return; // request queues only
+    const pick = repeatContactChipFor(patientUuid);
+    if (!pick) return;
+    const chip = getSystemChip(pick.id, pick.vars);
+    if (!chip) return; // disabled or (pre-regen) not yet in config — fail closed
+    const row = document.querySelector(`.ag-row[row-index="${rowIndex}"]:not(.ag-full-width-row)`);
+    if (!row) return;
+    const host = queueChipHost(row, '.ch-q-repeat');
+    if (!host) return; // absent row or chip already present (idempotent)
+    const span = document.createElement('span');
+    span.className = 'ch-q-repeat' + (host.inPreview ? '' : ' ch-q-repeat-inline');
+    span.setAttribute('role', 'note');
+    span.innerHTML = renderChipHtml(chip);
+    span.title =
+      pick.tier === 2
+        ? `This patient has ${pick.count} distinct requests first seen in the last ${CL.constants.CONTACT_WINDOW_DAYS} days (rolling local ledger — patient/task IDs and dates only, no names or clinical content). Repeat contact is an escalation prompt, not a diagnosis.`
+        : `This patient has ${pick.count} open requests seen in your queues this tab session. Session-only — cleared when the tab closes.`;
+    // Always PREPEND (Vue reconciles away trailing foreign nodes — CLAUDE.md rule 1).
+    host.target.insertBefore(span, host.target.firstChild);
+    refreshPulseOnRow(row);
+  };
+
+  // Fetch-scheduling pass (mirrors scheduleQueuePending). Gated OFF the results
+  // queue; skipped when both repeat chips are disabled (no point resolving). Rides
+  // the SHARED resolve cache — hits are free, only new resolves count against the
+  // 8-row cap, so it shares the request-queue fan-out with monitoring/PA/pending.
+  let _queueRepeatRunning = false;
+  let _queueRepeatGeneration = 0;
+  const scheduleQueueRepeatContact = async () => {
+    if (!CL) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return;
+    const c1 = findSystemChip('queue.repeatContact');
+    const c2 = findSystemChip('queue.repeatContactSession');
+    const anyEnabled = (c1 && c1.enabled !== false) || (c2 && c2.enabled !== false);
+    if (!anyEnabled) return;
+    const gen = ++_queueRepeatGeneration;
+    if (_queueRepeatRunning) return;
+    _queueRepeatRunning = true;
+    const API = window.SentinelApiClient;
+    const ctx = API ? API.detectMedicusContext(location.href) : null;
+    const MAX = 8; // cap NEW resolves per pass (shared-cache hits are free)
+    let done = 0;
+    const today = CL.todayStr(new Date());
+    for (const [rowIndex, taskUuid] of _queueRowUuids) {
+      if (pageType() !== 'queue' || _queueRepeatGeneration !== gen) break;
+      let cached = getCachedPatientForTask(taskUuid);
+      if (!cached) {
+        if (done >= MAX) continue;
+        if (!API || !ctx) break;
+        const monEntry = _queueMonCache.get(taskUuid);
+        const slug = (monEntry && monEntry.taskTypeSlug) || _currentQueueSlug;
+        if (!slug) continue;
+        await resolvePatientForTask(slug, taskUuid);
+        cached = getCachedPatientForTask(taskUuid);
+        done++;
+      }
+      if (!cached || !cached.patientUuid) continue;
+      // Tier-1 session accumulation (bounded, cross-queue, session-durable).
+      let set = _sessionContacts.get(cached.patientUuid);
+      if (!set) {
+        if (_sessionContacts.size >= _SESSION_CONTACTS_CAP) {
+          _sessionContacts.delete(_sessionContacts.keys().next().value); // FIFO
+        }
+        set = new Set();
+        _sessionContacts.set(cached.patientUuid, set);
+      }
+      set.add(taskUuid);
+      // Tier-2 rolling ledger record (dedup + earliest-day handled by the pure op).
+      if (CL.recordContact(_contactLogMem, cached.patientUuid, taskUuid, today)) _contactLogDirty = true;
+      injectQueueRepeatChip(rowIndex, cached.patientUuid);
+    }
+    scheduleLedgerFlush();
+    _queueRepeatRunning = false;
+    if (_queueRepeatGeneration !== gen) scheduleQueueRepeatContact();
+  };
+
+  // Durable re-injection on every refresh — repeat-chip equivalent of
+  // reinjectCachedPendingChips (CLAUDE.md rule #4). Reads the session/ledger
+  // (both in-memory) via the resolved-patient cache keyed by the durable map, so
+  // the H6 sort canary (which drops that map) halts injection on a reordered grid.
+  const reinjectCachedRepeatChips = () => {
+    if (!CL || isResultQueueSlug(_currentQueueSlug)) return;
+    const scope = queueScope();
+    scope.querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)').forEach((row) => {
+      const ri = row.getAttribute('row-index');
+      if (ri == null) return;
+      const taskUuid = _durableRowMap.get(Number(ri));
+      if (!taskUuid) return;
+      const cached = getCachedPatientForTask(taskUuid);
+      if (!cached || !cached.patientUuid) return;
+      injectQueueRepeatChip(Number(ri), cached.patientUuid);
+    });
+  };
+
+  // B5 — read the row's own displayed created-date (same cell decorateOneRow reads)
+  // so the carry-over chip can stay COMPLEMENTARY to the taskAge chip, never a
+  // duplicate: we only chip when the ledger has seen the task LONGER than the
+  // displayed date claims (the bounce/re-open case where Medicus resets the shown
+  // date), or when there is no parseable date. Returns the displayed age in days,
+  // or null.
+  const rowDisplayedAgeDays = (row) => {
+    const cell = row.querySelector('[col-id="createdAt"]');
+    if (!cell) return null;
+    const cm = String(cell.textContent || '').match(/(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})/);
+    if (!cm) return null;
+    const d = parseDate(cm[0]);
+    const days = daysAgo(d);
+    return Number.isFinite(days) ? days : null;
+  };
+
+  const injectQueueCarryChip = (rowIndex, taskUuid) => {
+    if (!CL || !taskUuid) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return; // request queues only
+    const carried = CL.taskCarriedDays(_taskAgeMem, taskUuid, new Date());
+    if (carried == null) return;
+    const amberTh = TH('taskAgeAmber');
+    const redTh = TH('taskAgeRed');
+    if (carried < amberTh) return; // below the amber floor — no chip
+    const row = document.querySelector(`.ag-row[row-index="${rowIndex}"]:not(.ag-full-width-row)`);
+    if (!row) return;
+    // Complementary-not-duplicative gate. The row's own displayed-date taskAge chip
+    // already covers the age when the displayed date is at least as old as our
+    // first-seen. Suppress the carry-over chip when:
+    //   (a) the displayed date already fires the RED taskAge chip (explicit rule:
+    //       one age signal per row, prefer the stronger row-date red), OR
+    //   (b) the displayed age is >= our carried days (row date already tells the
+    //       same or older story — carry-over would just duplicate it).
+    // We KEEP the chip when the ledger has seen it longer than the row claims
+    // (carried > displayed, incl. a reset-to-today bounce where displayed is null/0)
+    // — that is exactly the "bounced request whose date reset" B5 exists to catch.
+    const displayed = rowDisplayedAgeDays(row);
+    if (displayed != null && displayed >= redTh) return; // (a)
+    if (displayed != null && displayed >= carried) return; // (b)
+    const id = carried >= redTh ? 'queue.carryOverRed' : 'queue.carryOverAmber';
+    const chip = getSystemChip(id, { days: carried });
+    if (!chip) return; // disabled or (pre-regen) not yet in config — fail closed
+    const host = queueChipHost(row, '.ch-q-carry');
+    if (!host) return; // absent row or chip already present (idempotent)
+    const span = document.createElement('span');
+    span.className = 'ch-q-carry' + (host.inPreview ? '' : ' ch-q-carry-inline');
+    span.setAttribute('role', 'note');
+    span.innerHTML = renderChipHtml(chip);
+    span.title =
+      `This task has been in your queues for ${carried} day${carried === 1 ? '' : 's'} since this extension first saw it` +
+      (displayed != null ? ` (the row shows ${displayed}d — a re-opened or reassigned task can reset the displayed date).` : '.') +
+      ' Local task-age ledger — task ID + dates only, no patient identity.';
+    // Always PREPEND (Vue reconciles away trailing foreign nodes — CLAUDE.md rule 1).
+    host.target.insertBefore(span, host.target.firstChild);
+    refreshPulseOnRow(row);
+  };
+
+  // Scheduling pass — records every visible request-row task into the task-age
+  // ledger (firstSeen/lastSeen/slug) and injects. No fetch, no patient resolve, no
+  // per-pass cap needed (synchronous, task-keyed). Records batch into one dirty
+  // flush; gated OFF the results queue.
+  const scheduleQueueCarryOver = () => {
+    if (!CL) return;
+    if (isResultQueueSlug(_currentQueueSlug)) return;
+    const today = CL.todayStr(new Date());
+    for (const [rowIndex, taskUuid] of _queueRowUuids) {
+      if (pageType() !== 'queue') break;
+      if (CL.recordTask(_taskAgeMem, taskUuid, _currentQueueSlug, today)) _taskAgeDirty = true;
+      injectQueueCarryChip(rowIndex, taskUuid);
+    }
+    scheduleLedgerFlush();
+  };
+
+  // Durable re-injection on every refresh — carry-chip equivalent of
+  // reinjectCachedMonitoringChips (CLAUDE.md rule #4); read-only (the ledger write
+  // happens in the scheduling pass above, which fires on each task-list event).
+  const reinjectCachedCarryChips = () => {
+    if (!CL || isResultQueueSlug(_currentQueueSlug)) return;
+    const scope = queueScope();
+    scope.querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)').forEach((row) => {
+      const ri = row.getAttribute('row-index');
+      if (ri == null) return;
+      const taskUuid = _durableRowMap.get(Number(ri));
+      if (!taskUuid) return;
+      injectQueueCarryChip(Number(ri), taskUuid);
+    });
+  };
+
+  // ---- Queue result-triage chips ----
+  // Mirror of the monitoring pipeline but for Investigation Results tasks.
+  // Uses the engine globals: SentinelApiClient, SentinelNormalisers, SentinelResultSeverity.
+
+  // Pure helper — build a compact "recent result" inspector entry from a normalised
+  // investigation report. Exported for unit testing via regex extraction.
+  // Returns { id, label, capturedAt, lines } where each line mirrors the shape produced
+  // by options.js's extractResultFields (name: non-empty string|null, specimen:
+  // non-empty string|null, text: always a string). The label carries NO patient
+  // identifiers — it is derived purely from specimen names + a line count.
+  function buildRecentInspectEntry(report, taskUuid, now) {
+    const results = report && Array.isArray(report.results) ? report.results : [];
+    const lines = results.map((r) => ({
+      name: r && typeof r.name === 'string' && r.name ? r.name : null,
+      specimen: r && typeof r.specimen === 'string' && r.specimen ? r.specimen : null,
+      text: r && typeof r.text === 'string' ? r.text : '',
+    }));
+    const n = lines.length;
+    const countLabel = n === 1 ? '1 line' : n + ' lines';
+    const specimens = [];
+    for (const l of lines) {
+      if (l.specimen && !specimens.includes(l.specimen)) specimens.push(l.specimen);
+    }
+    let label;
+    if (specimens.length === 1) {
+      label = specimens[0] + ' · ' + countLabel;
+    } else if (specimens.length > 1) {
+      label = specimens[0] + ' +' + (specimens.length - 1) + ' more · ' + countLabel;
+    } else {
+      const firstName = lines.find((l) => l.name) ? lines.find((l) => l.name).name : null;
+      label = (firstName || 'Result') + ' · ' + countLabel;
+    }
+    return { id: taskUuid, label, capturedAt: now, lines };
+  }
+
+  // Pure helper — insert a recent-inspect entry into a NEWEST-FIRST capped store,
+  // deduping by entry.id (taskUuid): if an entry with the same id already exists it is
+  // removed and the new one is moved to the front; otherwise the new one is unshifted.
+  // The store is then trimmed to `cap`. Mutates and returns `store`. Exported for tests.
+  function insertRecentInspect(store, entry, cap) {
+    if (!Array.isArray(store) || !entry || !entry.id) return store;
+    const existing = store.findIndex((e) => e && e.id === entry.id);
+    if (existing !== -1) store.splice(existing, 1);
+    store.unshift(entry);
+    if (typeof cap === 'number' && cap >= 0 && store.length > cap) store.length = cap;
+    return store;
+  }
+
+  // Pure chip-selection helper — exported for unit testing via regex extraction.
+  // Returns an array of { id, vars } for the chips to show for a given severity result.
+  function selectResultChips(sev) {
+    if (!sev) return [];
+    const chips = [];
+    // Compose the rule-chip display label, de-duplicating the analyte name.
+    // The Medicus results queue already shows the analyte name first, and our chip
+    // prefixes it again ("{name} — {rule}"). When the user's rule label ALREADY
+    // names the analyte (e.g. analyte "B12", rule "B12 low") that prefix just
+    // duplicates it ("B12 — B12 low"). So: if the rule label already contains the
+    // analyte name as a whole token, show the rule label alone; otherwise keep the
+    // "{name} — {rule}" form. This lets a clinician name rules naturally
+    // ("B12 low", "Ferritin borderline") without duplication and without needing
+    // globally-unique bare labels ("low1", "low2") — labels are free-form (keyed by id).
+    // Nested (not module-scope) so the regex test-extraction of this function stays self-contained.
+    const composeResultRuleLabel = (name, rule) => {
+      const n = (name || '').trim();
+      const r = (rule || '').trim();
+      if (!r) return n;
+      if (!n) return r;
+      const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const nn = norm(n);
+      const rr = norm(r);
+      const redundant =
+        !!nn &&
+        (rr === nn || rr.startsWith(nn + ' ') || rr.endsWith(' ' + nn) || rr.includes(' ' + nn + ' '));
+      return redundant ? r : n + ' — ' + r;
+    };
+    // The salient result's rule label (set when a user/base rule RAISED severity above
+    // the lab flag) — lets us show an attributable chip instead of a generic one.
+    const ruleLabel = sev.top && sev.top.ruleLabel ? sev.top.ruleLabel : null;
+    const topName = sev.top ? sev.top.name : '';
+    // Item 2.6 (TRIAGE-LENS-2026-07-02.md trend arrows) — a bare arrow glyph appended
+    // to the SALIENT chip's own label when sev.top carries a usable prior (up/down
+    // only; 'same' gets no glyph — nothing to draw attention to). sev.top.prior is
+    // computed by evaluateReportSeverity (engine/result-severity.js, additive field);
+    // this is purely a display append, one character, and never changes which chip id
+    // renders. Only the chips below that actually show the analyte name/label have
+    // anywhere to put it — the plain "{count} abnormal" chip (no rule, no name in its
+    // shipped template) has no slot for it and is deliberately left unchanged.
+    const priorDir = sev.top && sev.top.prior && (sev.top.prior.dir === 'up' || sev.top.prior.dir === 'down')
+      ? sev.top.prior.dir
+      : null;
+    const trendArrow = priorDir === 'up' ? ' ↑' : priorDir === 'down' ? ' ↓' : '';
+    // Clinical severity chips (urgent/abnormal) — highest priority, shown first.
+    // Keyed on urgentCount / abnormalCount (a genuine numeric/lab-flagged RESULT), NOT on
+    // the aggregate `level`: item 3.2 lets a red TEXT review or a red COMBO push `level` to
+    // red while urgentCount stays 0, and the old `level === 'amber'` guard on the abnormal
+    // branch would then suppress a real numeric-abnormal chip. Counting the results directly
+    // keeps the numeric chip visible alongside the red text/combo chip. (When abnormalCount
+    // is 0 no abnormal chip renders anyway, so a review-only amber report is unchanged.)
+    if (sev.urgentCount > 0) {
+      if (ruleLabel) {
+        chips.push({
+          id: 'queue.resultRuleUrgent',
+          vars: { name: topName, rule: ruleLabel, label: composeResultRuleLabel(topName, ruleLabel) + trendArrow }
+        });
+      } else {
+        chips.push({ id: 'queue.resultUrgent', vars: { name: topName + trendArrow, count: sev.urgentCount } });
+      }
+    } else if (sev.abnormalCount > 0) {
+      if (ruleLabel) {
+        chips.push({
+          id: 'queue.resultRuleAbnormal',
+          vars: { name: topName, rule: ruleLabel, label: composeResultRuleLabel(topName, ruleLabel) + trendArrow }
+        });
+      } else {
+        chips.push({ id: 'queue.resultAbnormal', vars: { count: sev.abnormalCount } });
+      }
+    }
+    // Part A (item 3.2, TRIAGE-LENS-2026-07-02.md) — a red-level text review
+    // (reviewTop.level === 'red', e.g. a positive blood culture rule authored with
+    // abnormalLevel:'red') reuses the SAME urgent/rule-urgent chip templates as a
+    // genuine numeric urgent result — there is no separate "review, but red" system
+    // chip in defaults.json, and there must not be a new one added here (this rule set
+    // is calibrated by a CSO review, not this mechanism change) — reusing the existing
+    // red family is the deliberate choice. Renders alongside the numeric urgent/abnormal
+    // chip above when both fire (they already co-render today — see the
+    // "urgent numeric + review" case in test-result-severity.js — this is not a new
+    // interaction, just a new colour for the review side of it).
+    const isRedReview = !!(sev.reviewTop && sev.reviewTop.level === 'red');
+    if (isRedReview) {
+      const redName = sev.reviewTop.name || '';
+      const redLabel = sev.reviewTop.label || '';
+      // Same "is this a real custom label, or just the generic default" distinction as
+      // every other attributable chip here (numeric urgent/abnormal, amber review): a
+      // text rule authored WITHOUT its own `label` falls back to the literal string
+      // "Needs review" (see computeTextOutcome) — that is not a name worth naming in
+      // the chip, so it renders via the generic red id instead of the rule-attributed one.
+      if (redLabel && redLabel !== 'Needs review') {
+        chips.push({
+          id: 'queue.resultRuleUrgent',
+          vars: { name: redName, rule: redLabel, label: composeResultRuleLabel(redName, redLabel) }
+        });
+      } else {
+        chips.push({ id: 'queue.resultUrgent', vars: { name: redName, count: 1 } });
+      }
+    }
+    // Text-rule review chips (amber) — after clinical severity, before meta process
+    // chips. A specifically-labelled text rule (e.g. bowel screening non-responder)
+    // shows its own label via the attributable chip; the generic "Needs review" covers
+    // cultures (whose rule label is itself "Needs review"). Suppressed when the review
+    // chip above ALREADY carried this exact finding red (reviewCount === 1 and it was
+    // the red one) — never double-show the identical result as both a red and an amber
+    // chip. A report with additional amber-level reviews alongside the red one still
+    // shows this generic amber chip (reviewCount counts every review, red or amber).
+    if (sev.reviewCount > 0 && !(isRedReview && sev.reviewCount === 1)) {
+      const reviewLabel = sev.reviewTop && sev.reviewTop.label ? String(sev.reviewTop.label) : '';
+      if (reviewLabel && reviewLabel !== 'Needs review') {
+        chips.push({ id: 'queue.resultReviewRule', vars: { rule: reviewLabel } });
+      } else {
+        chips.push({ id: 'queue.resultReview', vars: { count: sev.reviewCount } });
+      }
+    }
+    // noGrowth (calm) — mirror the review path: a custom rule's normalLabel (e.g.
+    // "Negative", "Not detected") shows via the attributable chip; the default "No
+    // growth" (cultures) keeps the generic chip. The label comes from the matched
+    // rule's normalLabel (sev.noGrowthTop.label), NOT the generic system-chip text.
+    if (sev.noGrowthCount > 0) {
+      const normalLabel = sev.noGrowthTop && sev.noGrowthTop.label ? String(sev.noGrowthTop.label) : '';
+      if (normalLabel && normalLabel !== 'No growth') {
+        chips.push({ id: 'queue.resultNoGrowthRule', vars: { label: normalLabel } });
+      } else {
+        chips.push({ id: 'queue.resultNoGrowth', vars: { count: sev.noGrowthCount } });
+      }
+    }
+    // Combo rules — a fired combo (e.g. sterile pyuria) shows its own attributable
+    // label. Escalate-only/amber; appears after the calm noGrowth path, before meta.
+    if (sev.comboCount > 0 && sev.comboTop && sev.comboTop.label) {
+      chips.push({ id: 'queue.resultCombo', vars: { rule: String(sev.comboTop.label) } });
+    }
+    // Meta/process chips (outline, not filled) — last
+    if (sev.misprioritised) chips.push({ id: 'queue.resultMisprioritised', vars: {}, meta: true });
+    if (sev.unmatched) chips.push({ id: 'queue.resultUnmatched', vars: {}, meta: true });
+    // NOTE: sev.unclassified (Part B, item 3.2) is NOT rendered here — there is no
+    // defaults.json systemChips slot for it (this mechanism change deliberately ships
+    // no new shipped chip config) — see buildUnclassifiedChipHtml/injectResultChip,
+    // which appends it as FIXED markup, the same pattern as the "unit?" meta chip.
+    // When a more informative severity chip is already present, suppress bare-flag review
+    // chips (e.g. a custom rule matching Medicus's internal "High" flag result). A review
+    // chip labelled just "High" / "Low" / "H" adds no signal when the severity chip already
+    // names the analyte or rule. Keep it when it's the only chip (some signal > none).
+    if (chips.length > 1) {
+      const BARE_FLAG = /^(high|low|h|l)$/i;
+      return chips.filter((c) => {
+        if (c.id !== 'queue.resultReviewRule') return true;
+        return !BARE_FLAG.test((c.vars && c.vars.rule || '').trim());
+      });
+    }
+    return chips;
+  }
+
+  // Pure helper (item 2.2, TRIAGE-LENS-2026-07-02.md) — build the compact per-result
+  // detail array for the queue result-chip popover. Takes the normalised investigation
+  // report (engine/normalisers.js normaliseInvestigationReport) and the sev object
+  // returned by evaluateReportSeverity (engine/result-severity.js), including its
+  // ADDITIVE `flagged`/`reviewTop`/`noGrowthTop`/`comboTop`/`unclassified` fields —
+  // never recomputes grading itself, just reshapes what's already been decided. Capped
+  // at 10 entries, filled in priority order: numeric urgent-flagged results, then
+  // numeric abnormal-flagged results, then the rule-fired (text-rule) review result,
+  // then every unclassified-positive result (item 3.2 Part B), then the fired combo +
+  // calm noGrowth informational lines. Exported for unit testing via regex extraction —
+  // self-contained (nests its own small helpers), same pattern as selectResultChips'
+  // composeResultRuleLabel above.
+  function buildResultDetail(report, sevResult) {
+    const DETAIL_CAP = 10;
+    if (!sevResult || typeof sevResult !== 'object') return [];
+    const results = report && Array.isArray(report.results) ? report.results : [];
+    const out = [];
+    const pushCap = (entry) => {
+      if (entry && out.length < DETAIL_CAP) out.push(entry);
+    };
+
+    // Compose a rule's label with its threshold summary, e.g.
+    // "Critical high potassium (red ≥6.5)". comparator/threshold are the ADDITIVE
+    // fields computeRuleSev now carries (result-severity.js) — display-only.
+    // ADDITIVE (item 3.6) — a delta rule reuses this SAME slot with comparator
+    // 'rise'/'fall' (never 'above'/'below'); rendered with a "≥+" magnitude symbol
+    // instead of "≥"/"≤" so "(red ≥+26)" reads as a CHANGE, not an absolute value
+    // crossing — showing "(red ≥26)" on a creatinine delta rule would be actively
+    // misleading (a creatinine of 26 is nonsensical; a RISE of 26 is the AKI signal).
+    const composeRuleThresholdLabel = (label, comparator, threshold, effSev) => {
+      if (!label) return null;
+      const isDelta = comparator === 'rise' || comparator === 'fall';
+      if ((comparator !== 'above' && comparator !== 'below' && !isDelta) || !Number.isFinite(threshold)) return label;
+      const band = effSev === 'urgent' ? 'red' : 'amber';
+      const symbol = isDelta ? '≥+' : comparator === 'above' ? '≥' : '≤';
+      return label + ' (' + band + ' ' + symbol + threshold + ')';
+    };
+
+    // Direction for a numeric flagged entry: prefer the lab's own above/below range
+    // flags, then a rule's comparator (a rule can escalate a value the lab itself
+    // never flagged above/below), and only fall back to the bare 'urgent' lab flag
+    // (result.urgent — a distinct API field independent of range) when no direction
+    // is known at all. ADDITIVE (item 3.6) — a delta rule's comparator is
+    // 'rise'/'fall' (the OBSERVED direction of change); treated the same as
+    // 'above'/'below' for the arrow glyph (↑ for a rise, ↓ for a fall).
+    const flagFor = (f) => {
+      if (f.isAbove) return 'above';
+      if (f.isBelow) return 'below';
+      if (f.ruleComparator === 'above' || f.ruleComparator === 'rise') return 'above';
+      if (f.ruleComparator === 'below' || f.ruleComparator === 'fall') return 'below';
+      if (f.urgent || f.effSev === 'urgent') return 'urgent';
+      return null;
+    };
+
+    const toEntry = (f) => ({
+      name: f.name || '',
+      value: f.value === undefined ? null : f.value,
+      unit: f.unit || null,
+      low: f.low === undefined ? null : f.low,
+      high: f.high === undefined ? null : f.high,
+      flag: flagFor(f),
+      date: f.date || null,
+      ruleLabel: composeRuleThresholdLabel(f.ruleLabel, f.ruleComparator, f.ruleThreshold, f.effSev),
+      // ADDITIVE (item 2.7, TRIAGE-LENS-2026-07-02.md) — the fired rule's id (only set
+      // when a rule, not the lab flag, drove this result's severity — same gate as
+      // ruleLabel, see result-severity.js's ruleDriven). Looked up against
+      // CONFIG.resultRules at POPOVER-RENDER time (buildResultDetailPopoverEl), not
+      // cached here, so an edited rule's actions apply immediately with no cache
+      // invalidation — see findResultRuleActionsById below.
+      ruleId: f.ruleId || null,
+      // ADDITIVE (item 3.6) — ready-to-render change summary e.g. '+38 in 5 days',
+      // set only when a delta rule drove this result's severity (result-severity.js
+      // evaluateReportSeverity). null on every non-delta-driven entry.
+      deltaSummary: f.deltaSummary || null,
+      prior: f.prior || null,
+    });
+
+    const flagged = Array.isArray(sevResult.flagged) ? sevResult.flagged : [];
+    // Tier 1 — urgent-flagged numeric results
+    flagged.filter((f) => f && f.effSev === 'urgent').forEach((f) => pushCap(toEntry(f)));
+    // Tier 2 — abnormal-flagged numeric results
+    flagged.filter((f) => f && f.effSev === 'abnormal').forEach((f) => pushCap(toEntry(f)));
+
+    // Tier 3 — rule-fired (text-rule) review result. evaluateReportSeverity only
+    // tracks the FIRST review outcome (reviewTop); look up the matching normalised
+    // result (by name) for a value/date to show, when still available.
+    if (sevResult.reviewTop && sevResult.reviewTop.name) {
+      const match = results.find((r) => r && r.name === sevResult.reviewTop.name);
+      pushCap({
+        name: sevResult.reviewTop.name,
+        value: match && match.rawValue ? match.rawValue : null,
+        unit: null,
+        low: null,
+        high: null,
+        // Part A (item 3.2) — a red-level text review shows the urgent glyph (mirrors the
+        // comboTop tier below), so the popover line reads as red, not a plain review.
+        flag: sevResult.reviewTop.level === 'red' ? 'urgent' : null,
+        date: (match && match.date) || null,
+        ruleLabel: sevResult.reviewTop.label || null,
+        prior: null,
+      });
+    }
+
+    // Tier 3b — unclassified qualitative positives (Part B, item 3.2). Results no rule
+    // classified but whose text looks positive; surfaced so the popover/banner explain
+    // the amber chip rather than showing nothing. ONE LINE PER ENTRY in
+    // sevResult.unclassified (not just the first — capped like every other tier by
+    // pushCap/DETAIL_CAP). Value shows the raw result string when available.
+    const unclassifiedList = Array.isArray(sevResult.unclassified) ? sevResult.unclassified : [];
+    unclassifiedList.forEach((u) => {
+      if (!u || !u.name) return;
+      const match = results.find((r) => r && r.name === u.name);
+      pushCap({
+        name: u.name,
+        value: match && match.rawValue ? match.rawValue : null,
+        unit: null,
+        low: null,
+        high: null,
+        flag: null,
+        date: (match && match.date) || null,
+        ruleLabel: "'" + String(u.token || '') + "' — not matched by a rule, surfaced for review",
+        prior: null,
+      });
+    });
+
+    // Tier 4 — informational lines: the fired combo (report-level, not tied to a
+    // single result row), then the calm noGrowth text-rule outcome.
+    if (sevResult.comboTop && sevResult.comboTop.label) {
+      pushCap({
+        name: sevResult.comboTop.label,
+        value: null,
+        unit: null,
+        low: null,
+        high: null,
+        flag: sevResult.comboTop.level === 'red' ? 'urgent' : null,
+        date: null,
+        ruleLabel: null,
+        prior: null,
+      });
+    }
+    if (sevResult.noGrowthTop && sevResult.noGrowthTop.name) {
+      const match = results.find((r) => r && r.name === sevResult.noGrowthTop.name);
+      pushCap({
+        name: sevResult.noGrowthTop.name,
+        value: match && match.rawValue ? match.rawValue : null,
+        unit: null,
+        low: null,
+        high: null,
+        flag: null,
+        date: (match && match.date) || null,
+        ruleLabel: sevResult.noGrowthTop.label || null,
+        prior: null,
+      });
+    }
+
+    return out;
+  }
+
+  // Pure helper (item 2.2) — render one buildResultDetail() entry as a single display
+  // line, e.g. "K+ 6.2 mmol/L ↑ (3.5–5.3) · 12 Jun · rule: Critical high potassium
+  // (red ≥6.5) · was 4.1, 03 May". Exported for unit testing via regex extraction —
+  // self-contained (nests its own date formatter). The RESULT of this function must
+  // only ever be assigned via textContent, never innerHTML — the pieces it joins
+  // (analyte name, value, unit, rule label) are untrusted lab-report/config-derived
+  // strings (CLAUDE.md / TRIAGE-LENS-2026-07-02.md item 2.2 hard rule).
+  function formatDetailLine(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    const shortDate = (iso) => {
+      if (typeof iso !== 'string') return '';
+      const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) return '';
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const mon = months[Number(m[2]) - 1];
+      return mon ? m[3] + ' ' + mon : '';
+    };
+    const GLYPH = { urgent: '❗', above: '↑', below: '↓' };
+
+    let head = String(entry.name || '').trim();
+    const hasValue = entry.value !== null && entry.value !== undefined && entry.value !== '';
+    if (hasValue) {
+      head += (head ? ' ' : '') + String(entry.value);
+      if (entry.unit) head += ' ' + entry.unit;
+    }
+    if (entry.flag && GLYPH[entry.flag]) head += ' ' + GLYPH[entry.flag];
+    // ADDITIVE (item 3.6) — a delta-fired entry's change summary e.g. '+38 in 5
+    // days', appended right after the arrow so the head reads as one clause:
+    // "Creatinine 148 ↑ +38 in 5 days". Suppresses the trailing "was X, date"
+    // segment below (same underlying prior value — showing both is redundant).
+    if (entry.deltaSummary) head += ' ' + entry.deltaSummary;
+    const hasLow = entry.low !== null && entry.low !== undefined;
+    const hasHigh = entry.high !== null && entry.high !== undefined;
+    if (hasLow || hasHigh) {
+      head += ' (' + (hasLow ? entry.low : '?') + '–' + (hasHigh ? entry.high : '?') + ')';
+    }
+
+    const segs = [];
+    const headTrimmed = head.trim();
+    if (headTrimmed) segs.push(headTrimmed);
+    const d = shortDate(entry.date);
+    if (d) segs.push(d);
+    if (entry.ruleLabel) segs.push('rule: ' + entry.ruleLabel);
+    if (
+      !entry.deltaSummary &&
+      entry.prior &&
+      (entry.prior.dir === 'up' || entry.prior.dir === 'down' || entry.prior.dir === 'same') &&
+      entry.prior.value !== null &&
+      entry.prior.value !== undefined
+    ) {
+      const pd = shortDate(entry.prior.date);
+      segs.push('was ' + entry.prior.value + (pd ? ', ' + pd : ''));
+    }
+    return segs.join(' · ');
+  }
+
+  // Pure helper (item 3.1, TRIAGE-LENS-2026-07-02.md) — render one entry from
+  // sev.unitMismatches as a single explanatory popover line, e.g. "Potassium: rule
+  // 'Critical high potassium' expects mmol/L, result reported in mg/dL — rule not
+  // applied". Exported for unit testing via regex extraction, same pattern as
+  // formatDetailLine above. The RESULT of this function must only ever be assigned
+  // via textContent, never innerHTML — the pieces it joins (analyte name, rule
+  // label, unit strings) are untrusted lab-report/config-derived strings.
+  function formatUnitMismatchLine(m) {
+    if (!m || typeof m !== 'object') return '';
+    const name = String(m.name || '').trim() || 'Result';
+    const ruleLabel = String(m.ruleLabel || '').trim();
+    const ruleUnit = String(m.ruleUnit || '').trim();
+    const resultUnit = String(m.resultUnit || '').trim();
+    const rulePart = ruleLabel ? "rule '" + ruleLabel + "'" : 'a rule';
+    const expects = ruleUnit ? ' expects ' + ruleUnit + ',' : '';
+    const reported = resultUnit ? ' result reported in ' + resultUnit : ' result reported in an unrecognised unit';
+    return name + ': ' + rulePart + expects + reported + ' — rule not applied';
+  }
+
+  // Sentinel returned by computeQueueRowResult (item 1.1 leg D) to distinguish
+  // "attempted this row's fetch/eval and it genuinely failed" from a plain
+  // `null`, which stays reserved for "nothing to check" (feature disabled,
+  // this task has no matching investigation report) or "checked, nothing due".
+  // A distinct object identity — never a string/bool — so it can't collide
+  // with a real evaluateReportSeverity() result or a plain null.
+  const QUEUE_RESULT_FETCH_ERROR = Object.freeze({ __chQueueResultError: true });
+
+  const computeQueueRowResult = async () => {
+    return null;
+  };
+
+  // The "couldn't check" chip (item 1.1 leg D) — fixed markup, NOT routed
+  // through getSystemChip/renderSystemChipHtmlMemo (those are user-configurable
+  // chip CONTENT; this is a system-level failure indicator and must not be
+  // relabelled/disabled by a rule config). Grey outline (.ch-chip-meta family +
+  // its own .ch-chip-error modifier — see hud.css) so it's visually distinct
+  // from both a filled clinical chip and the plain meta/outline chips.
+  const RESULT_ERROR_CHIP_HTML =
+    '<span class="ch-chip ch-chip-meta ch-chip-error" role="note" ' +
+    'title="Medicus Suite couldn’t check this result — will retry">?</span>';
+
+  // "Unit mismatch" chip (item 3.1, TRIAGE-LENS-2026-07-02.md) — fixed markup, NOT
+  // routed through getSystemChip/renderSystemChipHtmlMemo, same reasoning as
+  // RESULT_ERROR_CHIP_HTML above: this is a SYSTEM-level indicator (one or more
+  // result rules were skipped because the reported unit conflicts with the rule's
+  // expected unit — see engine/result-severity.js unitsCompatible), not
+  // user-configurable chip content, and there is no defaults.json systemChips slot
+  // to author a label for it. Same ch-chip-meta family as the other meta chips
+  // (misprioritised/unmatched) — outline, never a clinical fill, since this never
+  // changes severity, only which rules were consulted.
+  const UNIT_MISMATCH_CHIP_HTML =
+    '<span class="ch-chip ch-chip-meta ch-chip-unit-mismatch" role="note" ' +
+    'title="One or more rules were skipped: reported unit does not match the rule’s expected unit — see detail">unit?</span>';
+
+  // "Unclassified qualitative positive" chip (Part B, item 3.2, TRIAGE-LENS-2026-07-02.md)
+  // — a non-numeric result (e.g. "Positive", "Detected") that no lab flag and no text
+  // rule caught, surfaced so it can never be silently invisible (see
+  // engine/result-severity.js matchUnclassifiedPositive). Fixed markup, NOT routed
+  // through findSystemChip/renderSystemChipHtmlMemo — same reasoning as
+  // RESULT_ERROR_CHIP_HTML/UNIT_MISMATCH_CHIP_HTML above: this mechanism change ships
+  // no new defaults.json systemChips slot (that is the calibration pass's call). AMBER
+  // but deliberately NOT the filled .ch-chip-amber a lab-confirmed abnormal/review chip
+  // uses — dashed outline (.ch-chip-unclassified, hud.css) with a "?" hint prefix, so a
+  // GP never mistakes an unreviewed free-text hit for a graded clinical finding.
+  // `name`/`token` are lab-report-derived and untrusted — escapeHtml()'d, this file's
+  // innerHTML discipline. Shows only the FIRST unclassified entry by name (mirrors the
+  // review/noGrowth/combo "top" chip convention); a count suffix covers the rest.
+  const buildUnclassifiedChipHtml = (list) => {
+    if (!Array.isArray(list) || !list.length) return null;
+    const first = list[0] && typeof list[0] === 'object' ? list[0] : {};
+    const name = escapeHtml(String(first.name || 'Result').trim());
+    const extra = list.length > 1 ? ' +' + (list.length - 1) : '';
+    const title = 'Not matched by a rule — surfaced for review (unclassified positive result' +
+      (list.length > 1 ? 's' : '') + ')';
+    return '<span class="ch-chip ch-chip-unclassified" role="note" title="' + escapeHtml(title) + '">? ' +
+      name + extra + '</span>';
+  };
+
+  // "All-normal, fileable" marker (item 4.4, TRIAGE-LENS-2026-07-02.md) — a small
+  // green tick shown ONLY when computeQueueRowResult's fileability check found the
+  // report level:'none' AND cleared shared/lab-filing-utils.js's fileabilityBlockers
+  // (free-text/culture/unmatched/missing-rules) — the same profile-independent gate
+  // lab-file-button.js runs on the filing screen. READ-ONLY: it never files anything
+  // — filing stays the explicit lab-file-button.js action on the task's filing
+  // screen; this is purely "work the reds first, batch the ticks later". Fixed
+  // markup, NOT routed through findSystemChip/renderSystemChipHtmlMemo — same
+  // reasoning as RESULT_ERROR_CHIP_HTML/UNIT_MISMATCH_CHIP_HTML above: a system-level
+  // indicator with no defaults.json systemChips slot to author a label for. Classed
+  // `ch-chip-fileable` (colour) + `ch-q-fileable` (a stable hook independent of the
+  // colour class). Rendered INSIDE the existing .ch-q-result host span (see
+  // injectResultChip below), so it inherits that host's hud.css token-block scope
+  // (CLAUDE.md rule 5) via CSS inheritance without needing its own top-level entry
+  // in the selector list.
+  const FILEABLE_CHIP_HTML =
+    '<span class="ch-chip ch-chip-fileable ch-q-fileable" role="note" ' +
+    'title="Every result is within normal limits and nothing was found that blocks auto-filing. ' +
+    'This is a marker only, nothing is filed automatically — file from the task’s lab-filing action.">✓</span>';
+
+  // taskUuid (item 2.2) is threaded through by every call site (initial post-fetch
+  // inject, the scheduler's fresh-cache-hit path, and reinjectCachedResultChips) so
+  // the popover click handler can read this row's cached detail at click time.
+  const injectResultChip = (rowIndex, sev, taskUuid, isError) => {
+    return;
+  };
+
+  // ---- Result-chip detail popover (item 2.2, TRIAGE-LENS-2026-07-02.md) ----
+  // Singleton, document.body-hosted (same convention as the action menu above). Built
+  // with createElement/textContent ONLY — the lines are derived from lab-report data
+  // (untrusted), so no innerHTML anywhere on this path (CLAUDE.md / plan hard rule).
+  let _resultDetailPopoverEl = null;
+  let _resultDetailPopoverAnchor = null;
+
+  const closeResultDetailPopover = () => {
+    if (_resultDetailPopoverEl) {
+      _resultDetailPopoverEl.remove();
+      _resultDetailPopoverEl = null;
+    }
+    _resultDetailPopoverAnchor = null;
+    document.removeEventListener('click', onDocClickForResultPopover, true);
+    document.removeEventListener('keydown', onKeydownForResultPopover, true);
+    window.removeEventListener('scroll', closeResultDetailPopover, true);
+  };
+  const onDocClickForResultPopover = (e) => {
+    if (!_resultDetailPopoverEl) return;
+    if (_resultDetailPopoverEl.contains(e.target)) return;
+    if (_resultDetailPopoverAnchor && _resultDetailPopoverAnchor.contains(e.target)) return;
+    closeResultDetailPopover();
+  };
+  const onKeydownForResultPopover = (e) => {
+    if (e.key === 'Escape' || e.key === 'Esc') closeResultDetailPopover();
+  };
+
+  // Fixed explanation shown when the grey "?" error chip is clicked (item 2.2 —
+  // the error chip gets a popover too). Plain, non-alarming, and honest about the
+  // retry behaviour: the scheduler re-attempts an error entry after the short
+  // _RESULT_ERROR_TTL, with no user action needed.
+  const RESULT_ERROR_POPOVER_TEXT =
+    'Medicus Suite couldn’t check this result — the fetch or evaluation failed. ' +
+    'This is usually transient (network hiccup, Medicus API blip). ' +
+    'It retries automatically; the chip updates when a retry succeeds.';
+
+  // findResultRuleActionsById(ruleId) → action[] | null (item 2.7, TRIAGE-LENS-2026-07-02.md)
+  // Looks up a result rule's `actions` array by id straight from the LIVE CONFIG at
+  // POPOVER-RENDER time (not cached alongside the detail entry, which only carries the
+  // small ruleId string) — so editing a rule's actions in Settings applies to the next
+  // popover open with no cache invalidation needed. Returns null (never []) when the
+  // rule is missing, disabled-out-of-config, or carries no actions, so callers can use
+  // a simple truthiness check.
+  const findResultRuleActionsById = (ruleId) => {
+    if (!ruleId || !CONFIG || !Array.isArray(CONFIG.resultRules)) return null;
+    const rule = CONFIG.resultRules.find((r) => r && r.id === ruleId);
+    if (!rule || !Array.isArray(rule.actions) || !rule.actions.length) return null;
+    return rule.actions;
+  };
+
+  // buildResultRuleActionsRow(actions) — item 2.7. One button per guidance action,
+  // built with createElement/textContent only (no innerHTML — action label/text are
+  // clinician-authored config, but this popover's hard rule per item 2.2 is
+  // createElement/textContent throughout, so this stays consistent rather than
+  // carving out an exception). Reuses executeAction for link/snippet — the SAME
+  // scheme-guarded (isSafeActionUrl) function the alert-rule action menu uses, so a
+  // javascript:/data: link action is blocked here exactly as it is there. `note`
+  // actions are handled locally (a toggled inline text block) rather than via
+  // executeAction's note branch, which rewrites a whole ch-action-menu singleton — a
+  // different popover/lifecycle to this one; toggling in place keeps the rest of this
+  // popover's detail lines visible instead of replacing them.
+  const buildResultRuleActionsRow = (actions) => {
+    const row = document.createElement('div');
+    row.className = 'ch-result-popover-actions';
+    actions.forEach((a) => {
+      if (!a || typeof a !== 'object') return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ch-result-popover-action ch-result-popover-action-' + (a.type || 'note');
+      btn.textContent = a.label || '(unlabelled)';
+      if (a.type === 'note' && a.text) {
+        const note = document.createElement('div');
+        // Deliberately NOT "ch-result-popover-action-note" — the button itself already
+        // carries that exact class as its type modifier (ch-result-popover-action-<type>),
+        // so reusing it here would make the two indistinguishable by selector.
+        note.className = 'ch-result-popover-action-notebody';
+        note.textContent = a.text;
+        note.style.display = 'none';
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          note.style.display = note.style.display === 'none' ? 'block' : 'none';
+        });
+        row.appendChild(btn);
+        row.appendChild(note);
+      } else {
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          executeAction(a, btn, null);
+        });
+        row.appendChild(btn);
+      }
+    });
+    return row;
+  };
+
+  // Build the popover body with createElement/textContent only — no innerHTML of any
+  // lab-derived string. `detail` is the array built by buildResultDetail; each line's
+  // TEXT comes from formatDetailLine, assigned via textContent only. isError builds
+  // the fixed error explanation instead (never a numeric detail array — error cache
+  // entries don't carry one). `unitMismatches` (item 3.1, ADDITIVE) is
+  // sev.unitMismatches, mirrored onto the cache entry alongside `detail` — one
+  // explanatory line per skipped rule, appended AFTER the normal detail lines.
+  // Rendered regardless of whether `detail` itself is empty, so a report whose
+  // ONLY signal is a unit-mismatch skip still shows something rather than "No
+  // detail available."
+  const buildResultDetailPopoverEl = (detail, isError, unitMismatches) => {
+    const el = document.createElement('div');
+    el.className = 'ch-result-popover';
+    el.setAttribute('role', 'dialog');
+    if (isError) {
+      const line = document.createElement('div');
+      line.className = 'ch-result-popover-line ch-result-popover-error';
+      line.textContent = RESULT_ERROR_POPOVER_TEXT;
+      el.appendChild(line);
+      return el;
+    }
+    const hasDetail = Array.isArray(detail) && detail.length > 0;
+    const mismatches = Array.isArray(unitMismatches) ? unitMismatches : [];
+    if (!hasDetail && !mismatches.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ch-result-popover-empty';
+      empty.textContent = 'No detail available.';
+      el.appendChild(empty);
+      return el;
+    }
+    if (hasDetail) {
+      detail.forEach((entry) => {
+        const line = document.createElement('div');
+        line.className = 'ch-result-popover-line' + (entry.flag ? ' ch-result-popover-line-' + entry.flag : '');
+        line.textContent = formatDetailLine(entry);
+        el.appendChild(line);
+        // Item 2.7 — guidance actions carried by the fired result rule, resolved by
+        // ruleId against the live CONFIG (see findResultRuleActionsById above). No
+        // ruleId, or a rule with no actions configured, renders nothing extra.
+        const actions = findResultRuleActionsById(entry.ruleId);
+        if (actions) el.appendChild(buildResultRuleActionsRow(actions));
+      });
+    }
+    // Item 3.1 — one explanatory line per (result, rule) unit-mismatch skip.
+    mismatches.forEach((m) => {
+      const line = document.createElement('div');
+      line.className = 'ch-result-popover-line ch-result-popover-line-unit-mismatch';
+      line.textContent = formatUnitMismatchLine(m);
+      el.appendChild(line);
+    });
+    return el;
+  };
+
+  // Toggle: clicking the SAME open anchor again closes it; clicking any other chip (or
+  // a fresh open) closes whatever was open and opens the new one. `taskUuid` is read
+  // fresh from _queueResultCache at click time (not a stale closure), so a detail
+  // array that changed since inject (config/cache invalidation) is never shown stale.
+  // The error state is ALSO re-read from the live cache entry (OR'd with the inject-time
+  // flag): if the entry has flipped to error since inject, never show a stale detail
+  // array for a row whose current state is "couldn't check".
+  const toggleResultDetailPopover = (anchorEl, taskUuid, isError) => {
+    if (_resultDetailPopoverEl && _resultDetailPopoverAnchor === anchorEl) {
+      closeResultDetailPopover();
+      return;
+    }
+    closeResultDetailPopover();
+    const entry = _queueResultCache.get(taskUuid);
+    const showError = !!isError || !!(entry && entry.error);
+    const detail = !showError && entry && Array.isArray(entry.detail) ? entry.detail : [];
+    const unitMismatches = !showError && entry && Array.isArray(entry.unitMismatches) ? entry.unitMismatches : [];
+    const popover = buildResultDetailPopoverEl(detail, showError, unitMismatches);
+    const r = anchorEl.getBoundingClientRect();
+    popover.style.position = 'fixed';
+    popover.style.top = (r.bottom + 4) + 'px';
+    popover.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 340)) + 'px';
+    popover.style.zIndex = '2147483647';
+    document.body.appendChild(popover);
+    _resultDetailPopoverEl = popover;
+    _resultDetailPopoverAnchor = anchorEl;
+    // Dismiss on outside click, Esc, or scroll (matches the action-menu's deferred
+    // listener-attach so the click that OPENED the popover doesn't also close it).
+    setTimeout(() => {
+      document.addEventListener('click', onDocClickForResultPopover, true);
+      document.addEventListener('keydown', onKeydownForResultPopover, true);
+      window.addEventListener('scroll', closeResultDetailPopover, true);
+    }, 0);
+  };
+
+  // Re-inject result chips straight from the per-task cache, keyed by each row's own
+  // `row-id` (the task UUID) read from the DOM — exactly how the durable age/decoration
+  // chips work. This does NOT depend on the bridge-provided `_queueRowUuids` map (which
+  // the Medicus SPA churn keeps clearing to 0), so chips survive every re-render.
+  // injectResultChip de-dupes, and a wipe immediately precedes this call, so it's a
+  // clean, synchronous restore with no visible gap.
+  const reinjectCachedResultChips = () => {
+    return;
+  };
+
+  // ---- Severity row tint (item 1.3, TRIAGE-LENS-2026-07-02.md) ----
+  // Pre-attentive 2-3px left-edge tint on rows with a KNOWN cached severity — red for
+  // red/urgent, amber for amber. A marker CLASS added to the host `.ag-row` (and its
+  // preview/detail row when one exists), same "class on the host element" pattern as
+  // QUEUE_DECORATED_KEY — NOT an injected node. Rows with no cached severity get
+  // neither class: this must never imply "assessed" (that's item 1.1's territory).
+  const ROW_TINT_RED = 'ch-row-sev-red';
+  const ROW_TINT_AMBER = 'ch-row-sev-amber';
+
+  // Strip stale tint classes from every row currently carrying one, scoped to the live
+  // grid container. Must run in the SAME wipe cycle as the chip-node wipe
+  // (refreshQueueChips) so a recycled row-index never keeps a previous patient's
+  // tint colour — the tint analogue of the v3.69 wrong-row chip bug (CLAUDE.md rule #4).
+  const clearQueueRowTint = () => {
+    queueScope()
+      .querySelectorAll('.' + ROW_TINT_RED + ', .' + ROW_TINT_AMBER)
+      .forEach((el) => el.classList.remove(ROW_TINT_RED, ROW_TINT_AMBER));
+  };
+
+  // Re-apply tint straight from the per-task cache, using the EXACT SAME durable
+  // rowIndex->taskUuid->severity lookup as reinjectCachedResultChips above (survives
+  // the runQueue churn that empties _queueRowUuids). Tints both the master row and its
+  // preview/detail row (queueChipHost's host resolution shows a GP may be scanning
+  // either). Gated on prefs.queueRowTint (default true) via the existing PREF()
+  // mechanism. Idempotent: always paired with clearQueueRowTint() in the same cycle,
+  // so calling it repeatedly never accumulates stale classes.
+  const reapplyQueueRowTint = () => {
+    return;
+  };
+
+  // ---- Seen-session row dimming (item 4.7, TRIAGE-LENS-2026-07-02.md) ----
+  // SAFETY-SENSITIVE — read docs/HAZARD-LOG.md before touching this section.
+  // Dims rows for tasks the GP has already OPENED this session, so unworked
+  // rows stand out. Visual only, session-local: `_seenTasks` is a plain Set
+  // of taskUuids, never persisted (no chrome.storage write), never cleared
+  // (lives for the page/tab session — a fresh page load starts empty). A
+  // taskUuid is added the moment runDetailVerdict() resolves it (below), the
+  // same "GP is now looking at this task" signal the detail-verdict banner
+  // itself keys off.
+  //
+  // HARD SAFETY GATE: a row is ONLY eligible to dim when it is NOT currently
+  // carrying ROW_TINT_RED or ROW_TINT_AMBER — i.e. its live severity is
+  // clear/none or unassessed. This is checked against the row's CURRENT tint
+  // class at apply time, every refreshQueueChips cycle (never a one-off
+  // snapshot taken when the task was opened), which is what gives the
+  // auto-undim behaviour for free: reapplyQueueRowTint (above) runs earlier
+  // in the SAME refreshQueueChips pass and derives the tint fresh from
+  // _queueResultCache every time, so a row that has since re-graded red/amber
+  // (a new result landed) has already LOST its tint class by the time this
+  // function reads it, fails the gate below, and is never dimmed — there is
+  // no separate "undo the dim" code path to get wrong. This suppresses
+  // NOTHING from the engine: chip content, tint colour and the status-bar
+  // counts are all completely unaffected by whether a row is dimmed.
+  //
+  // Pref-gated OFF by default (PREF('queueSeenDimming', false)) — the most
+  // snooze-adjacent feature in the plan, so opt-in is the conservative
+  // default.
+  const ROW_SEEN_CLASS = 'ch-row-seen';
+  const _seenTasks = new Set();
+
+  const clearQueueSeenDim = () => {
+    queueScope()
+      .querySelectorAll('.' + ROW_SEEN_CLASS)
+      .forEach((el) => el.classList.remove(ROW_SEEN_CLASS));
+  };
+
+  // Re-apply from _seenTasks + the durable rowIndex->taskUuid map. Exported
+  // for tests. MUST run after reapplyQueueRowTint in the same refresh cycle
+  // (refreshQueueChips wires this) so the tint-class gate below reflects this
+  // cycle's freshly-computed severity, not a stale one.
+  const reapplyQueueSeenDim = () => {
+    if (!PREF('queueSeenDimming', false)) return;
+    queueScope()
+      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
+      .forEach((row) => {
+        const ri = row.getAttribute('row-index');
+        if (ri == null) return;
+        const rowIndex = Number(ri);
+        const taskUuid = _durableRowMap.get(rowIndex);
+        if (!taskUuid || !_seenTasks.has(taskUuid)) return;
+        // NEVER dim a row with a red/amber result — the escalation gate. Read the
+        // severity straight from the result cache (the source of truth), NOT from
+        // the tint CSS class: the tint is only rendered when prefs.queueRowTint is
+        // on, so a class check would wrongly dim a seen ALERT row for a user who
+        // has row-tint OFF but seen-dimming ON. A fresh red/amber cache entry
+        // blocks the dim regardless of any cosmetic pref; a later re-grade to
+        // red/amber removes the dim on the next refresh (auto-undim) for free.
+        const sevEntry = _queueResultCache.get(taskUuid);
+        if (
+          sevEntry &&
+          sevEntry.sev &&
+          sevEntry.ts &&
+          Date.now() - sevEntry.ts <= _RESULT_CACHE_TTL &&
+          (sevEntry.sev.level === 'red' || sevEntry.sev.level === 'amber')
+        ) {
+          return;
+        }
+        // Pulse rail is the request-queue equivalent of the result tint —
+        // never dim a row the pulse has marked red/amber.
+        if (row.classList.contains(PULSE_RED) || row.classList.contains(PULSE_AMBER)) return;
+        row.classList.add(ROW_SEEN_CLASS);
+        const previewRow = findQueuePreviewRow(row);
+        if (previewRow) previewRow.classList.add(ROW_SEEN_CLASS);
+      });
+  };
+
+  // ---- Detail-page verdict banner (item 2.4, TRIAGE-LENS-2026-07-02.md) ----
+  // Opening a task and staring at a raw report to re-derive what the queue chip
+  // already knew is the exact "the screen never lies" gap this closes: echo the
+  // SAME cached severity onto the task detail page, reusing the queue's own
+  // cache/compute path (_queueResultCache / computeQueueRowResult) so a task
+  // seen in the queue this session renders with ZERO extra fetches, and a task
+  // opened directly (no queue visit) computes ONCE per taskUuid per page-visit.
+  const DETAIL_VERDICT_CLASS = 'ch-detail-verdict';
+
+  // Which taskUuid the banner currently reflects (module state — survives
+  // runDetail's repeated calls across SPA route/DOM churn) and which taskUuids
+  // have already had a compute-on-miss attempted THIS PAGE-VISIT, so a genuine
+  // cache miss fetches exactly once (the caches above make a repeat visit to
+  // the same task cheap; this guard is what makes a repeat runDetail() pass on
+  // the SAME task, before that fetch resolves, a no-op rather than a re-fetch).
+  let _detailVerdictTaskUuid = null;
+  const _detailVerdictAttempted = new Set();
+
+  // Pure — decides what the banner should show for a given _queueResultCache
+  // entry (or undefined/missing) at time `now`. This is the single seam that
+  // carries all the TTL/error/null-sev logic; the wiring below just acts on the
+  // result. Exported for unit testing via regex extraction (same pattern as
+  // the other pure helpers in this file).
+  //   'render'  — a fresh, graded severity is cached: draw the banner from it.
+  //   'error'   — a fresh (within _RESULT_ERROR_TTL) error entry: draw the grey
+  //               "couldn't check" variant.
+  //   'nothing' — a fresh, definitive null (nothing gradeable — e.g. an admin/
+  //               med task, or disabled result chips): draw NOTHING, ever — a
+  //               verdict banner on a non-result task is noise, not signal.
+  //   'compute' — no entry, the entry has aged past its own TTL (result or
+  //               error), or the row has literally never been evaluated
+  //               (entry.sev === undefined): the caller must compute once.
+  function detailVerdictState(entry, now) {
+    const nowTs = typeof now === 'number' ? now : Date.now();
+    if (!entry) return 'compute';
+    if (entry.error) {
+      return entry.ts && nowTs - entry.ts <= _RESULT_ERROR_TTL ? 'error' : 'compute';
+    }
+    if (entry.sev === undefined) return 'compute';
+    if (!entry.ts || nowTs - entry.ts > _RESULT_CACHE_TTL) return 'compute';
+    return entry.sev === null ? 'nothing' : 'render';
+  }
+
+  // Compose the chip-equivalent headline, reusing selectResultChips' OWN
+  // priority order and sev fields — never re-deriving severity. Mirrors the
+  // top of selectResultChips (clinical severity first, then review/combo/
+  // noGrowth) but returns plain text for the banner rather than a chip def.
+  function buildDetailVerdictHeadline(sev) {
+    if (!sev || typeof sev !== 'object') return '';
+    // Keyed on urgentCount/abnormalCount directly (not gated on `level`) — item 3.2
+    // lets a red text review push `level` to red while urgentCount stays 0, and a
+    // `level === 'amber'` guard would then hide a genuine numeric abnormal headline.
+    // Same reasoning as selectResultChips' numeric branch above.
+    if (sev.urgentCount > 0) {
+      return sev.urgentCount === 1 ? '1 urgent' : sev.urgentCount + ' urgent';
+    }
+    if (sev.abnormalCount > 0) {
+      return sev.abnormalCount === 1 ? '1 abnormal' : sev.abnormalCount + ' abnormal';
+    }
+    if (sev.reviewCount > 0) {
+      const label = sev.reviewTop && sev.reviewTop.label ? String(sev.reviewTop.label) : '';
+      return label && label !== 'Needs review' ? label : 'Needs review';
+    }
+    if (sev.comboCount > 0 && sev.comboTop && sev.comboTop.label) return String(sev.comboTop.label);
+    // Part B (item 3.2) — an unclassified qualitative positive (amber), when nothing
+    // more severe carried the headline. Names the analyte + matched token, e.g.
+    // "Hepatitis B surface antigen: 'Positive'".
+    if (Array.isArray(sev.unclassified) && sev.unclassified.length > 0) {
+      const first = sev.unclassified[0] || {};
+      const n = first.name ? String(first.name) : '';
+      const t = first.token ? String(first.token) : '';
+      const suffix = sev.unclassified.length > 1 ? ' (+' + (sev.unclassified.length - 1) + ')' : '';
+      return (n ? n + ': ' : '') + (t ? "'" + t + "'" : 'unclassified') + suffix;
+    }
+    if (sev.noGrowthCount > 0) {
+      const label = sev.noGrowthTop && sev.noGrowthTop.label ? String(sev.noGrowthTop.label) : '';
+      return label && label !== 'No growth' ? label : 'No growth';
+    }
+    return '';
+  }
+
+  // Least-fragile stable host: the "Task Details" card every non-document
+  // detail task is expected to carry (EXPECTED_CARDS_BY_PAGE['detail'] — the
+  // same anchor extractTaskDetails()/pageReady() already rely on for this
+  // exact page type, so it is present whenever runDetail's own extraction is).
+  const detailVerdictHost = () => findCardByTitle('Task Details');
+
+  // Remove any existing banner node (idempotent — safe to call unconditionally).
+  const removeDetailVerdictBanner = () => {
+    document.querySelectorAll('.' + DETAIL_VERDICT_CLASS).forEach((el) => el.remove());
+  };
+
+  // Build the banner element with createElement/textContent ONLY — the pieces
+  // (analyte names/values, rule labels) are lab-report/config-derived and
+  // untrusted, same discipline as buildResultDetailPopoverEl (CLAUDE.md).
+  const buildDetailVerdictEl = (taskUuid, sev, isError) => {
+    const el = document.createElement('div');
+    el.className = DETAIL_VERDICT_CLASS;
+    el.dataset.chTaskUuid = taskUuid;
+    el.setAttribute('role', 'note');
+    if (isError) {
+      el.classList.add(DETAIL_VERDICT_CLASS + '-error');
+      const line = document.createElement('div');
+      line.className = DETAIL_VERDICT_CLASS + '-line';
+      line.textContent = RESULT_ERROR_POPOVER_TEXT;
+      el.appendChild(line);
+      return el;
+    }
+    const level = sev && sev.level === 'red' ? 'red' : 'amber';
+    el.classList.add(DETAIL_VERDICT_CLASS + '-' + level);
+    const headline = buildDetailVerdictHeadline(sev);
+    if (headline) {
+      const h = document.createElement('div');
+      h.className = DETAIL_VERDICT_CLASS + '-headline';
+      h.textContent = headline;
+      el.appendChild(h);
+    }
+    const DETAIL_LINE_CAP = 3;
+    const detail = sev && Array.isArray(sev.detail) ? sev.detail : [];
+    detail.slice(0, DETAIL_LINE_CAP).forEach((entry) => {
+      const line = document.createElement('div');
+      line.className = DETAIL_VERDICT_CLASS + '-line';
+      line.textContent = formatDetailLine(entry);
+      el.appendChild(line);
+    });
+    if (detail.length > DETAIL_LINE_CAP) {
+      const more = document.createElement('div');
+      more.className = DETAIL_VERDICT_CLASS + '-more';
+      more.textContent = '+' + (detail.length - DETAIL_LINE_CAP) + ' more';
+      el.appendChild(more);
+    }
+    // Item 3.1 — one-line note when one or more rules were skipped on a unit
+    // mismatch. NO severity change: this is an informational note, not a headline,
+    // and never affects `level`/the banner's red/amber colour above. Full detail
+    // (which analyte, which rule, which units) lives in the chip's own popover —
+    // this note just tells the GP to go look.
+    const unitMismatches = sev && Array.isArray(sev.unitMismatches) ? sev.unitMismatches : [];
+    if (unitMismatches.length) {
+      const note = document.createElement('div');
+      note.className = DETAIL_VERDICT_CLASS + '-unit-note';
+      const n = unitMismatches.length;
+      note.textContent = (n === 1 ? '1 rule skipped' : n + ' rules skipped') + ': unit mismatch — see chip';
+      el.appendChild(note);
+    }
+    return el;
+  };
+
+  // PREPEND into the host card, de-duped + kept fresh by taskUuid (never mere
+  // presence — CLAUDE.md rule 4/5: a stale banner on the wrong patient is the
+  // failure mode that matters). A banner already correct for this taskUuid is
+  // left alone (idempotent across runDetail's repeated calls on SPA churn).
+  const renderDetailVerdictBanner = (taskUuid, sev, isError) => {
+    const host = detailVerdictHost();
+    if (!host) return;
+    const existing = host.querySelector('.' + DETAIL_VERDICT_CLASS);
+    if (existing) {
+      if (existing.dataset.chTaskUuid === taskUuid) return;
+      existing.remove();
+    }
+    const el = buildDetailVerdictEl(taskUuid, sev, isError);
+    host.insertBefore(el, host.firstChild);
+  };
+
+  // Entry point — called from runDetail() on every pass. A cache HIT (this
+  // task was seen in the queue, or a previous visit already computed it)
+  // renders immediately with zero extra fetches. A cache MISS computes once
+  // via the SAME path the queue uses (computeQueueRowResult), seeding a
+  // _queueResultCache entry with the derived overviewURL first — exactly the
+  // shape the queue bridge itself writes — so computeQueueRowResult's existing
+  // cache-read is unchanged. No spinner/placeholder while that fetch is in
+  // flight (plan item 2): nothing renders until there is a real verdict.
+  const runDetailVerdict = () => {
+    const API = window.SentinelApiClient;
+    if (!API) { removeDetailVerdictBanner(); return; }
+    const ctx = API.detectMedicusContext(location.href);
+    const taskUuid = ctx && ctx.taskUuid;
+    if (taskUuid) _seenTasks.add(taskUuid);
+    removeDetailVerdictBanner();
+    _detailVerdictTaskUuid = taskUuid || null;
+  };
+
+  // ---- Queue triage status bar (item 1.2, TRIAGE-LENS-2026-07-02.md) ----
+  // Replaces the old passive "absence is not a verdict" legend with a live,
+  // recomputed status strip: "N red · N amber · N clear · N ? · checking N…",
+  // a jump-to-next-alert button, and a focus toggle that dims non-alert rows.
+  // Counting reuses the exact same durable-map/cache lookup as the tint code
+  // above, so the bar and the row colours can never disagree.
+
+  // Pure — counts the rows the lens knows about (union of the durable
+  // rowIndex->taskUuid map and whatever rows are currently visible in the
+  // virtualised grid, deduped by taskUuid where one is known) into five
+  // triage buckets. Exported for tests.
+  //   - red / amber: a fresh (within _RESULT_CACHE_TTL) cached result at that level.
+  //   - clear: a fresh cached level:'none' result — an actual report was
+  //     assessed and nothing flagged. ONLY that.
+  //   - noResult: a fresh definitive sev===null non-error entry (a task with
+  //     nothing to check — no matching investigation report, e.g. admin/med
+  //     request rows). Checked-but-not-gradeable is neither clear nor
+  //     checking, so it gets its own bucket and is NOT rendered as a bar
+  //     segment (item 1.1's honesty rule: never imply "assessed normal").
+  //   - couldn't check: a fresh (within _RESULT_ERROR_TTL) error entry.
+  //   - checking: a row we know about but have no LIVE cache entry for —
+  //     never fetched yet, mid-fetch, or the entry (result or error) has aged
+  //     past its own TTL. A visible row with no durable-map entry at all
+  //     (bridge hasn't resolved its taskUuid yet) also counts here — there is
+  //     no taskUuid to look up a cache entry by, so "still checking" is the
+  //     only honest bucket for it.
+  const computeQueueTriageCounts = (durableMap, cache, visibleRowIndexes, now) => {
+    const counts = { red: 0, amber: 0, clear: 0, error: 0, checking: 0, noResult: 0, total: 0 };
+    const visible = visibleRowIndexes instanceof Set ? visibleRowIndexes : new Set(visibleRowIndexes || []);
+    const rowIndexes = new Set(visible);
+    if (durableMap && typeof durableMap.keys === 'function') {
+      for (const ri of durableMap.keys()) rowIndexes.add(ri);
+    }
+    const seenUuids = new Set();
+    for (const rowIndex of rowIndexes) {
+      const taskUuid = durableMap && typeof durableMap.get === 'function' ? durableMap.get(rowIndex) : undefined;
+      if (!taskUuid) {
+        // Visible but not yet mapped to a taskUuid — nothing to look up, still checking.
+        counts.total++;
+        counts.checking++;
+        continue;
+      }
+      if (seenUuids.has(taskUuid)) continue; // dedupe by taskUuid where known
+      seenUuids.add(taskUuid);
+      counts.total++;
+      const entry = cache && typeof cache.get === 'function' ? cache.get(taskUuid) : undefined;
+      if (!entry || entry.sev === undefined) {
+        counts.checking++;
+        continue;
+      }
+      const ttl = entry.error ? _RESULT_ERROR_TTL : _RESULT_CACHE_TTL;
+      const fresh = !!entry.ts && now - entry.ts <= ttl;
+      if (!fresh) {
+        counts.checking++;
+        continue;
+      }
+      if (entry.error) {
+        counts.error++;
+      } else if (entry.sev === null) {
+        // Checked, but there was no gradeable investigation report on this task
+        // (admin/med-request rows, no matching report). NOT 'clear' — 'clear'
+        // must mean assessed-normal and nothing else (Phase 1 honesty rule).
+        // Counted separately and not rendered as a bar segment.
+        counts.noResult++;
+      } else if (entry.sev.level === 'red') {
+        counts.red++;
+      } else if (entry.sev.level === 'amber') {
+        counts.amber++;
+      } else {
+        counts.clear++; // assessed: level 'none'
+      }
+    }
+    return counts;
+  };
+
+  // Pure — where the "jump to next alert" button goes next. Reds take priority;
+  // falls back to ambers only when there are zero reds (never mixes the two
+  // lists — a GP cycling through reds should never land on an amber
+  // mid-sequence). currentPos is the last row-index jumped to (or null/absent
+  // from the list); wraps back to the start after the last one. Returns null
+  // when both lists are empty (caller disables the button in that case).
+  // Exported for tests.
+  const nextAlertRowIndex = (currentPos, redIndexes, amberIndexes) => {
+    const list = (redIndexes && redIndexes.length ? redIndexes : amberIndexes) || [];
+    if (!list.length) return null;
+    if (currentPos == null) return list[0];
+    const next = list.find((idx) => idx > currentPos);
+    return next !== undefined ? next : list[0]; // wrap around
+  };
+
+  // Impure — live-query which currently-rendered rows carry each tint class.
+  // AG-Grid virtualises, so this (deliberately, like every other queue-chip
+  // helper in this file) only ever sees on-screen rows; sorted ascending so
+  // nextAlertRowIndex's row-index-order cycling is well-defined.
+  const getQueueTintedRowIndexes = () => {
+    const red = [];
+    const amber = [];
+    queueScope()
+      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
+      .forEach((row) => {
+        const ri = row.getAttribute('row-index');
+        if (ri == null) return;
+        const n = Number(ri);
+        // Pulse rails count as alerts too — on the request queue they are the
+        // only red/amber row mark, and a jump/focus that cannot see them makes
+        // the screen contradict its own rail.
+        const isRed = row.classList.contains(ROW_TINT_RED) || row.classList.contains(PULSE_RED);
+        const isAmber = row.classList.contains(ROW_TINT_AMBER) || row.classList.contains(PULSE_AMBER);
+        if (isRed) red.push(n);
+        else if (isAmber) amber.push(n);
+      });
+    red.sort((a, b) => a - b);
+    amber.sort((a, b) => a - b);
+    return { red, amber };
+  };
+
+  const QUEUE_STATUS_BAR_ID = 'ch-q-status-bar';
+  const QUEUE_STATUS_FLASH_CLASS = 'ch-q-status-flash';
+  const QUEUE_FOCUS_CLASS = 'ch-q-focus-alerts';
+  const QUEUE_STATUS_TOOLTIP =
+    'Triage Lens flags urgent / abnormal results. A row with no flag has not been assessed as normal — open and review every result.';
+
+  // Module state — session-local, deliberately NOT reset by refreshQueueChips
+  // (only by runQueue on a genuine queue re-entry, or the focus toggle itself).
+  let _queueStatusJumpPos = null; // last row-index jumped to, for the cycling order
+  let _queueStatusLastRed = 0; // last-rendered red/amber totals, to detect a
+  let _queueStatusLastAmber = 0; // "material" severity change that should reset the cycle
+  let _queueFocusAlertsOn = false; // OFF by default (plan item 1.2)
+  let _queueStatusBarRafPending = false;
+
+  // Practice-features gate for the WHOLE queue status bar (counts + jump
+  // button + Focus-alerts button together) — a colleague's own request, 2026-09-10,
+  // corrected the same day after a live test showed a practice that doesn't
+  // want this bar at all needs the ENTIRE thing gone, not just the one
+  // button (the original build only hid the button, leaving the counts/jump
+  // readout behind — wrong scope). Grandfathered ON (shared/practice-packs.js)
+  // since the bar has always shipped enabled — a missing/undecided key must
+  // not silently remove chrome an existing install already has.
+  // shared/practice-packs.js MUST load BEFORE this file in manifest.json's
+  // content_scripts array (fixed 2026-09-10, was the other way round): the
+  // synchronous init line just below runs at top-level script-parse time,
+  // not lazily — if window.PracticePacks isn't defined yet at that exact
+  // moment, _focusAlertsPackOn is permanently stuck at its `true` fallback.
+  // Wired via bindInjector (full start/stop lifecycle), same as every other
+  // whole-widget pack (routineRxButton, quickActionsWidget, allocateCanvases)
+  // — not the bespoke read()/watch() pair the first build used.
+  const FOCUS_ALERTS_PACK_KEY =
+    (window.PracticePacks && window.PracticePacks.KEYS.focusAlerts) || 'suite.ui.focusAlerts';
+  let _focusAlertsPackOn = !window.PracticePacks || window.PracticePacks.peek(FOCUS_ALERTS_PACK_KEY);
+
+  // Shared jump-to-alert mechanics (item 1.2's button AND item 4.6's 'n' key
+  // both call this — factored out so there is exactly one implementation of
+  // "find the next red/amber row, scroll to it, flash it"). Pure-ish: reads
+  // the live DOM to find/scroll/flash the target row, but does NOT mutate
+  // _queueStatusJumpPos itself — both callers own that assignment so each can
+  // decide what else to do with the landed-on row-index (the keyboard
+  // handler additionally parks the kbd cursor there). Returns the row-index
+  // jumped to, or null if there was nothing to jump to. Exported for tests.
+  const jumpToAlertRow = (fromIndex) => {
+    const { red, amber } = getQueueTintedRowIndexes();
+    const target = nextAlertRowIndex(fromIndex, red, amber);
+    if (target == null) return null;
+    const row = queueScope().querySelector('.ag-row[row-index="' + target + '"]:not(.ag-full-width-row)');
+    if (!row) return null;
+    if (typeof row.scrollIntoView === 'function') {
+      try {
+        row.scrollIntoView({ block: 'center' });
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    const flashTargets = [row];
+    const previewRow = findQueuePreviewRow(row);
+    if (previewRow) flashTargets.push(previewRow);
+    flashTargets.forEach((r) => {
+      if (!r || !r.classList) return;
+      r.classList.add(QUEUE_STATUS_FLASH_CLASS);
+      setTimeout(() => r.classList.remove(QUEUE_STATUS_FLASH_CLASS), 2600);
+    });
+    return target;
+  };
+
+  const onQueueStatusJumpClick = () => {
+    const target = jumpToAlertRow(_queueStatusJumpPos);
+    if (target == null) return;
+    _queueStatusJumpPos = target;
+  };
+
+  const onQueueStatusFocusClick = (e) => {
+    _queueFocusAlertsOn = !_queueFocusAlertsOn;
+    applyQueueFocusClass();
+    const btn = e && e.currentTarget;
+    if (btn) {
+      btn.setAttribute('aria-pressed', String(_queueFocusAlertsOn));
+      if (btn.classList) btn.classList.toggle('ch-q-status-btn-active', _queueFocusAlertsOn);
+    }
+  };
+
+  // ---- Keyboard triage (item 4.6, TRIAGE-LENS-2026-07-02.md) ----
+  // A single keydown handler, attached ONCE on document at module init
+  // (below), active only when pageType() is the queue AND focus is not in an
+  // input/textarea/select/contenteditable — never hijacks ordinary typing.
+  //   j / ArrowDown — move the cursor to the next visible row (row-index
+  //     order); k / ArrowUp — previous. Clamps at both ends (does not wrap:
+  //     this is a linear scan, unlike 'n's cycling jump).
+  //   Enter — activate the cursor row: click its open-link (the same target
+  //     the GP would click to open the task).
+  //   n — jump to the next red (amber-fallback) row, reusing jumpToAlertRow
+  //     above, and park the keyboard cursor there too.
+  //   ? — tiny help hint (console log only; deliberately minimal).
+  // Cursor state (_kbdCursorRowIndex) is session-local and reset on queue
+  // (re)entry/navigation by teardownQueueObserver (called at the start of
+  // every runQueue AND whenever the page navigates off the queue). The
+  // ch-kbd-cursor CLASS itself is cleared+reapplied every refreshQueueChips
+  // cycle (CLAUDE.md rule 4) so a recycled row-index never keeps a stale
+  // cursor from a previous patient.
+  const KBD_CURSOR_CLASS = 'ch-kbd-cursor';
+  let _kbdCursorRowIndex = null;
+
+  // Pure — sorted ascending row-index list of every row currently rendered in
+  // the (virtualised) grid. Exported for tests.
+  const visibleQueueRowIndexes = () => {
+    const out = [];
+    queueScope()
+      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
+      .forEach((row) => {
+        const ri = row.getAttribute('row-index');
+        if (ri != null) out.push(Number(ri));
+      });
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
+  // Pure — where the cursor moves to for one j/k press, given the current
+  // cursor position (row-index or null) and the currently visible row-index
+  // list. direction is +1 (j/ArrowDown) or -1 (k/ArrowUp). Clamps at both
+  // ends rather than wrapping. A currentIndex no longer present in the list
+  // (its row scrolled out of the virtualised viewport, or was recycled onto
+  // a different task) re-anchors to the nearest end rather than doing
+  // nothing. Returns null only when the list itself is empty. Exported for
+  // tests.
+  const moveKbdCursor = (currentIndex, rowIndexes, direction) => {
+    if (!rowIndexes || !rowIndexes.length) return null;
+    if (currentIndex == null) return direction > 0 ? rowIndexes[0] : rowIndexes[rowIndexes.length - 1];
+    const pos = rowIndexes.indexOf(currentIndex);
+    if (pos === -1) return direction > 0 ? rowIndexes[0] : rowIndexes[rowIndexes.length - 1];
+    const next = pos + direction;
+    if (next < 0) return rowIndexes[0];
+    if (next >= rowIndexes.length) return rowIndexes[rowIndexes.length - 1];
+    return rowIndexes[next];
+  };
+
+  const clearQueueKbdCursor = () => {
+    queueScope()
+      .querySelectorAll('.' + KBD_CURSOR_CLASS)
+      .forEach((el) => el.classList.remove(KBD_CURSOR_CLASS));
+  };
+
+  // Re-apply the cursor class from _kbdCursorRowIndex — called both by the
+  // keyboard handler (after moving) and by refreshQueueChips (to restore the
+  // cursor visually across SPA churn, same pattern as reapplyQueueRowTint).
+  // No-op if the cursor row isn't currently rendered (virtualised out of
+  // view) — it is NOT re-anchored here; only an explicit j/k/n press moves
+  // it. Exported for tests.
+  const applyQueueKbdCursor = () => {
+    if (_kbdCursorRowIndex == null) return;
+    const row = queueScope().querySelector('.ag-row[row-index="' + _kbdCursorRowIndex + '"]:not(.ag-full-width-row)');
+    if (!row) return;
+    row.classList.add(KBD_CURSOR_CLASS);
+    const previewRow = findQueuePreviewRow(row);
+    if (previewRow) previewRow.classList.add(KBD_CURSOR_CLASS);
+  };
+
+  const scrollKbdCursorIntoView = () => {
+    if (_kbdCursorRowIndex == null) return;
+    const row = queueScope().querySelector('.ag-row[row-index="' + _kbdCursorRowIndex + '"]:not(.ag-full-width-row)');
+    if (row && typeof row.scrollIntoView === 'function') {
+      try {
+        row.scrollIntoView({ block: 'nearest' });
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  };
+
+  // Resolve the element to click to open a queue row's task — the same
+  // target a GP would click. Prefers a real link/link-role element inside
+  // the patientName cell (real Medicus may render the cell content as an
+  // anchor); falls back to the cell itself, which is the documented fallback
+  // chip host elsewhere in this file (queueChipHost) and is exactly what a
+  // GP visually clicks on regardless of what markup is under it. Returns
+  // null if the row has no patientName cell at all (header/pinned/malformed
+  // row). Exported for tests.
+  const findQueueRowOpenTarget = (row) => {
+    const nameCell = row.querySelector('[col-id="patientName"]');
+    if (!nameCell) return null;
+    const link = nameCell.querySelector('a, [role="link"]');
+    return link || nameCell;
+  };
+
+  // True when `el` is a live text-entry surface — the keyboard handler must
+  // never hijack typing into it. Exported for tests.
+  const isQueueKeydownTypingTarget = (el) => {
+    if (!el) return false;
+    const tag = el.tagName ? String(el.tagName).toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+    if (el.isContentEditable) return true;
+    return false;
+  };
+
+  const onQueueKeydown = (e) => {
+    if (!PREF('queueKeyboardNav', true)) return;
+    if (pageType() !== 'queue') return;
+    if (isQueueKeydownTypingTarget(e && e.target)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const key = e.key;
+    if (key === 'j' || key === 'ArrowDown') {
+      if (e.preventDefault) e.preventDefault();
+      _kbdCursorRowIndex = moveKbdCursor(_kbdCursorRowIndex, visibleQueueRowIndexes(), 1);
+      clearQueueKbdCursor();
+      applyQueueKbdCursor();
+      scrollKbdCursorIntoView();
+    } else if (key === 'k' || key === 'ArrowUp') {
+      if (e.preventDefault) e.preventDefault();
+      _kbdCursorRowIndex = moveKbdCursor(_kbdCursorRowIndex, visibleQueueRowIndexes(), -1);
+      clearQueueKbdCursor();
+      applyQueueKbdCursor();
+      scrollKbdCursorIntoView();
+    } else if (key === 'Enter') {
+      if (_kbdCursorRowIndex == null) return;
+      const row = queueScope().querySelector('.ag-row[row-index="' + _kbdCursorRowIndex + '"]:not(.ag-full-width-row)');
+      if (!row) return;
+      const target = findQueueRowOpenTarget(row);
+      if (target && typeof target.click === 'function') {
+        if (e.preventDefault) e.preventDefault();
+        target.click();
+      }
+    } else if (key === ' ' || key === 'Spacebar') {
+      if (!PREF('queuePulseCompress', true)) return;
+      if (_kbdCursorRowIndex == null) return;
+      const row = queueScope().querySelector('.ag-row[row-index="' + _kbdCursorRowIndex + '"]:not(.ag-full-width-row)');
+      if (!row) return;
+      if (e.preventDefault) e.preventDefault();
+      const keyId = pulseOpenKey(row);
+      if (keyId) {
+        _pulseOpenByKey.set(keyId, _pulseOpenByKey.get(keyId) === 'why' ? null : 'why');
+        refreshPulseOnRow(row);
+        const whyEl = pulseTarget(row).target.querySelector('.ch-q-pulse-head');
+        if (whyEl && whyEl.focus) whyEl.focus();
+      }
+    } else if (key === 'Escape') {
+      if (!PREF('queuePulseCompress', true)) return;
+      if (_kbdCursorRowIndex == null) return;
+      const row = queueScope().querySelector('.ag-row[row-index="' + _kbdCursorRowIndex + '"]:not(.ag-full-width-row)');
+      if (!row) return;
+      const keyId = pulseOpenKey(row);
+      const wasOpen = keyId && _pulseOpenByKey.get(keyId);
+      if (!wasOpen) return;
+      if (e.preventDefault) e.preventDefault();
+      _pulseOpenByKey.set(keyId, null);
+      refreshPulseOnRow(row);
+      const trigEl = pulseTarget(row).target.querySelector('.ch-q-pulse-head');
+      if (trigEl && trigEl.focus) trigEl.focus();
+    } else if (key === 'n' || key === 'N') {
+      if (e.preventDefault) e.preventDefault();
+      const target = jumpToAlertRow(_queueStatusJumpPos);
+      if (target != null) {
+        _queueStatusJumpPos = target;
+        _kbdCursorRowIndex = target;
+        clearQueueKbdCursor();
+        applyQueueKbdCursor();
+      }
+    } else if (key === '?') {
+      log('queue keyboard shortcuts: j/k (or arrows) move, Enter opens, Space why-pulse, n jumps to next red/amber');
+    }
+  };
+
+  // Create-once, mutate-in-place (no flicker, no duplicate insertion across
+  // SPA re-renders) — same pattern the old legend used, extended with the
+  // interactive controls. Appended to document.body (not the AG-Grid
+  // container), so it never triggers the queue MutationObserver itself.
+  const ensureQueueStatusBarEl = () => {
+    let el = document.getElementById(QUEUE_STATUS_BAR_ID);
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = QUEUE_STATUS_BAR_ID;
+    el.className = 'ch-q-status';
+    el.setAttribute('role', 'status');
+    // aria-live deliberately 'off', not 'polite': counts can change multiple
+    // times a second while the fetch pass runs — a polite live region would
+    // spam a screen reader far faster than the numbers are meaningful.
+    el.setAttribute('aria-live', 'off');
+    el.setAttribute('aria-label', 'Triage Lens queue triage status');
+    el.title = QUEUE_STATUS_TOOLTIP;
+
+    const counts = document.createElement('span');
+    counts.className = 'ch-q-status-counts';
+    el.appendChild(counts);
+
+    const spinner = document.createElement('span');
+    spinner.className = 'ch-q-status-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    el.appendChild(spinner);
+
+    const jumpBtn = document.createElement('button');
+    jumpBtn.type = 'button';
+    jumpBtn.className = 'ch-q-status-btn ch-q-status-jump';
+    jumpBtn.addEventListener('click', onQueueStatusJumpClick);
+    el.appendChild(jumpBtn);
+
+    const focusBtn = document.createElement('button');
+    focusBtn.type = 'button';
+    focusBtn.className = 'ch-q-status-btn ch-q-status-focus';
+    focusBtn.setAttribute('aria-pressed', 'false');
+    focusBtn.textContent = 'Focus alerts';
+    focusBtn.addEventListener('click', onQueueStatusFocusClick);
+    el.appendChild(focusBtn);
+
+    document.body.appendChild(el);
+    return el;
+  };
+
+  const removeQueueStatusBar = () => {
+    const el = document.getElementById(QUEUE_STATUS_BAR_ID);
+    if (el) el.remove();
+  };
+
+  // The nearest STABLE ancestor for the focus-dim class: queueObservedContainer
+  // is rebuilt whenever the SPA tears down and re-creates AG-Grid (setupQueueObserver),
+  // so a class placed there would silently vanish on that swap. document.body
+  // persists across every re-render, and the dim rule is scoped by the
+  // descendant selector (.ch-q-focus-alerts .ag-row:...) so putting the class on
+  // body is exactly as targeted as putting it on the grid container itself —
+  // it only ever affects `.ag-row` elements. teardownQueueObserver removes it
+  // when leaving the queue page so it can't bleed onto unrelated Medicus pages.
+  const applyQueueFocusClass = () => {
+    if (typeof document === 'undefined' || !document.body) return;
+    document.body.classList.toggle(QUEUE_FOCUS_CLASS, _queueFocusAlertsOn);
+  };
+
+  const renderQueueStatusBar = () => {
+    if (!PREF('queueStatusBar', true) || !_focusAlertsPackOn) {
+      removeQueueStatusBar();
+      return;
+    }
+    const el = ensureQueueStatusBarEl();
+    const now = Date.now();
+    const visible = new Set();
+    queueScope()
+      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
+      .forEach((row) => {
+        const ri = row.getAttribute('row-index');
+        if (ri != null) visible.add(Number(ri));
+      });
+    const counts = computeQueueTriageCounts(_durableRowMap, _queueResultCache, visible, now);
+
+    const parts = [counts.red + ' red', counts.amber + ' amber'];
+    if (counts.clear > 0) parts.push(counts.clear + ' clear');
+    if (counts.error > 0) parts.push(counts.error + ' ?');
+    let text = parts.join(' · ');
+    if (counts.checking > 0) text += (text ? ' · ' : '') + 'checking ' + counts.checking + '…';
+
+    const countsEl = el.querySelector('.ch-q-status-counts');
+    if (countsEl) countsEl.textContent = text;
+    el.classList.toggle('ch-q-status--checking', counts.checking > 0);
+
+    // "Material" change = the aggregate red/amber picture actually moved (a new
+    // alert appeared/resolved) — NOT virtualisation-driven scroll churn, which
+    // constantly changes which row-indexes are on-screen without changing what's
+    // wrong with the queue. Only the former should discard the jump cycle.
+    if (counts.red !== _queueStatusLastRed || counts.amber !== _queueStatusLastAmber) {
+      _queueStatusJumpPos = null;
+      _queueStatusLastRed = counts.red;
+      _queueStatusLastAmber = counts.amber;
+    }
+
+    const { red: redIdx, amber: amberIdx } = getQueueTintedRowIndexes();
+    const jumpBtn = el.querySelector('.ch-q-status-jump');
+    if (jumpBtn) {
+      const hasRed = redIdx.length > 0;
+      const hasAmber = amberIdx.length > 0;
+      jumpBtn.disabled = !hasRed && !hasAmber;
+      jumpBtn.textContent = hasRed ? '▶ red' : hasAmber ? '▶ amber' : '▶ red';
+    }
+
+    // Sync the focus button's visual/ARIA state from the session-local toggle on
+    // every render — covers the bar being torn down and recreated (leave/re-enter
+    // the queue) while `_queueFocusAlertsOn` stayed true, which the click handler
+    // alone would never re-apply to a brand-new button element.
+    const focusBtn = el.querySelector('.ch-q-status-focus');
+    if (focusBtn) {
+      focusBtn.setAttribute('aria-pressed', String(_queueFocusAlertsOn));
+      if (focusBtn.classList) focusBtn.classList.toggle('ch-q-status-btn-active', _queueFocusAlertsOn);
+    }
+  };
+
+  // rAF-coalesced wrapper: refreshQueueChips fires on every grid mutation and the
+  // result-triage worker calls this once per row it finishes fetching, so a queue
+  // with 40 rows tagging in a burst would otherwise trigger 40 full DOM updates a
+  // frame apart. Collapses any number of calls within one frame into a single
+  // render — CLAUDE.md-style "no flicker, cheap to call from a loop".
+  const updateQueueStatusBar = () => {
+    if (_queueStatusBarRafPending) return;
+    _queueStatusBarRafPending = true;
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
+    raf(() => {
+      _queueStatusBarRafPending = false;
+      renderQueueStatusBar();
+    });
+  };
+
+  // Full start/stop lifecycle for the whole status bar (see
+  // FOCUS_ALERTS_PACK_KEY's own comment above). off() also forces dimming
+  // back off and clears the body class if it was active — the toggle that
+  // would otherwise turn it back off is about to disappear along with the
+  // rest of the bar, so nothing must be left silently stuck dimmed.
+  if (window.PracticePacks && window.PracticePacks.bindInjector) {
+    window.PracticePacks.bindInjector(FOCUS_ALERTS_PACK_KEY, {
+      on: () => {
+        _focusAlertsPackOn = true;
+        updateQueueStatusBar();
+      },
+      off: () => {
+        _focusAlertsPackOn = false;
+        if (_queueFocusAlertsOn) {
+          _queueFocusAlertsOn = false;
+          applyQueueFocusClass();
+        }
+        removeQueueStatusBar();
+      },
+    });
+  }
+
+  // Rolling rate-limit for result fetches: max 90 fetches per 60s window.
+  let _resultFetchCount = 0;
+  let _resultFetchWindowTimer = null;
+  const _RESULT_FETCH_MAX = 90;
+  // Soft threshold (80% of budget): below it we run at the fast inter-fetch delay;
+  // above it we ease the delay up to throttle as we approach the hard cap.
+  const _RESULT_FETCH_SOFT = Math.floor(_RESULT_FETCH_MAX * 0.8);
+  const _RESULT_FETCH_WINDOW_MS = 60000;
+  // Short retry window for a failed (null) result fetch, so a transient error or a
+  // flaky HIGH result re-surfaces soon instead of being cached blank for the full TTL.
+  const _RESULT_RETRY_MS = 20000;
+
+  const scheduleQueueResultTriage = async () => {
+    return;
+  };
+
+  const QUEUE_DECORATED_KEY = 'chQDec';
+
+  // Find the preview/detail row that goes with this master row.
+  // In real Medicus, master rows live in .ag-center-cols-container and detail
+  // rows live in a separate .ag-full-width-container. They're linked by id:
+  // master has row-id="<UUID>", detail has row-id="detail_<UUID>".
+  // Master rows are absolutely positioned, so DOM-order siblings are unrelated.
+  const findQueuePreviewRow = (row) => {
+    const rowId = row.getAttribute('row-id');
+    if (!rowId) return null;
+    // Try detail row by id first (works for real Medicus master/detail layout)
+    const detailEsc = rowId.replace(/"/g, '\\"');
+    const byId = document.querySelector('[row-id="detail_' + detailEsc + '"]');
+    if (byId) return byId;
+    // Fallback: legacy DOM-order sibling (covers test mocks and simpler layouts)
+    let p = row.nextElementSibling;
+    let hops = 0;
+    while (p && hops < 3) {
+      if (p.classList && p.classList.contains('ag-full-width-row')) return p;
+      p = p.nextElementSibling;
+      hops++;
+    }
+    return null;
+  };
+
+  // Where to host a row's injected chips, and whether to prepend or append.
+  // Detail/preview-row layouts: prepend into the roomy preview row (as designed).
+  // Flat single-line queues (no detail row): fall back to the patient-name cell
+  // and APPEND — after the name + Medicus badges — so long result chips never push
+  // the patient name out of the fixed-width cell. Returns null if no host or a chip
+  // (matching `marker`) is already present.
+  const queueChipHost = (row, marker) => {
+    const previewRow = findQueuePreviewRow(row);
+    const target = previewRow
+      ? (previewRow.querySelector('.h-full.w-full') || previewRow.firstElementChild || previewRow)
+      : row.querySelector('[col-id="patientName"]');
+    if (!target || (marker && target.querySelector(marker))) return null;
+    return { target, inPreview: !!previewRow };
+  };
+
+  // ---- Rank & collapse multi-fire request-rule chips (item 2.5), extended
+  // with display-only negation/past-tense demotion (item 3.4,
+  // TRIAGE-LENS-2026-07-02.md) and the green routine tier (item 4.3,
+  // TRIAGE-LENS-2026-07-02.md) ----
+  // Sort matched rules red < amber < info < green (unknown/other kinds sort
+  // last, defensively, rather than throwing); WITHIN a kind, an unqualified
+  // (live) match now ranks above a negated/past-tense one — "no chest pain"
+  // must never outrank a live "chest pain" of the same severity. Ties keep
+  // their original matchRules order (stable — explicit index tiebreak). This
+  // never hides a match: escalate-only — a demoted rule still renders (top
+  // chip or "+N" overflow), just ranked lower and shown distinctly.
+  //
+  // green ranks LAST, below info: green is the "nothing urgent here — safe to
+  // sweep" signal, so a green chip is only ever the TOP chip when NO red/
+  // amber/info rule ALSO matched the same request text. This is the whole
+  // safety argument for item 4.3's shipped green rules — a green rule's
+  // patterns are deliberately administrative/non-clinical, but even if a
+  // patient's free text happens to co-mention a genuine symptom that a red/
+  // amber/info rule also catches ("...also my chest hurts"), THAT rule wins
+  // the top-chip slot by kind alone, unconditionally. The green rule is never
+  // suppressed (it still renders in the "+N" overflow), just never allowed to
+  // be the headline when something more urgent also fired.
+  //
+  // Evidence (and therefore the qualifier) is computed HERE, at decoration
+  // time, which runs on every queue refresh — so it stays cheap. A row
+  // typically matches 0-2 rules; on the rare row matching MORE than
+  // RULE_QUALIFIER_EVIDENCE_CAP, only the top rules BY KIND get evidence
+  // computed — the remainder are treated as unqualified for ranking purposes
+  // only (they still render fully in the "+N" overflow list, just without a
+  // negation/past badge).
+  const RULE_KIND_RANK = { red: 0, amber: 1, info: 2, green: 3 };
+  const RULE_QUALIFIER_EVIDENCE_CAP = 4;
+  const RULE_QUALIFIER_LABEL = { negated: 'negated?', past: 'past?' };
+  const RULE_QUALIFIER_ARIA = { negated: 'possible negation', past: 'possible past reference' };
+  const rankRuleMatches = (rules, previewText) => {
+    const withIndex = rules.map((r, i) => ({ r, i, qualifier: null, qualifierTerm: null }));
+    const kindOrder = (r) => RULE_KIND_RANK[r.kind] ?? 4;
+    const byKind = withIndex
+      .slice()
+      .sort((a, b) => (kindOrder(a.r) !== kindOrder(b.r) ? kindOrder(a.r) - kindOrder(b.r) : a.i - b.i));
+    const evidenceEligible = new Set(byKind.slice(0, RULE_QUALIFIER_EVIDENCE_CAP).map((x) => x.i));
+    const matcher = typeof window !== 'undefined' && window.TriageLensMatch;
+    if (matcher) {
+      withIndex.forEach((x) => {
+        if (!evidenceEligible.has(x.i)) return;
+        const ev = matcher.ruleMatchEvidence(x.r, previewText || '');
+        x.qualifier = ev ? ev.qualifier : null;
+        x.qualifierTerm = ev ? ev.qualifierTerm : null;
+      });
+    }
+    return withIndex
+      .sort((a, b) => {
+        if (kindOrder(a.r) !== kindOrder(b.r)) return kindOrder(a.r) - kindOrder(b.r);
+        const qa = a.qualifier ? 1 : 0;
+        const qb = b.qualifier ? 1 : 0;
+        if (qa !== qb) return qa - qb; // unqualified before qualified, same kind
+        return a.i - b.i;
+      })
+      .map((x) => ({ ...x.r, _qualifier: x.qualifier, _qualifierTerm: x.qualifierTerm }));
+  };
+
+  // Deliberately separate from renderChipHtml above (system chips — child/
+  // elder/priority/task-age — are UNCHANGED by item 2.5) so only the
+  // ranked/collapsed rule-match chips get role="button"/tabindex/aria-label
+  // and the click-to-evidence wiring. Built as a real element via
+  // createElement/textContent/setAttribute (not an HTML string) — chip.text/
+  // chip.ariaLabel are OUR OWN generated strings (rule label + kind, never
+  // raw request text), but building them this way needs no escaping at all
+  // and lets this chip be appended onto the strip AFTER the system chips'
+  // combined innerHTML without a re-parse. `chip.rqIdx` indexes into
+  // decorateOneRow's per-row ruleMatchActivators array (wired up after the
+  // element lands in the DOM) rather than encoding the handler in the markup.
+  // `chip.qualifier` (item 3.4) — when set, adds the outline/dimmed
+  // ".ch-chip-demoted" variant; the chip is otherwise built identically and
+  // is NEVER omitted for being qualified (display-only, escalate-only).
+  const buildRuleMatchChipEl = (chip) => {
+    const el = document.createElement('span');
+    const demotedClass = chip.qualifier ? ' ch-chip-demoted' : '';
+    el.className = `ch-chip ch-chip-${chip.kind} ch-chip-actionable ch-q-rule-chip${demotedClass}`;
+    el.setAttribute('data-rq-idx', String(chip.rqIdx));
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('aria-label', chip.ariaLabel);
+    el.setAttribute('title', chip.text);
+    el.appendChild(document.createTextNode(chip.text));
+    const chev = document.createElement('span');
+    chev.className = 'ch-chev';
+    chev.textContent = ' ▾';
+    el.appendChild(chev);
+    return el;
+  };
+
+  // ---- Queue pulse (v3.236.4) — compress already-computed chips to one named weight ----
+  // Composer is window.TriageQueuePulse (queue-pulse.js). This block is DOM-only:
+  // collect chips already on the row, render rail + headline + why tray,
+  // PREPEND the host, re-run after every fetch-driven inject. Pref
+  // queuePulseCompress (default on). Not a score — see PLAN.md.
+  const PULSE_HOST = 'ch-q-pulse';
+  const PULSE_ON = 'ch-row-pulse-on';
+  const PULSE_RED = 'ch-row-pulse-red';
+  const PULSE_AMBER = 'ch-row-pulse-amber';
+  const PULSE_FLOAT = 'ch-q-pulse-float';
+  const _pulseOpenByKey = new Map(); // taskUuid|ri → 'why'
+  // key → cleanup fn. Per-key (NOT a single slot): the reapplyQueuePulses
+  // sweep calls refreshPulseOnRow for EVERY row, so a shared slot gets run by
+  // whichever row refreshes next — before the deferred arm() has even added
+  // the listeners — leaking 3 document/window capture listeners per sweep
+  // while a tray is open. Each cleanup also cancels its own pending arm
+  // timeout so a cleanup that runs before arm prevents the listeners from
+  // ever being added.
+  const _pulseFloatCleanups = new Map();
+
+  const runPulseFloatCleanup = (key) => {
+    const fn = _pulseFloatCleanups.get(key);
+    if (!fn) return;
+    _pulseFloatCleanups.delete(key);
+    fn();
+  };
+
+  // Churn-path teardown (refreshQueueChips): drop every float's DOM and
+  // listeners but KEEP _pulseOpenByKey, so reapplyQueuePulses re-opens the
+  // same tray after the rebuild.
+  const clearPulseFloatUi = () => {
+    _pulseFloatCleanups.forEach((fn) => fn());
+    _pulseFloatCleanups.clear();
+    document.querySelectorAll('.' + PULSE_FLOAT).forEach((el) => el.remove());
+  };
+
+  // Dismissal (click-away / Escape / grid scroll): close every float AND
+  // null EVERY open-state entry — not just the dismissing tray's own key —
+  // so a dismissed tray for another key can never resurrect on the next
+  // refresh sweep.
+  const dismissPulseFloats = () => {
+    clearPulseFloatUi();
+    _pulseOpenByKey.forEach((v, k) => {
+      if (v) _pulseOpenByKey.set(k, null);
+    });
+  };
+
+  const positionPulseFloat = (tray, anchor) => {
+    tray.classList.add(PULSE_FLOAT);
+    tray.style.position = 'fixed';
+    tray.style.zIndex = '2147483646';
+    const pad = 8;
+    const maxW = Math.min(420, window.innerWidth - pad * 2);
+    tray.style.width = maxW + 'px';
+    tray.style.maxWidth = maxW + 'px';
+    tray.style.maxHeight = Math.min(360, window.innerHeight - pad * 2) + 'px';
+    tray.style.overflowY = 'auto';
+    document.body.appendChild(tray);
+    const r = anchor.getBoundingClientRect();
+    const th = tray.getBoundingClientRect().height;
+    const tw = tray.getBoundingClientRect().width;
+    const roomBelow = window.innerHeight - pad - (r.bottom + 4);
+    const roomAbove = r.top - pad - 4;
+    let top;
+    if (th <= roomBelow || roomBelow >= roomAbove) {
+      top = Math.max(pad, Math.min(r.bottom + 4, window.innerHeight - pad - Math.min(th, window.innerHeight - pad * 2)));
+    } else {
+      top = Math.max(pad, r.top - th - 4);
+    }
+    let left = r.left;
+    if (left + tw > window.innerWidth - pad) left = window.innerWidth - pad - tw;
+    if (left < pad) left = pad;
+    tray.style.top = Math.round(top) + 'px';
+    tray.style.left = Math.round(left) + 'px';
+  };
+
+  const pulseOpenKey = (row) => {
+    const ri = row && row.getAttribute && row.getAttribute('row-index');
+    if (ri == null) return null;
+    const taskUuid = _durableRowMap.get(Number(ri));
+    return taskUuid || ('ri:' + ri);
+  };
+
+  const chipKindFromEl = (el) => {
+    if (!el || !el.classList) return 'info';
+    if (el.classList.contains('ch-chip-red')) return 'red';
+    if (el.classList.contains('ch-chip-amber')) return 'amber';
+    if (el.classList.contains('ch-chip-green')) return 'green';
+    if (el.classList.contains('ch-chip-info')) return 'info';
+    if (el.classList.contains('ch-chip-meta') || el.classList.contains('ch-chip-error')) return 'meta';
+    return 'info';
+  };
+
+  const familyFromChipEl = (chip, host) => {
+    if (host) {
+      if (host.classList.contains('ch-q-mon')) return 'monitoring';
+      if (host.classList.contains('ch-q-pending')) return 'pending';
+      if (host.classList.contains('ch-q-repeat')) return 'repeat';
+      if (host.classList.contains('ch-q-carry')) return 'carry';
+      if (host.classList.contains('ch-q-result')) return 'result';
+    }
+    const rawId = (chip.getAttribute && chip.getAttribute('data-rule-id')) || '';
+    const id = rawId.replace(/^system:/, '');
+    if (id === 'queue.child' || id === 'queue.elder') return 'age';
+    if (id === 'queue.priority') return 'priority';
+    if (id === 'queue.taskAgeAmber' || id === 'queue.taskAgeRed') return 'taskAge';
+    if (id === 'queue.repeatContact' || id === 'queue.repeatContactSession') return 'repeat';
+    if (id === 'queue.carryOverRed' || id === 'queue.carryOverAmber') return 'carry';
+    if (id === 'queue.monitoringDueRed' || id === 'queue.monitoringDueAmber') return 'monitoring';
+    if (id === 'queue.pendingResultRed' || id === 'queue.pendingResultAmber') return 'pending';
+    const label = ((chip.getAttribute && chip.getAttribute('title')) || chip.textContent || '')
+      .replace(/\s*▾\s*$/, '')
+      .trim();
+    if (/^pharmacy first$/i.test(label)) return 'pf';
+    if (/^ask-back$/i.test(label)) return 'askback';
+    if (chip.classList && chip.classList.contains('ch-q-rule-chip')) return 'rule';
+    return 'system';
+  };
+
+  const collectSignalsFromRow = (row) => {
+    const preview = findQueuePreviewRow(row);
+    const roots = [row, preview].filter(Boolean);
+    const seen = new Set();
+    const signals = [];
+    const push = (sig, key) => {
+      if (!sig || !sig.name || seen.has(key)) return;
+      seen.add(key);
+      signals.push(sig);
+    };
+    roots.forEach((root) => {
+      root.querySelectorAll('.ch-q-pa').forEach((host) => {
+        const level = host.classList.contains('ch-q-pa-red') ? 'red' : 'amber';
+        const labelEl = host.querySelector('.ch-q-pa-label');
+        const name = ((labelEl && labelEl.textContent) || host.getAttribute('title') || 'Practice alert').trim();
+        push(
+          { kind: level, name: name, family: 'flag', source: 'patient-alerts', silent: true },
+          'pa:' + name
+        );
+      });
+      root.querySelectorAll('.ch-chip').forEach((chip) => {
+        if (chip.closest && (chip.closest('.ch-q-pulse') || chip.closest('.ch-action-menu'))) return;
+        const host =
+          chip.closest('.ch-q-mon, .ch-q-pending, .ch-q-repeat, .ch-q-carry, .ch-q-result, .ch-queue-chips') ||
+          chip.parentElement;
+        const name = ((chip.getAttribute('title') || chip.textContent || '').replace(/\s*▾\s*$/, '')).trim();
+        if (!name || name === '+' || /^\+\d+$/.test(name)) return;
+        const family = familyFromChipEl(chip, host);
+        const kind = chipKindFromEl(chip);
+        push(
+          {
+            kind: kind,
+            name: name,
+            family: family,
+            source: family === 'rule' ? 'request' : family,
+            silent: family === 'monitoring' || family === 'pending',
+          },
+          family + ':' + name
+        );
+      });
+    });
+    return signals;
+  };
+
+  const clearPulseClasses = (row) => {
+    if (!row || !row.classList) return;
+    row.classList.remove(PULSE_ON, PULSE_RED, PULSE_AMBER);
+    const preview = findQueuePreviewRow(row);
+    if (preview) preview.classList.remove(PULSE_ON, PULSE_RED, PULSE_AMBER);
+  };
+
+  const applyPulseRail = (row, rail) => {
+    clearPulseClasses(row);
+    // Chip-hide (PULSE_ON) is escalate-only. An empty / unchecked rail must
+    // leave the chip pile visible — hiding it is the quiet-row all-clear lie.
+    if (rail !== 'red' && rail !== 'amber') return;
+    const preview = findQueuePreviewRow(row);
+    const add = (el) => {
+      if (!el) return;
+      el.classList.add(PULSE_ON);
+      if (rail === 'red') el.classList.add(PULSE_RED);
+      else el.classList.add(PULSE_AMBER);
+    };
+    add(row);
+    add(preview);
+  };
+
+  const pulseTarget = (row) => {
+    const previewRow = findQueuePreviewRow(row);
+    const target = previewRow
+      ? previewRow.querySelector('.h-full.w-full') || previewRow.firstElementChild || previewRow
+      : row.querySelector('[col-id="patientName"]');
+    return { target: target, previewRow: previewRow };
+  };
+
+  const buildPulseWhyTray = (composed) => {
+    const tray = document.createElement('div');
+    tray.className = 'ch-q-why';
+    const h = document.createElement('h3');
+    h.textContent = 'Why this is marked';
+    tray.appendChild(h);
+    const ul = document.createElement('ul');
+    ul.className = 'ch-q-why-list';
+    const RANK = (typeof window !== 'undefined' && window.TriageQueuePulse && window.TriageQueuePulse.KIND_RANK) || {};
+    // Red before amber before info/green/meta — stable for ties (Array#sort
+    // is stable in every engine this ships to).
+    const signals = (composed.signals || []).slice().sort((a, b) => (RANK[b.kind] || 0) - (RANK[a.kind] || 0));
+    if (signals.length === 0) {
+      const li = document.createElement('li');
+      const wrap = document.createElement('div');
+      const strong = document.createElement('strong');
+      strong.textContent = 'Nothing named matched';
+      const src = document.createElement('span');
+      src.className = 'ch-q-why-src';
+      src.textContent = 'Not all-clear — the request still has to be read.';
+      wrap.appendChild(strong);
+      wrap.appendChild(src);
+      li.appendChild(wrap);
+      ul.appendChild(li);
+    }
+    signals.forEach((s) => {
+      const li = document.createElement('li');
+      const mark = document.createElement('i');
+      mark.className = 'ch-q-why-mark ' + (s.kind || 'info');
+      const wrap = document.createElement('div');
+      const strong = document.createElement('strong');
+      strong.textContent = s.name;
+      const src = document.createElement('span');
+      src.className = 'ch-q-why-src';
+      src.textContent = s.source || s.family || '';
+      wrap.appendChild(strong);
+      wrap.appendChild(src);
+      if (s.silent) {
+        const rec = document.createElement('span');
+        rec.className = 'ch-q-why-rec';
+        rec.textContent = ' — from the record, not the request text';
+        wrap.appendChild(rec);
+      }
+      li.appendChild(mark);
+      li.appendChild(wrap);
+      ul.appendChild(li);
+    });
+    tray.appendChild(ul);
+    const foot = document.createElement('p');
+    foot.className = 'ch-q-why-foot';
+    foot.textContent =
+      'Not a score. A quiet rail is not all-clear — it means nothing matched, or we have not checked the record yet.';
+    tray.appendChild(foot);
+    return tray;
+  };
+
+  const refreshPulseOnRow = (row) => {
+    if (!row || !row.classList || !row.classList.contains('ag-row')) return;
+    if (row.classList.contains('ag-full-width-row')) return;
+    if (!row.querySelector('[col-id="dateOfBirth"]')) return;
+    const { target, previewRow } = pulseTarget(row);
+    if (!target) return;
+    const key = pulseOpenKey(row);
+    // Clean up and remove ONLY this key's tray — other rows' open trays (and
+    // their listeners) are theirs to manage on their own refresh. A keyless
+    // row can't own a tray, so it falls back to the full teardown.
+    if (key) {
+      runPulseFloatCleanup(key);
+      document.querySelectorAll('.' + PULSE_FLOAT).forEach((el) => {
+        if (el.getAttribute('data-pulse-key') === key) el.remove();
+      });
+    } else {
+      clearPulseFloatUi();
+    }
+    target.querySelectorAll('.' + PULSE_HOST).forEach((el) => el.remove());
+    if (!PREF('queuePulseCompress', true)) {
+      clearPulseClasses(row);
+      return;
+    }
+    const QP = typeof window !== 'undefined' && window.TriageQueuePulse;
+    if (!QP) return;
+    const composed = QP.composePulse(collectSignalsFromRow(row), {});
+    applyPulseRail(row, composed.rail);
+    const escalate = composed.rail === 'red' || composed.rail === 'amber';
+    const open = key ? _pulseOpenByKey.get(key) : null;
+    // Nothing to say and nothing summoned: no pulse chrome at all — a quiet
+    // row keeps its chip pile untouched (applyPulseRail above) and gets no
+    // extra host. The keyboard Space path still works: it sets the open
+    // state BEFORE calling refreshPulseOnRow, so the host appears on demand.
+    if (!escalate && composed.signals.length === 0 && !open) {
+      clearPulseClasses(row);
+      return;
+    }
+    const ri = row.getAttribute('row-index');
+    const whyTrayId = 'ch-q-why-' + ri;
+    const host = document.createElement('span');
+    // Flat queues (tasks / investigations) have no preview row — pulse is
+    // PREPENDed into the patient-name cell. Inline class drops the
+    // preview-row 100% flex so the name stays visible.
+    host.className = PULSE_HOST + (previewRow ? '' : ' ch-q-pulse-inline');
+    const line = document.createElement('span');
+    line.className = 'ch-q-pulse-row';
+    // Compression chrome (headline / thread / overflow) only when the rail
+    // escalates. Quiet rows keep the chip pile so they cannot look cleared.
+    if (escalate && composed.headline) {
+      const head = document.createElement('span');
+      head.className = 'ch-q-pulse-head';
+      head.setAttribute('role', 'button');
+      head.setAttribute('tabindex', '0');
+      head.setAttribute('aria-controls', whyTrayId);
+      head.setAttribute('aria-expanded', open === 'why' ? 'true' : 'false');
+      head.setAttribute(
+        'aria-label',
+        composed.headline.name +
+          ' — ' +
+          composed.headline.kind +
+          ' — not a score. Space or click for why.' +
+          (composed.silent ? ' — from the record, not the request text' : '')
+      );
+      const chip = document.createElement('span');
+      chip.className = 'ch-chip ch-chip-' + composed.headline.kind;
+      chip.textContent = composed.headline.name;
+      chip.title = composed.headline.name;
+      if (composed.silent) {
+        const src = document.createElement('span');
+        src.className = 'ch-q-pulse-src';
+        src.setAttribute('aria-hidden', 'true');
+        src.textContent = 'record';
+        chip.appendChild(src);
+      }
+      head.appendChild(chip);
+      line.appendChild(head);
+    }
+    if (escalate && composed.thread) {
+      const th = document.createElement('span');
+      th.className = 'ch-q-pulse-thread';
+      th.textContent = composed.thread.name;
+      th.title = 'Contact count — not a grade';
+      line.appendChild(th);
+    }
+    if (escalate && composed.overflowCount > 0) {
+      const more = document.createElement('span');
+      more.className = 'ch-q-pulse-more';
+      more.textContent = '+' + composed.overflowCount;
+      more.setAttribute('role', 'button');
+      more.setAttribute('tabindex', '0');
+      more.setAttribute('aria-controls', whyTrayId);
+      more.setAttribute('aria-expanded', open === 'why' ? 'true' : 'false');
+      more.setAttribute('aria-label', composed.overflowCount + ' more signals — show why');
+      line.appendChild(more);
+    }
+    host.appendChild(line);
+
+
+    // Focus survival: after a toggle rebuilds the host, re-find the control
+    // that triggered it (by class, inside the freshly rebuilt target) and
+    // refocus it — a rebuild must never drop focus back onto the page body.
+    const refocus = (cls) => {
+      const el = pulseTarget(row).target.querySelector('.' + cls);
+      if (el && el.focus) el.focus();
+    };
+    const toggle = (which, cls) => {
+      if (!key) return;
+      _pulseOpenByKey.set(key, _pulseOpenByKey.get(key) === which ? null : which);
+      refreshPulseOnRow(row);
+      if (cls) refocus(cls);
+    };
+    const onWhy = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const cls =
+        e.currentTarget && e.currentTarget.classList.contains('ch-q-pulse-more')
+          ? 'ch-q-pulse-more'
+          : 'ch-q-pulse-head';
+      toggle('why', cls);
+    };
+    host.querySelectorAll('.ch-q-pulse-head, .ch-q-pulse-more').forEach((el) => {
+      el.addEventListener('click', onWhy);
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') onWhy(e);
+      });
+    });
+
+    target.insertBefore(host, target.firstChild);
+
+    if (open === 'why') {
+      const tray = buildPulseWhyTray(composed);
+      // The triggers' aria-controls point at these ids (crit decision I).
+      tray.id = whyTrayId;
+      if (key) tray.setAttribute('data-pulse-key', key);
+      tray.addEventListener('click', (e) => e.stopPropagation());
+      tray.addEventListener('mousedown', (e) => e.stopPropagation());
+      positionPulseFloat(tray, host);
+      const onDoc = (e) => {
+        if (tray.contains(e.target) || host.contains(e.target)) return;
+        dismissPulseFloats();
+      };
+      const onKey = (e) => {
+        if (e.key !== 'Escape') return;
+        dismissPulseFloats();
+      };
+      const onScroll = (e) => {
+        // The tray itself scrolls (overflow-y: auto cap in positionPulseFloat)
+        // — its own internal scroll must not dismiss it.
+        if (e.target instanceof Element && tray.contains(e.target)) return;
+        dismissPulseFloats();
+      };
+      const arm = () => {
+        document.addEventListener('click', onDoc, true);
+        document.addEventListener('keydown', onKey, true);
+        window.addEventListener('scroll', onScroll, true);
+      };
+      const armTimer = setTimeout(arm, 0);
+      _pulseFloatCleanups.set(key, () => {
+        // Cancelling the pending arm matters: a cleanup that runs before the
+        // deferred arm() must prevent the listeners from ever being added,
+        // or they leak with nothing left holding a reference to remove them.
+        clearTimeout(armTimer);
+        document.removeEventListener('click', onDoc, true);
+        document.removeEventListener('keydown', onKey, true);
+        window.removeEventListener('scroll', onScroll, true);
+      });
+    }
+  };
+
+  const reapplyQueuePulses = () => {
+    if (!PREF('queuePulseCompress', true)) {
+      clearPulseFloatUi();
+      queueScope()
+        .querySelectorAll('.' + PULSE_ON + ', .' + PULSE_RED + ', .' + PULSE_AMBER)
+        .forEach((el) => el.classList.remove(PULSE_ON, PULSE_RED, PULSE_AMBER));
+      queueScope()
+        .querySelectorAll('.' + PULSE_HOST)
+        .forEach((el) => el.remove());
+      return;
+    }
+    queueScope()
+      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
+      .forEach((row) => refreshPulseOnRow(row));
+  };
+
+  const decorateOneRow = (row) => {
+    if (!row || !row.classList || !row.classList.contains('ag-row')) return;
+    // Only decorate master rows. Skip detail/preview rows (they have no cells).
+    if (row.classList.contains('ag-full-width-row')) return;
+    // Skip header rows / pinned rows / anything without cells
+    if (!row.querySelector('[col-id="dateOfBirth"]')) return;
+    if (row.dataset[QUEUE_DECORATED_KEY] === '1') return;
+
+    const cellText = (colId) => {
+      const cell = row.querySelector('[col-id="' + colId + '"]');
+      return cell ? cell.textContent.trim() : '';
+    };
+
+    const dob = cellText('dateOfBirth');
+    const priority = cellText('priorityDisplay');
+    const created = cellText('createdAt');
+
+    // Find preview row to read request body & inject chips
+    const previewRow = findQueuePreviewRow(row);
+    let previewText = '';
+    if (previewRow) {
+      // Prefer the inner <p> with the actual request text — avoids picking up
+      // any sibling chrome elements
+      const p = previewRow.querySelector('p, .q-pa-xs');
+      previewText = (p ? p.textContent : previewRow.textContent).trim();
+      // Strip leading "Request:" label that Medicus prepends
+      previewText = previewText.replace(/^\s*Request\s*:?\s*/i, '');
+    }
+
+    // Compute chips
+    const chips = [];
+    const pushSysChip = (id, vars) => {
+      const c = getSystemChip(id, vars);
+      if (c) chips.push(c);
+    };
+
+    // Age extremes
+    const ageMatch = dob.match(/\((\d+)\s*y/i);
+    // Item 3.5 (TRIAGE-LENS-2026-07-02.md) — captured OUTSIDE the if-block so the
+    // require gate below can reuse the SAME age already parsed from this row's own
+    // DOB cell (the queue surface has no sex/meds/problems data — see the require
+    // gate comment further down).
+    let rowAgeYears;
+    if (ageMatch) {
+      const age = +ageMatch[1];
+      rowAgeYears = age;
+      if (age < TH('childAge')) pushSysChip('queue.child', { age });
+      else if (age >= TH('elderAge')) pushSysChip('queue.elder', { age });
+    }
+
+    // Priority escalation
+    if (priority && /high|urgent/i.test(priority)) {
+      pushSysChip('queue.priority', { priority });
+    }
+
+    // Days since created (visible age of task)
+    const cm = created.match(/(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})/);
+    if (cm) {
+      const d = parseDate(cm[0]);
+      const days = daysAgo(d);
+      if (Number.isFinite(days)) {
+        if (days >= TH('taskAgeRed')) pushSysChip('queue.taskAgeRed', { days });
+        else if (days >= TH('taskAgeAmber')) pushSysChip('queue.taskAgeAmber', { days });
+      }
+    }
+
+    // User rules — match against the request preview text. Rank matches by
+    // severity (then, item 3.4, live-before-negated/past within a severity)
+    // and collapse to a top chip + "+N" overflow chip (item 2.5) rather than
+    // one chip per matched rule. Both are clickable (item 2.3): the top chip
+    // opens straight to ITS rule's evidence+actions; "+N" opens the full
+    // ranked list, each entry drilling into its own evidence+actions the same
+    // way. ruleMatchActivators holds the per-chip click callbacks — populated
+    // here (closure-capturing rankedRules/previewText, already in hand) and
+    // consumed by the wiring pass below, by index (data-rq-idx), once the
+    // chip HTML has actually landed in the DOM.
+    // Item 3.5 — require gate applied AFTER text matching, exactly like the engine's
+    // result-rule contextAllows gate: a rule with a `require` clause the current
+    // surface's data cannot confirm is EXCLUDED from ruleMatches (fails closed) —
+    // never suppresses any OTHER, un-gated rule that also matched the same text.
+    // The queue surface only has age (parsed from this row's own DOB cell, above);
+    // sex/meds/problems are NOT available here, so any require:{sex|medsAny|
+    // problemsAny} clause always fails closed on the queue (see content.js's Part 2
+    // report — meds/problems only reach content.js on the detail/record HUD path,
+    // via extractMedications/extractActiveProblems).
+    const rawRuleMatches = matchRules('queue', { request: previewText });
+    const matcherReq = typeof window !== 'undefined' && window.TriageLensMatch && window.TriageLensMatch.ruleRequireMet;
+    const ruleMatches = matcherReq
+      ? rawRuleMatches.filter((r) => matcherReq(r, { ageYears: rowAgeYears }))
+      : rawRuleMatches;
+    const ruleMatchActivators = [];
+    if (ruleMatches.length) {
+      const rankedRules = rankRuleMatches(ruleMatches, previewText);
+      const topRule = rankedRules[0];
+      const overflow = rankedRules.length - 1;
+      const topQualifier = topRule._qualifier || null;
+      const topLabel = topQualifier
+        ? `${topRule.label} (${RULE_QUALIFIER_LABEL[topQualifier]})`
+        : topRule.label;
+      const topIdx = ruleMatchActivators.push(
+        (el) => showRuleMatchMenu(el, rankedRules, previewText, false)
+      ) - 1;
+      chips.push({
+        kind: topRule.kind,
+        text: topLabel,
+        isRuleMatch: true,
+        qualifier: topQualifier,
+        rqIdx: topIdx,
+        ariaLabel: `${topRule.label} — ${topRule.kind} alert` +
+          (topQualifier ? `, ${RULE_QUALIFIER_ARIA[topQualifier]}` : '') +
+          (overflow > 0 ? `, ${overflow} more rule${overflow === 1 ? '' : 's'} matched` : '')
+      });
+      if (overflow > 0) {
+        const moreIdx = ruleMatchActivators.push(
+          (el) => showRuleMatchMenu(el, rankedRules, previewText, true)
+        ) - 1;
+        chips.push({
+          kind: 'meta',
+          text: '+' + overflow,
+          isRuleMatch: true,
+          rqIdx: moreIdx,
+          ariaLabel: `${overflow} more matched rule${overflow === 1 ? '' : 's'} — show all`
+        });
+      }
+    }
+
+    // Pharmacy First divert chip and missing-info ask-back sit on the same
+    // request-row strip as the keyword chips. Age-unknown rows do not get the
+    // green Pharmacy First chip. Ask-back still shows when a gap or a
+    // volunteered red flag is already in the text.
+    const RM = typeof window !== 'undefined' && window.SentinelReceptionMatch;
+    if (RM && PREF('requestPathwayChips', true) && previewText && _receptionPathwaysData) {
+      const matchedPathways = RM.matchPathways(previewText, _receptionPathwaysData.pathways);
+      const topPathway = matchedPathways[0];
+      if (topPathway) {
+        const pfElig = RM.pharmacyFirstEligibility(topPathway, rowAgeYears);
+        const gapsData = RM.redFlagGaps(topPathway, previewText);
+        const closingQuestions = _receptionPathwaysData.closingQuestions;
+        const hasEscalation = gapsData.flaggedInText.length > 0;
+        const hasAskBack = gapsData.gaps.length > 0 || hasEscalation;
+        if (pfElig.eligible === true) {
+          const pfIdx = ruleMatchActivators.push(
+            (el) => showPathwayMenu(el, topPathway, previewText, pfElig, gapsData, closingQuestions)
+          ) - 1;
+          chips.push({
+            kind: 'green',
+            text: 'Pharmacy First',
+            isRuleMatch: true,
+            rqIdx: pfIdx,
+            ariaLabel: `Pharmacy First eligible — ${topPathway.title}` +
+              (hasEscalation ? ', patient may have already mentioned a red flag — review before diverting' : '')
+          });
+        } else if (hasAskBack) {
+          const abIdx = ruleMatchActivators.push(
+            (el) => showPathwayMenu(el, topPathway, previewText, pfElig, gapsData, closingQuestions)
+          ) - 1;
+          chips.push({
+            kind: 'info',
+            text: 'Ask-back',
+            isRuleMatch: true,
+            rqIdx: abIdx,
+            ariaLabel: `Reception ask-back available — ${topPathway.title}` +
+              (hasEscalation ? ', patient may have already mentioned a red flag — review before proceeding' : '')
+          });
+        }
+      }
+    }
+
+
+    if (!chips.length) {
+      row.dataset[QUEUE_DECORATED_KEY] = '1';
+      refreshPulseOnRow(row);
+      return;
+    }
+
+    // Inject chips. Preferred target is the inner content wrapper of the
+    // preview row (Medicus uses <div class="h-full w-full"><p class="q-pa-xs">…)
+    // so chips render on the same line as the request preview text. Fallbacks
+    // for simpler layouts and the no-preview-row case (e.g. test mocks).
+    let target = null;
+    if (previewRow) {
+      target = previewRow.querySelector('.h-full.w-full')
+            || previewRow.querySelector('.ag-full-width-container')
+            || previewRow.firstElementChild
+            || previewRow;
+    } else {
+      target = row.querySelector('[col-id="patientName"]');
+    }
+
+    if (target && !target.querySelector('.ch-queue-chips')) {
+      const strip = document.createElement('span');
+      strip.className = 'ch-queue-chips';
+      // System chips (child/elder/priority/task-age — UNCHANGED by item 2.5)
+      // render via the existing combined-HTML-string path; the ranked
+      // rule-match chips (top + "+N") are appended afterwards as real
+      // elements (buildRuleMatchChipEl above) — mixing innerHTML then
+      // appendChild on the same node is standard DOM (Medicus's own page
+      // does this constantly) and keeps the rule-match chips last, matching
+      // their position in `chips` (system chips are always pushed first).
+      const systemChips = chips.filter(c => !c.isRuleMatch);
+      const ruleMatchChips = chips.filter(c => c.isRuleMatch);
+      strip.innerHTML = systemChips.map(c => renderChipHtml(c)).join('');
+      ruleMatchChips.forEach(c => strip.appendChild(buildRuleMatchChipEl(c)));
+      target.insertBefore(strip, target.firstChild);
+      // Wire action menu handlers onto system chips that have actions
+      // (child/elder/priority/task-age + any other plain ruleId chip) —
+      // UNCHANGED from before item 2.5.
+      strip.querySelectorAll('[data-rule-id]').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.preventDefault(); e.stopPropagation();
+          showActionMenu(el, el.dataset.ruleId);
+        });
+      });
+      // Wire the ranked rule-match chips (top + "+N") — item 2.3/2.5. Enter/
+      // Space activate too (role="button" chips, per plan a11y requirement).
+      strip.querySelectorAll('[data-rq-idx]').forEach(el => {
+        const activator = ruleMatchActivators[Number(el.dataset.rqIdx)];
+        if (!activator) return;
+        const activate = (e) => { e.preventDefault(); e.stopPropagation(); activator(el); };
+        el.addEventListener('click', activate);
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') activate(e);
+        });
+      });
+    }
+
+    row.dataset[QUEUE_DECORATED_KEY] = '1';
+    refreshPulseOnRow(row);
+  };
+
+  const decorateQueueRows = () => {
+    document.querySelectorAll('.ag-row').forEach(decorateOneRow);
+  };
+
+  // Queue observer with self-write protection.
+  // AG Grid recycles row DOM nodes when rows shift (e.g. when a task is cleared
+  // and the next moves up). The old chip strip stays attached to the recycled
+  // preview row, the duplicate-check trips, and the row ends up with stale or
+  // missing chips. Fix: every mutation tick, strip ALL chip strips, clear all
+  // decoration flags, and re-decorate from scratch. Disconnect the observer
+  // during our own writes so we don't loop on ourselves.
+  let queueObserver = null;
+  let queueObservedContainer = null;   // tracks which DOM node the observer is watching
+  let queueRafScheduled = false;
+
+  // Restrict per-frame queue DOM sweeps to the live AG-Grid container when we have
+  // one attached; fall back to `document` so behaviour is identical when the
+  // container isn't (yet) tracked. Used by the wipe/re-decorate/re-inject hot paths.
+  const queueScope = () => (queueObservedContainer && document.contains(queueObservedContainer)) ? queueObservedContainer : document;
+
+  // ---- Queue sort canary (audit H6) ----
+  // The rowIndex→taskUuid maps (_queueRowUuids/_durableRowMap) are built from the
+  // task-list payload the bridge saw at fetch time. If the GP sorts the grid
+  // CLIENT-side, AG-Grid reassigns row-index attributes to different tasks without
+  // a new task-list fetch, and every rowIndex-keyed chip (result / monitoring /
+  // patient-flag) would attach to the WRONG row — a wrong-patient hazard, not a
+  // cosmetic bug. The isolated world cannot reliably tell client-side from
+  // server-side sorting, so: whenever the grid's sort state CHANGES, drop both
+  // rowIndex maps. A server-side sort re-issues the task-list fetch and the
+  // bridge rebuilds the maps with fresh (correct) indexes within a tick; a
+  // client-side sort never does, leaving the maps empty and the fetch-driven
+  // chips absent — no chip is safe, a wrong-row chip is not (absence-of-alert
+  // ≠ all-clear doctrine). DOM-driven decoration chips read their own row's
+  // cells and are unaffected.
+  let _queueSortSig; // undefined = no baseline yet (fresh queue entry)
+  const queueSortSignature = () => {
+    const cells = queueScope().querySelectorAll('.ag-header-cell-sorted-asc, .ag-header-cell-sorted-desc');
+    if (!cells.length) return '';
+    return Array.from(cells)
+      .map((c) => (c.getAttribute('col-id') || '?') + ':' + (c.classList.contains('ag-header-cell-sorted-asc') ? 'asc' : 'desc'))
+      .sort()
+      .join(',');
+  };
+  const checkQueueSortCanary = () => {
+    const sig = queueSortSignature();
+    if (_queueSortSig === undefined) { _queueSortSig = sig; return; }
+    if (sig === _queueSortSig) return;
+    _queueSortSig = sig;
+    _queueRowUuids.clear();
+    _durableRowMap.clear();
+    log('queue: sort change detected — rowIndex maps dropped (H6 canary), sig=' + (sig || 'none'));
+  };
+
+  // Fully tear down the queue observer and forget the container reference.
+  // Called whenever we navigate AWAY from the queue so that the next visit
+  // to the queue page always rebuilds against the current (possibly fresh) DOM.
+  const teardownQueueObserver = () => {
+    if (queueObserver) { queueObserver.disconnect(); queueObserver = null; }
+    queueObservedContainer = null;
+    queueRafScheduled = false;
+    _queueSortSig = undefined; // sort-canary baseline re-established on next queue entry (H6)
+    removeQueueStatusBar();
+    // Leaving the queue page: drop the focus-dim class so it never bleeds onto
+    // unrelated Medicus pages that also happen to render `.ag-row` elements.
+    // `_queueFocusAlertsOn` itself is untouched — session-local state — so the
+    // toggle is restored on the next queue visit via runQueue's
+    // applyQueueFocusClass() call.
+    if (typeof document !== 'undefined' && document.body) document.body.classList.remove(QUEUE_FOCUS_CLASS);
+    // Item 4.6 — called both when leaving the queue AND at the start of every
+    // runQueue (fresh queue re-entry), so this one line covers "cursor resets
+    // on queue (re)entry / navigation" for both directions. The ch-kbd-cursor
+    // CLASS itself needs no explicit removal here — the DOM it was on is
+    // either gone (navigated away) or about to be fully re-decorated
+    // (runQueue -> decorateQueueRows), and refreshQueueChips's own
+    // clear/reapply cycle governs the class from then on.
+    _kbdCursorRowIndex = null;
+  };
+
+  const refreshQueueChips = () => {
+    log('queue: refreshQueueChips, rows=' + _queueRowUuids.size);
+    // Item 2.5 (TRIAGE-LENS-2026-07-02.md): every churn cycle wipes and
+    // rebuilds ALL chip nodes (CLAUDE.md rule #3), so a chip-anchored popover
+    // (the rule-match menu, or the older per-chip action menu) left open
+    // across a churn can end up pointing at a dead anchor. Close it rather
+    // than leave it floating over nothing — cheap, and applies to either
+    // menu since both share the activeActionMenu/activeAnchorEl singleton.
+    if (activeActionMenu && activeAnchorEl && !activeAnchorEl.isConnected) {
+      closeActionMenu();
+    }
+    if (queueObserver) queueObserver.disconnect();
+    clearPulseFloatUi();
+    queueScope().querySelectorAll('.ch-queue-chips, .ch-q-mon, .ch-q-result, .ch-q-pa, .ch-q-pending, .ch-q-repeat, .ch-q-carry, .ch-q-pulse').forEach(s => s.remove());
+    // Wipe stale severity tint in the SAME cycle as the chip-node wipe (item 1.3) —
+    // a recycled row-index must never keep a previous patient's tint colour.
+    clearQueueRowTint();
+    queueScope()
+      .querySelectorAll('.' + PULSE_ON + ', .' + PULSE_RED + ', .' + PULSE_AMBER)
+      .forEach((el) => el.classList.remove(PULSE_ON, PULSE_RED, PULSE_AMBER));
+    // Item 4.7 — same reasoning as the tint wipe above: a recycled row-index
+    // must never keep a previous patient's seen-dim.
+    clearQueueSeenDim();
+    // Item 4.6 — same reasoning: a recycled row-index must never keep a
+    // previous patient's keyboard cursor highlight.
+    clearQueueKbdCursor();
+    // Item 2.2 — the wipe above just removed every .ch-q-result chip, including any
+    // node the detail popover is anchored to. A popover whose anchor no longer exists
+    // must close rather than linger detached/mis-positioned; reinjectCachedResultChips
+    // below will supply a fresh anchor if the GP reopens it.
+    if (_resultDetailPopoverAnchor && !document.contains(_resultDetailPopoverAnchor)) {
+      closeResultDetailPopover();
+    }
+    queueScope().querySelectorAll('.ag-row').forEach(r => { delete r.dataset[QUEUE_DECORATED_KEY]; });
+    decorateQueueRows();
+    // H6 sort canary — MUST run before every reinject* call below: if the sort
+    // state changed since last cycle the rowIndex maps are dropped here, so the
+    // reinjects find nothing and no chip lands on a possibly-reordered row.
+    checkQueueSortCanary();
+    // Restore result chips synchronously from the per-task cache via the durable
+    // rowIndex→taskUuid map (NOT row-id — on real Medicus row-id is NOT the task
+    // UUID; keying off it was the v3.69.0 no-op, see CLAUDE.md rule #4).
+    reinjectCachedResultChips();
+    // Re-tint from the same cache the chips above just used — piggybacks this cycle so
+    // a config-driven cache invalidation (entry.sev cleared, watchConfig handler below)
+    // also clears/re-derives the tint for free (item 1.3, CLAUDE.md rule #4).
+    reapplyQueueRowTint();
+    // Item 4.7 — MUST run after reapplyQueueRowTint (immediately above): the
+    // never-dim-an-alert-row gate reads the tint classes reapplyQueueRowTint
+    // just set for THIS cycle, which is what gives the auto-undim behaviour.
+    reapplyQueueSeenDim();
+    // Item 4.6 — restore the keyboard cursor highlight across this cycle's
+    // churn, same pattern as the tint/seen-dim reapply above.
+    applyQueueKbdCursor();
+    // Restore monitoring chips synchronously from the per-task cache via the durable
+    // rowIndex->taskUuid map (see reinjectCachedMonitoringChips above) — unconditional,
+    // unlike the scheduleQueueMonitoring() fetch-scheduling call below, so cached chips
+    // survive the runQueue churn that empties _queueRowUuids (CLAUDE.md rule #4).
+    reinjectCachedMonitoringChips();
+    // Same durable-map restore for the patient-flag chips (Pt Alerts, H-042) —
+    // flag content is re-read from the live store at inject time.
+    reinjectCachedPaChips();
+    // B2 — same durable-map restore for the pending cross-link chips. Gated off
+    // the results queue inside reinjectCachedPendingChips; index membership is
+    // re-queried live, so a source entry that has since died never re-injects.
+    reinjectCachedPendingChips();
+    // B3/B5 — same durable-map restore for the repeat-contact and carry-over
+    // chips. Both gate off the results queue internally; the tier/threshold is
+    // re-evaluated live from the in-memory ledgers so a below-threshold row never
+    // re-injects. Placement rides the durable map (H6-safe).
+    reinjectCachedRepeatChips();
+    reinjectCachedCarryChips();
+    // Pulse recomposes from whatever chips this cycle just restored.
+    reapplyQueuePulses();
+    // Re-render the status bar AFTER the tint pass above so its jump-target query
+    // (tinted .ag-row elements) sees this cycle's freshly-applied classes, not the
+    // previous cycle's. Also re-assert the focus-dim class every cycle — cheap and
+    // idempotent (classList.add/remove no-op when already correct) — belt-and-braces
+    // in case anything upstream ever clears it.
+    updateQueueStatusBar();
+    applyQueueFocusClass();
+    // Re-arm the SAME observer (cheap) after the self-write disconnect above, so we
+    // don't leave it disconnected — only rebuild from scratch if the container is
+    // actually gone (SPA tore down AG-Grid). Do NOT null out queueObservedContainer
+    // first: that would force a needless full rebuild on every grid mutation.
+    if (queueObserver && queueObservedContainer && document.contains(queueObservedContainer)) {
+      queueObserver.observe(queueObservedContainer, { childList: true, subtree: true });
+    } else {
+      setupQueueObserver();
+    }
+    // Result-chip DISPLAY is handled synchronously by reinjectCachedResultChips above.
+    // Do NOT kick a fetch pass from here: refreshQueueChips fires on every grid mutation,
+    // so doing so re-started/aborted the fetch worker and starved it (only the first few
+    // of N rows ever got tagged). Fetching is driven by the bridge task-list event +
+    // runQueue; this call only re-displays what's already cached.
+    if (_queueRowUuids.size > 0) scheduleQueueMonitoring();
+  };
+
+  // True when EVERY element node added/removed in this mutation batch is one of our own
+  // injected chips. The async injectors (injectResultChip / injectQueueMonitoringChip) run
+  // while the observer is LIVE during the fetch pass, so each injected chip is a childList
+  // mutation that would otherwise schedule another refreshQueueChips — tagging ~12 visible
+  // rows spawned ~12 spurious refresh cycles. Ignoring these batches removes that
+  // self-trigger; genuine grid mutations (rows added/removed by AG-Grid) still schedule a
+  // refresh. An empty/text-only batch returns true (nothing relevant changed → skip).
+  const _isOwnChipMutation = (mutations) => {
+    for (const m of mutations) {
+      for (const nodes of [m.addedNodes, m.removedNodes]) {
+        for (const n of nodes) {
+          if (n.nodeType !== 1) continue; // ignore text nodes
+          const cl = n.classList;
+          if (!cl) return false;
+          // ch-q-pa included (audit M2): each patient-flag chip injection used
+          // to read as a real grid mutation and trigger a full refresh cycle.
+          if (!(cl.contains('ch-q-result') || cl.contains('ch-q-mon') || cl.contains('ch-queue-chips') || cl.contains('ch-chip') || cl.contains('ch-q-pa') || cl.contains('ch-q-pending') || cl.contains('ch-q-repeat') || cl.contains('ch-q-carry') || cl.contains('ch-q-pulse') || cl.contains('ch-q-why') || cl.contains('ch-q-act') || cl.contains('ch-q-pulse-float') || cl.contains('ms-rx-od') || cl.contains('ms-rx-od-btn'))) return false;
+        }
+      }
+    }
+    return true; // every element node added/removed was one of ours
+  };
+
+  const setupQueueObserver = () => {
+    // If we already have an observer AND the container it's watching is still
+    // live in the document, nothing to do.  But if the container was removed
+    // (Medicus SPA tore down AG Grid on navigation), discard the stale observer
+    // and build a fresh one.
+    if (queueObserver && queueObservedContainer && document.contains(queueObservedContainer)) return;
+
+    // Stale or missing — start clean.
+    if (queueObserver) { queueObserver.disconnect(); queueObserver = null; }
+
+    // Observe ag-body-viewport — parent of BOTH the master rows container
+    // (.ag-center-cols-container) AND the detail rows container
+    // (.ag-full-width-container), so we catch mutations in either.
+    const container = document.querySelector('.ag-body-viewport') || document.querySelector('.ag-root-wrapper');
+    if (!container) {
+      setTimeout(setupQueueObserver, 400);
+      return;
+    }
+    queueObservedContainer = container;
+    queueObserver = new MutationObserver((mutations) => {
+      // Ignore batches that are entirely our own async chip injections — they would
+      // otherwise self-trigger a refresh per chip during the tag burst. Genuine grid
+      // mutations still fall through to the coalesced rAF refresh below.
+      if (_isOwnChipMutation(mutations)) return;
+      if (queueRafScheduled) return;
+      queueRafScheduled = true;
+      requestAnimationFrame(() => {
+        queueRafScheduled = false;
+        refreshQueueChips();
+      });
+    });
+    queueObserver.observe(container, { childList: true, subtree: true });
+  };
+
+  // ---- Drag-to-position (docked HUD only) ----
+  const POS_KEY = 'ch-pos';
+
+  const restorePosition = (hud) => {
+    if (inPip() || !hud) return;
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); } catch (e) {}
+    if (!saved || !Number.isFinite(saved.left) || !Number.isFinite(saved.top)) return;
+    const maxX = window.innerWidth - 60;
+    const maxY = window.innerHeight - 40;
+    const left = Math.max(0, Math.min(maxX, saved.left));
+    const top = Math.max(0, Math.min(maxY, saved.top));
+    hud.style.left = left + 'px';
+    hud.style.top = top + 'px';
+    hud.style.right = 'auto';
+  };
+
+  const enableDrag = (hud) => {
+    if (inPip() || !hud) return;
+    const header = hud.querySelector('.ch-head');
+    if (!header || header.dataset.chDrag === '1') return;
+    header.dataset.chDrag = '1';
+    header.style.cursor = 'move';
+
+    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+
+    const onMove = (e) => {
+      if (!dragging) return;
+      const left = Math.max(0, Math.min(window.innerWidth - 60, sl + (e.clientX - sx)));
+      const top  = Math.max(0, Math.min(window.innerHeight - 40, st + (e.clientY - sy)));
+      hud.style.left = left + 'px';
+      hud.style.top = top + 'px';
+      hud.style.right = 'auto';
+    };
+    // End the drag and tear down every transient listener. Also fires on window
+    // blur so a drag interrupted by an alt-tab (mouseup never delivered) can't
+    // leave a live mousemove handler clamped to the HUD.
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', endDrag);
+      window.removeEventListener('blur', endDrag);
+      try {
+        const r = hud.getBoundingClientRect();
+        localStorage.setItem(POS_KEY, JSON.stringify({ left: r.left, top: r.top }));
+      } catch (e) {}
+    };
+    const onDown = (e) => {
+      if (e.target.closest('button')) return;
+      const rect = hud.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY;
+      sl = rect.left; st = rect.top;
+      dragging = true;
+      e.preventDefault();
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', endDrag);
+      window.addEventListener('blur', endDrag);
+    };
+    header.addEventListener('mousedown', onDown);
+  };
+
+  // ---- SPA route detection ----
+  const setupRouteWatcher = () => {
+    let pending, pendingSlow;
+    const onRoute = () => {
+      // Two-stage: short delay to let SPA swap DOM, longer delay to catch slow
+      // rerenders. BOTH timers are stored and cleared on each route change —
+      // previously the 1200ms timer was fire-and-forget, so rapid SPA navigation
+      // (journal-search churn, queue scrolling) stacked an uncancellable run(true)
+      // per change, each triggering a full 4-endpoint fetch cascade.
+      clearTimeout(pending);
+      clearTimeout(pendingSlow);
+      // New page load (SPA navigation) — let findCardByTitle warn again if the
+      // same title is still missing on THIS page (item 1.1), and drop any
+      // settle-watch armed for the page we just left.
+      _cardMissWarned.clear();
+      disarmLateCardWatch();
+      pending = setTimeout(() => run(true), 250);
+      pendingSlow = setTimeout(() => run(true), 1200);
+    };
+
+    // 1. <title> changes — most reliable signal in Medicus (title updates per patient)
+    const titleEl = document.querySelector('title');
+    if (titleEl) {
+      new MutationObserver(onRoute).observe(titleEl, { childList: true, characterData: true, subtree: true });
+    }
+
+    // 2. History API
+    const wrap = (k) => {
+      const orig = history[k];
+      if (!orig) return;
+      history[k] = function (...args) {
+        const r = orig.apply(this, args);
+        onRoute();
+        return r;
+      };
+    };
+    wrap('pushState');
+    wrap('replaceState');
+    window.addEventListener('popstate', onRoute);
+    window.addEventListener('hashchange', onRoute);
+
+    // 3. URL change via body mutations (catch SPA frameworks that bypass history.X)
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        onRoute();
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  };
+
+  // Wait for the page to populate (Medicus likely renders async)
+  const waitFor = (testFn, cb, timeout = 8000) => {
+    const start = Date.now();
+    const tick = () => {
+      if (testFn()) return cb();
+      if (Date.now() - start > timeout) return cb();
+      requestAnimationFrame(tick);
+    };
+    tick();
+  };
+
+  // Per-page wait predicate
+  const pageReady = () => {
+    const t = pageType();
+    // Generic fallback: patient banner present means the page has finished its
+    // initial render and we can attach the HUD even if we don't recognise the
+    // specific card layout (labs, prescriptions, miscellaneous tasks etc.)
+    const hasPatientBanner = !!document.querySelector(
+      '[class*="patient-banner"], [class*="patient-header"], [data-cy*="patient-banner"]'
+    );
+    if (t === 'record') {
+      return !!(findCardByTitle('Registers') || findCardByTitle('Active Problems') || hasPatientBanner);
+    }
+    if (t === 'detail') {
+      // Try the known cards first; fall back to any clinical-context card
+      // (Active Problems / Current Medication shows up on lab result detail,
+      // task detail, prescription detail) or the patient banner.
+      return !!(findCardByTitle('Task Details')
+             || findCardByTitle('Task Overview')
+             || findCardByTitle('Document Details')
+             || findCardByTitle('Active Problems')
+             || findCardByTitle('Initial Request')
+             || findCardByTitle('Current Medication')
+             || findCardByTitle('Investigation results')
+             || findCardByTitle('Results')
+             || findCardByTitle('Result')
+             || findCardByTitle('Prescription')
+             || findCardByTitle('Request details')
+             || hasPatientBanner);
+    }
+    if (t === 'queue') return !!document.querySelector('.ag-row');
+    return true; // unknown page type — bail quickly
+  };
+
+  // Node tests require() this file. Chrome content scripts have no CommonJS
+  // `module`, so the export branch does not run in the extension and the
+  // bootstrap below is what ships.
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      escapeHtml,
+      renderChipHtml,
+      validateTaskListDetail,
+      bridgeEventAllowed,
+      BRIDGE_MAX_ROWS: _BRIDGE_MAX_ROWS,
+      BRIDGE_MAX_EVENTS_PER_WINDOW: _BRIDGE_MAX_EVENTS_PER_WINDOW,
+    };
+  } else {
+  // Load config first, then start. Config drives rule matching.
+  loadConfig().then(() => {
+    // Items 4.1/4.2 — kick off the (session-once) reception-pathways fetch
+    // alongside the rest of bootstrap; see ensureReceptionPathwaysLoaded's own
+    // comment for why decorateOneRow itself never awaits this.
+    ensureReceptionPathwaysLoaded();
+    waitFor(pageReady, () => {
+      run(true);
+      setupRouteWatcher();
+    });
+    watchConfig(() => {
+      // Config changed — invalidate cached result severities so edited/enabled
+      // result rules are recomputed on the next pass (not re-injected stale),
+      // then wipe + redo queue chips and re-render the HUD. .detail/.unitMismatches/
+      // .fileable ride on the same cache entry as .sev (items 2.2/3.1/4.4) — clear
+      // all of them too so a stale popover or fileable tick built under the old
+      // config can't linger once .sev is recomputed.
+      for (const entry of _queueResultCache.values()) {
+        entry.sev = undefined;
+        entry.ts = 0;
+        entry.detail = undefined;
+        entry.unitMismatches = undefined;
+        entry.fileable = undefined;
+        entry.patientUuid = undefined;
+        entry.gradedTs = undefined;
+      }
+      // B2 — every source severity was just invalidated, so the whole pending
+      // cross-link index must die with them (rebuilt on the next fetch pass).
+      if (_pendingIndex) _pendingIndex.clear();
+      // The memoised chip HTML is config-derived too — drop it so edited labels/
+      // kinds re-render rather than serving the stale cached string.
+      _chipHtmlMemo.clear();
+      if (pageType() === 'queue') refreshQueueChips();
+      run(true);
+    });
+  }).catch(e => console.error('[TriageLens] init failed', e));
+
+  // Item 4.6 — attached ONCE at module init (not per-queue-visit — the handler
+  // itself gates on pageType()==='queue' on every keypress, so there's nothing
+  // to attach/detach on navigation). Capture-phase like the other document-
+  // level keydown listeners in this file (onKeydownForMenu/onKeydownForResultPopover)
+  // so it sees the key before any Medicus-page handler could stop propagation.
+  document.addEventListener('keydown', onQueueKeydown, true);
+
+  // Expose for manual re-trigger (demo / testing / SPA edge cases)
+  window.__clinHudRun = () => run(true);
+  }
+
+})();

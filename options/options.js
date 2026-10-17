@@ -1,0 +1,6203 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — Options page controller
+
+'use strict';
+
+// Display preferences are applied by shared/display-prefs.js (loaded before this script).
+
+// ── Inject current extension version into header badges ───────────────────────
+// Both badges used to be hard-coded; they drifted out of sync with manifest.json
+// and showed the install-time version of the page chrome forever.
+(function injectVersionBadges() {
+  try {
+    const v = 'v' + chrome.runtime.getManifest().version;
+    document.addEventListener('DOMContentLoaded', () => {
+      const a = document.getElementById('suiteVersionBadge');
+      const b = document.getElementById('debugVersionBadge');
+      if (a) a.textContent = v;
+      if (b) b.textContent = v;
+    });
+  } catch (_) {}
+})();
+
+// ── Helpers (hoisted to top so any subsequent code can use them) ──────────────
+
+function escHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+function escAttr(s) {
+  return escHtml(s).replace(/"/g, '&quot;');
+}
+
+const CAP_WEEKDAYS = [
+  { key: 'mon', label: 'Mon' },
+  { key: 'tue', label: 'Tue' },
+  { key: 'wed', label: 'Wed' },
+  { key: 'thu', label: 'Thu' },
+  { key: 'fri', label: 'Fri' },
+  { key: 'sat', label: 'Sat' },
+  { key: 'sun', label: 'Sun' },
+];
+
+function capDefaultMinimumByDay(legacyMin) {
+  const m = legacyMin || 0;
+  return { mon: m, tue: m, wed: m, thu: m, fri: m, sat: 0, sun: 0 };
+}
+
+function capPresetMinimumSummary(p) {
+  const mins = p.minimumByDay;
+  if (!mins) return `Min ${p.minimumPerDay || 0}/day`;
+  const values = CAP_WEEKDAYS.map((d) => mins[d.key] || 0);
+  const allSame = values.slice(0, 5).every((v) => v === values[0]);
+  if (allSame && values[5] === 0 && values[6] === 0) return `Min ${values[0]}/weekday`;
+  const wkTotal = values.reduce((a, b) => a + b, 0);
+  return `Min ${wkTotal}/week`;
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+
+// One nav item can light up several stacked sections (Queue rules, Diagnostics).
+const SECTION_GROUPS = {
+  diagnostics: ['ledger', 'health', 'debug'],
+};
+const SECTION_ALIASES = {
+  queue: 'triage',
+  'result-rules': 'triage',
+  oir: 'triage',
+  sentinel: 'suite',
+  labfiling: 'suite',
+  investigations: 'suite',
+  ledger: 'diagnostics',
+  health: 'diagnostics',
+  debug: 'diagnostics',
+};
+
+function showOptionsSection(navId, scrollToId) {
+  document.querySelectorAll('.nav-item').forEach((b) => b.classList.remove('active'));
+  document.querySelectorAll('.opt-section').forEach((s) => s.classList.remove('active'));
+  document.querySelector(`.nav-item[data-section="${navId}"]`)?.classList.add('active');
+  const ids = SECTION_GROUPS[navId] || [navId];
+  ids.forEach((id) => document.getElementById(`sect-${id}`)?.classList.add('active'));
+  if (scrollToId) document.getElementById(`sect-${scrollToId}`)?.scrollIntoView({ block: 'start' });
+}
+
+document.querySelectorAll('.nav-item').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    showOptionsSection(btn.dataset.section);
+  });
+});
+
+// Deep-linking: options.html#sect-<name> opens straight onto that section.
+// Used by the command palette; also
+// honoured on in-page hash changes so links can retarget an open options tab.
+// Legacy hashes (#sect-triage, #sect-ledger, …) still work after the collapse.
+function activateSectionFromHash() {
+  const m = /^#sect-([a-z-]+)$/.exec(location.hash || '');
+  if (!m) return;
+  const raw = m[1];
+  const navId = SECTION_ALIASES[raw] || raw;
+  const scrollTo = SECTION_GROUPS[navId] && SECTION_GROUPS[navId].includes(raw) ? raw : null;
+  showOptionsSection(navId, scrollTo);
+}
+activateSectionFromHash();
+window.addEventListener('hashchange', activateSectionFromHash);
+
+// ?rule=<id> (the Companion's "edit rule" chip): point the Result Rules frame at that clinical rule's own editor.
+try {
+  const ruleId = new URLSearchParams(location.search).get('rule');
+  const ruleFrame = document.getElementById('resultRulesFrame');
+  if (ruleId && /^[a-z0-9-]+$/i.test(ruleId) && ruleFrame) {
+    ruleFrame.src = '../content-scripts/triage-lens/options.html?rule=' + encodeURIComponent(ruleId) + '#resultRules';
+  }
+} catch (e) {
+  /* a bad query string just leaves the frame on its normal page */
+}
+
+// ── Suite settings (practice code) ────────────────────────────────────────────
+
+const practiceCodeInput = document.getElementById('practiceCode');
+const feedbackEmailInput = document.getElementById('feedbackEmail');
+const letterheadPracticeInput = document.getElementById('letterheadPractice');
+const letterheadClinicianInput = document.getElementById('letterheadClinician');
+const signingSoftFlagsInput = document.getElementById('signingSoftFlags');
+const pfSoftFlagsInput = document.getElementById('pfSoftFlags');
+const PRACTICE_PACK_TOGGLES = [
+  { key: 'suite.signing.softFlags', ids: ['signingSoftFlags', 'pfSoftFlags'], grandfather: false },
+  { key: 'suite.ui.allocateCanvases', ids: ['pfAllocateCanvases'], grandfather: true },
+  { key: 'suite.ui.contactsCanvas', ids: ['pfContactsCanvas'], grandfather: true },
+  { key: 'suite.ui.routineRxButton', ids: ['pfRoutineRxButton'], grandfather: true },
+  { key: 'suite.ui.quickActionsWidget', ids: ['pfQuickActionsWidget'], grandfather: true },
+  { key: 'suite.ui.focusAlerts', ids: ['pfFocusAlerts'], grandfather: true },
+  { key: 'suite.ui.templateOrganiser', ids: ['pfTemplateOrganiser'], grandfather: true },
+  { key: 'suite.ui.taskPresence', ids: ['pfTaskPresence'], grandfather: true },
+  { key: 'suite.ui.workloadTracker', ids: ['pfWorkloadTracker'], grandfather: true },
+  { key: 'suite.ui.availabilityWall', ids: ['pfAvailabilityWall'], grandfather: true },
+];
+function packToggleEls(spec) {
+  return spec.ids.map((id) => document.getElementById(id)).filter(Boolean);
+}
+function setPackToggleChecked(spec, on) {
+  packToggleEls(spec).forEach((el) => {
+    el.checked = on === true;
+  });
+}
+const saveSuiteBtn = document.getElementById('saveSuite');
+const suiteSaved = document.getElementById('suiteSaved');
+const codeDetectedRow = document.getElementById('codeDetectedRow');
+const codeDetectedValue = document.getElementById('codeDetectedValue');
+const codeNotDetectedRow = document.getElementById('codeNotDetectedRow');
+const testConnectionBtn = document.getElementById('testConnectionBtn');
+const testConnectionResult = document.getElementById('testConnectionResult');
+
+// Load saved code and show auto-detected code.
+// Wrapped in a self-invoking IIFE so any throw here can't halt the rest of
+// the script — every section below needs to keep working independently.
+(async function initSuiteSection() {
+  try {
+    // Load saved fallback
+    if (practiceCodeInput) {
+      chrome.storage.local.get(['suite.practiceCode'], (res) => {
+        practiceCodeInput.value = res['suite.practiceCode'] || '';
+      });
+    }
+    // Load saved feedback recipient email
+    if (feedbackEmailInput) {
+      chrome.storage.local.get(['suite.feedbackEmail'], (res) => {
+        feedbackEmailInput.value = res['suite.feedbackEmail'] || '';
+      });
+    }
+    // Load saved practice letterhead (practice name + clinician sign-off)
+    if (letterheadPracticeInput || letterheadClinicianInput) {
+      chrome.storage.local.get(['suite.letterhead'], (res) => {
+        const lh = res['suite.letterhead'] || {};
+        if (letterheadPracticeInput) letterheadPracticeInput.value = lh.practiceName || '';
+        if (letterheadClinicianInput) letterheadClinicianInput.value = lh.clinicianName || '';
+      });
+    }
+    const PP = typeof PracticePacks !== 'undefined' ? PracticePacks : null;
+    if (PP && typeof PP.materializeGrandfather === 'function') {
+      const presenceSeed = await chrome.storage.local.get(['presence.enabled', 'suite.ui.taskPresence']);
+      // A machine that already unticked presence stays off. Materialise must
+      // not write the new pack key true over that explicit false.
+      if (
+        presenceSeed['presence.enabled'] === false &&
+        presenceSeed['suite.ui.taskPresence'] !== true &&
+        presenceSeed['suite.ui.taskPresence'] !== false
+      ) {
+        await chrome.storage.local.set({ 'suite.ui.taskPresence': false });
+      }
+      if (presenceSeed['presence.enabled'] !== true && presenceSeed['presence.enabled'] !== false) {
+        await chrome.storage.local.set({ 'presence.enabled': true });
+      }
+      await PP.materializeGrandfather();
+    }
+    const packKeys = PRACTICE_PACK_TOGGLES.map((spec) => spec.key);
+    chrome.storage.local.get(packKeys, (res) => {
+      PRACTICE_PACK_TOGGLES.forEach((spec) => {
+        const stored = res[spec.key];
+        const on = PP ? PP.isEnabled(spec.key, stored) : stored === true || (spec.grandfather && stored !== false);
+        setPackToggleChecked(spec, on);
+      });
+    });
+    // Try to auto-detect from open Medicus tab
+    let detected = null;
+    try {
+      const tabs = await chrome.tabs.query({ url: 'https://*.medicus.health/*' });
+      for (const tab of tabs) {
+        const m = tab.url && tab.url.match(/england\.medicus\.health\/([a-f0-9]{4,8})\//i);
+        if (m?.[1]) {
+          detected = m[1].toLowerCase();
+          break;
+        }
+      }
+    } catch (_) {}
+    if (detected) {
+      if (codeDetectedRow) codeDetectedRow.style.display = 'flex';
+      if (codeDetectedValue) codeDetectedValue.textContent = detected;
+      if (codeNotDetectedRow) codeNotDetectedRow.style.display = 'none';
+    } else {
+      if (codeDetectedRow) codeDetectedRow.style.display = 'none';
+      if (codeNotDetectedRow) codeNotDetectedRow.style.display = 'block';
+    }
+  } catch (e) {
+    console.warn('[Suite section init]', e.message);
+  }
+})();
+
+saveSuiteBtn?.addEventListener('click', async () => {
+  if (!practiceCodeInput) return;
+  const code = practiceCodeInput.value.trim().toLowerCase();
+  const { 'submissions.config': existingSubConfig = {} } = await chrome.storage.local.get('submissions.config');
+  const suiteToSet = {
+    'suite.practiceCode': code,
+    'submissions.config': { ...existingSubConfig, practiceCode: code },
+    'suite.feedbackEmail': (feedbackEmailInput?.value || '').trim(),
+    'suite.letterhead': {
+      practiceName: (letterheadPracticeInput?.value || '').trim(),
+      clinicianName: (letterheadClinicianInput?.value || '').trim(),
+    },
+  };
+  // Never write false just because a checkbox is missing from the DOM.
+  if (signingSoftFlagsInput) {
+    suiteToSet['suite.signing.softFlags'] = signingSoftFlagsInput.checked === true;
+  }
+  await chrome.storage.local.set(suiteToSet);
+  if (suiteSaved) {
+    suiteSaved.classList.add('show');
+    setTimeout(() => suiteSaved.classList.remove('show'), 2000);
+  }
+});
+
+function bindPracticePackToggle(el, key) {
+  el?.addEventListener('change', async () => {
+    const on = el.checked === true;
+    const payload = { [key]: on };
+    // One switch: the Task Presence section checkbox reads presence.enabled.
+    if (key === 'suite.ui.taskPresence') payload['presence.enabled'] = on;
+    await chrome.storage.local.set(payload);
+  });
+}
+PRACTICE_PACK_TOGGLES.forEach((spec) => {
+  packToggleEls(spec).forEach((el) => bindPracticePackToggle(el, spec.key));
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area && area !== 'local') return;
+  const PP = typeof PracticePacks !== 'undefined' ? PracticePacks : null;
+  PRACTICE_PACK_TOGGLES.forEach((spec) => {
+    if (!changes[spec.key]) return;
+    const stored = changes[spec.key].newValue;
+    const on = PP ? PP.isEnabled(spec.key, stored) : stored === true;
+    setPackToggleChecked(spec, on);
+    if (spec.key === 'suite.ui.taskPresence' && presenceEnabledInput && stored === true) {
+      presenceEnabledInput.checked = true;
+    }
+    if (spec.key === 'suite.ui.taskPresence' && presenceEnabledInput && stored === false) {
+      presenceEnabledInput.checked = false;
+    }
+  });
+});
+
+// Guided tour replay — clears the seen-version marker (localStorage is shared
+// across extension pages, so the side panel sees the reset immediately and
+// re-runs the suite walkthrough next time it opens). Key must match
+// side-panel/tour/tour.js TOUR_SEEN_KEY.
+document.getElementById('replayTourBtn')?.addEventListener('click', () => {
+  try {
+    localStorage.removeItem('suite.tour.seenVersion');
+  } catch (_) {}
+  const status = document.getElementById('replayTourStatus');
+  if (status) {
+    status.textContent = 'Tour will run next time you open the side panel ✓';
+    setTimeout(() => {
+      status.textContent = '';
+    }, 4000);
+  }
+});
+
+// ── Feedback / feature request / bug report (mailto) ─────────────────────────
+// Ported verbatim from the About tab's composer when that tab was removed in
+// v3.255.0 — this is the suite's only general-purpose defect-reporting route,
+// so it follows the tab rather than being dropped with it. Recipient is the
+// suite.feedbackEmail set just above; falls back to the default below.
+// Nothing is transmitted here: a mailto: hands the draft to the user's own
+// mail client, which they review and send themselves.
+const FEEDBACK_EMAIL_DEFAULT = '';
+const fbTypeBtns = document.querySelectorAll('.fb-type-btn');
+fbTypeBtns.forEach((b) =>
+  b.addEventListener('click', () => {
+    fbTypeBtns.forEach((x) => x.classList.remove('active'));
+    b.classList.add('active');
+  })
+);
+
+document.getElementById('fbSendBtn')?.addEventListener('click', async () => {
+  const status = document.getElementById('fbStatus');
+  const subjectEl = document.getElementById('fbSubject');
+  const detailsEl = document.getElementById('fbDetails');
+  const type = document.querySelector('.fb-type-btn.active')?.dataset.fbType || 'Feedback';
+  const subject = (subjectEl?.value || '').trim();
+  const details = (detailsEl?.value || '').trim();
+
+  if (!subject && !details) {
+    if (status) {
+      status.style.color = 'var(--red)';
+      status.textContent = 'Add a subject or details first';
+    }
+    subjectEl?.focus();
+    return;
+  }
+
+  const version = chrome.runtime.getManifest().version;
+  const diag = [
+    '',
+    '──────────',
+    '(Diagnostics — please keep)',
+    `Type: ${type}`,
+    `Suite version: v${version}`,
+    `Browser: ${navigator.userAgent}`,
+    `Date: ${new Date().toISOString()}`,
+  ].join('\n');
+  const mailSubject = `[Medicus Suite] ${type}${subject ? ': ' + subject : ''}`;
+  const mailBody = `${details}\n${diag}`;
+  const stored = await chrome.storage.local.get('suite.feedbackEmail');
+  const recipient = (stored['suite.feedbackEmail'] || '').trim() || FEEDBACK_EMAIL_DEFAULT;
+  if (!recipient) {
+    if (status) {
+      status.style.color = 'var(--red)';
+      status.textContent = 'Set a feedback recipient email above first';
+    }
+    document.getElementById('feedbackEmail')?.focus();
+    return;
+  }
+  const url = `mailto:${recipient}?subject=${encodeURIComponent(mailSubject)}&body=${encodeURIComponent(mailBody)}`;
+
+  // Transient anchor click rather than navigating the settings page away.
+  const a = document.createElement('a');
+  a.href = url;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  if (status) {
+    status.style.color = 'var(--green)';
+    status.textContent = 'Opening your email client…';
+  }
+});
+
+testConnectionBtn?.addEventListener('click', async () => {
+  if (testConnectionResult) {
+    testConnectionResult.textContent = 'Testing...';
+    testConnectionResult.style.color = '#93a8c5';
+  }
+
+  let code = null;
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://*.medicus.health/*' });
+    for (const tab of tabs) {
+      const m = tab.url && tab.url.match(/england\.medicus\.health\/([a-f0-9]{4,8})\//i);
+      if (m?.[1]) {
+        code = m[1].toLowerCase();
+        break;
+      }
+    }
+  } catch (_) {}
+  if (!code) {
+    const stored = await chrome.storage.local.get('suite.practiceCode');
+    code = stored['suite.practiceCode'] || null;
+  }
+
+  if (!code) {
+    if (testConnectionResult) {
+      testConnectionResult.textContent = 'No practice code — open a Medicus tab or enter code below.';
+      testConnectionResult.style.color = '#f59e0b';
+    }
+    return;
+  }
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const url = `https://${code}.api.england.medicus.health/scheduling/data/appointment-book/embedded-overview?date=${today}&filterByUsualLocation=false`;
+    const r = await fetch(url, { credentials: 'include' });
+    if (testConnectionResult) {
+      if (r.ok) {
+        testConnectionResult.textContent = `Connected (${code}) ✓`;
+        testConnectionResult.style.color = '#4ade80';
+      } else {
+        testConnectionResult.textContent = `Error ${r.status} for code "${code}" — check code or Medicus sign-in.`;
+        testConnectionResult.style.color = '#f87171';
+      }
+    }
+  } catch (e) {
+    if (testConnectionResult) {
+      testConnectionResult.textContent = `Network error: ${e.message}`;
+      testConnectionResult.style.color = '#f87171';
+    }
+  }
+});
+
+// ── API Integration (Transactional API) settings ──────────────────────────────
+// shared/txn-config.js (TxnConfig) is service-worker only — not loaded on this
+// page — so the two literal defaults below are mirrored from its DEFAULTS and
+// must be kept in sync if that module's defaults ever change.
+const TXN_DEFAULT_MODE = 'session';
+const TXN_DEFAULT_ENVIRONMENT = 'staging';
+
+const txnModeRadios = document.querySelectorAll('input[name="txnMode"]');
+const txnModeWarning = document.getElementById('txnModeWarning');
+const txnEnvironmentSelect = document.getElementById('txnEnvironment');
+const txnProxyUrlInput = document.getElementById('txnProxyUrl');
+const txnCallerKeyInput = document.getElementById('txnCallerKey');
+const txnUserEmailInput = document.getElementById('txnUserEmail');
+const txnTenantValue = document.getElementById('txnTenantValue');
+const saveTxnBtn = document.getElementById('saveTxnBtn');
+const txnSaved = document.getElementById('txnSaved');
+const txnTestConnectionBtn = document.getElementById('txnTestConnectionBtn');
+const txnTestConnectionResult = document.getElementById('txnTestConnectionResult');
+const txnProdConfirmWarning = document.getElementById('txnProdConfirmWarning');
+const txnParityReportBtn = document.getElementById('txnParityReportBtn');
+
+// Production interlock: saving with environment 'prod' and a non-session
+// integration mode points Suite's live patient-record reads at the real
+// Medicus API, so it gets a deliberate double-click confirmation rather than
+// saving on the first click like every other change. Armed by the first
+// Save click below; a second Save click while armed performs the save; the
+// arm expires silently after 10s (TXN_PROD_CONFIRM_WINDOW_MS) if not
+// confirmed.
+const TXN_PROD_CONFIRM_WINDOW_MS = 10000;
+let txnProdConfirmArmed = false;
+let txnProdConfirmTimer = null;
+
+function txnClearProdConfirm() {
+  txnProdConfirmArmed = false;
+  if (txnProdConfirmTimer) {
+    clearTimeout(txnProdConfirmTimer);
+    txnProdConfirmTimer = null;
+  }
+  if (txnProdConfirmWarning) {
+    txnProdConfirmWarning.style.display = 'none';
+    txnProdConfirmWarning.textContent = '';
+  }
+}
+
+function txnUpdateModeWarning() {
+  if (!txnModeWarning) return;
+  const checked = document.querySelector('input[name="txnMode"]:checked');
+  txnModeWarning.style.display = checked && checked.value === 'transactional' ? 'block' : 'none';
+}
+txnModeRadios.forEach((r) => r.addEventListener('change', txnUpdateModeWarning));
+
+(async function initTxnSection() {
+  try {
+    const res = await chrome.storage.local.get([
+      'txn.integrationMode',
+      'txn.environment',
+      'txn.proxyUrl',
+      'txn.callerKey',
+      'txn.userEmail',
+      'suite.practiceCode',
+    ]);
+
+    const mode = res['txn.integrationMode'] || TXN_DEFAULT_MODE;
+    const modeRadio =
+      document.querySelector(`input[name="txnMode"][value="${escAttr(mode)}"]`) ||
+      document.getElementById('txnModeSession');
+    if (modeRadio) modeRadio.checked = true;
+
+    if (txnEnvironmentSelect) txnEnvironmentSelect.value = res['txn.environment'] || TXN_DEFAULT_ENVIRONMENT;
+    if (txnProxyUrlInput) txnProxyUrlInput.value = res['txn.proxyUrl'] || '';
+    if (txnCallerKeyInput) txnCallerKeyInput.value = res['txn.callerKey'] || '';
+    if (txnUserEmailInput) txnUserEmailInput.value = res['txn.userEmail'] || '';
+    if (txnTenantValue) txnTenantValue.textContent = res['suite.practiceCode'] || '(not set — see Suite section)';
+
+    txnUpdateModeWarning();
+  } catch (e) {
+    console.warn('[Txn section init]', e.message);
+  }
+})();
+
+saveTxnBtn?.addEventListener('click', async () => {
+  const checkedMode = document.querySelector('input[name="txnMode"]:checked');
+  const mode = checkedMode ? checkedMode.value : TXN_DEFAULT_MODE;
+  const environment = txnEnvironmentSelect ? txnEnvironmentSelect.value : TXN_DEFAULT_ENVIRONMENT;
+
+  // Deliberate-confirmation interlock: pointing Suite at PRODUCTION while an
+  // integration mode other than 'session' is selected means live reads will
+  // actually hit real patient data, so the first click only arms a warning —
+  // it does not save. A second click within the window confirms and saves.
+  const needsProdConfirm = environment === 'prod' && mode !== 'session';
+  if (needsProdConfirm && !txnProdConfirmArmed) {
+    txnProdConfirmArmed = true;
+    if (txnProdConfirmTimer) clearTimeout(txnProdConfirmTimer);
+    txnProdConfirmTimer = setTimeout(txnClearProdConfirm, TXN_PROD_CONFIRM_WINDOW_MS);
+    if (txnProdConfirmWarning) {
+      txnProdConfirmWarning.textContent =
+        'You are pointing Suite at the PRODUCTION Medicus API for live patient data. Click Save again within 10 seconds to confirm.';
+      txnProdConfirmWarning.style.display = 'block';
+    }
+    return;
+  }
+  // Either this isn't a prod+non-session save (saves as today), or it's a
+  // confirming second click — either way, clear any armed state.
+  txnClearProdConfirm();
+
+  await chrome.storage.local.set({
+    'txn.integrationMode': mode,
+    'txn.environment': environment,
+    // Trimmed; an empty string is a deliberate clear of a previously-saved value.
+    'txn.proxyUrl': (txnProxyUrlInput?.value || '').trim(),
+    'txn.callerKey': (txnCallerKeyInput?.value || '').trim(),
+    'txn.userEmail': (txnUserEmailInput?.value || '').trim(),
+  });
+
+  txnUpdateModeWarning();
+
+  if (txnSaved) {
+    txnSaved.classList.add('show');
+    setTimeout(() => txnSaved.classList.remove('show'), 2000);
+  }
+});
+
+txnTestConnectionBtn?.addEventListener('click', async () => {
+  if (txnTestConnectionResult) {
+    txnTestConnectionResult.textContent = 'Testing…';
+    txnTestConnectionResult.style.color = 'var(--text-3)';
+  }
+  try {
+    const r = await chrome.runtime.sendMessage({ action: 'txn:testConnection' });
+    if (!txnTestConnectionResult) return;
+    if (r && r.ok) {
+      txnTestConnectionResult.textContent = `Connected — proxy and Medicus API reachable (${r.latencyMs} ms)`;
+      txnTestConnectionResult.style.color = 'var(--green)';
+    } else {
+      txnTestConnectionResult.textContent = (r && r.error) || 'Test failed — no response from the service worker.';
+      txnTestConnectionResult.style.color = 'var(--red)';
+    }
+  } catch (e) {
+    if (txnTestConnectionResult) {
+      txnTestConnectionResult.textContent = `Error: ${e.message}`;
+      txnTestConnectionResult.style.color = 'var(--red)';
+    }
+  }
+});
+
+// Generate parity report — one-click assurance evidence pack: reads the
+// Clinical Event Ledger (shared/event-ledger.js, window.EventLedger, loaded
+// before this script), summarises the crossover-related events with
+// shared/txn-parity-report.js (window.TxnParityReport), and downloads a
+// Markdown document. Same client-side Blob + temporary <a download> pattern
+// as the Event Ledger section's own "Export CSV" (see initLedgerSection
+// below) — no server round-trip, nothing leaves this machine.
+txnParityReportBtn?.addEventListener('click', async () => {
+  const EL = typeof window !== 'undefined' ? window.EventLedger : null;
+  const TPR = typeof window !== 'undefined' ? window.TxnParityReport : null;
+  if (!EL || !TPR) return;
+  try {
+    const events = await EL.getEvents();
+    const report = TPR.buildParityReport(events, { nowIso: new Date().toISOString() });
+    const checkedMode = document.querySelector('input[name="txnMode"]:checked');
+    const mode = checkedMode ? checkedMode.value : TXN_DEFAULT_MODE;
+    const tenantText = txnTenantValue ? txnTenantValue.textContent : '';
+    const practiceLabel = tenantText && !tenantText.startsWith('(') && tenantText !== '—' ? tenantText : '';
+    const md = TPR.renderParityReportMarkdown(report, { practiceLabel, modeNote: `Integration mode: ${mode}` });
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'medicus-suite-api-parity-report.md';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.warn('[Txn parity report]', e.message);
+  }
+});
+
+// ── Task Presence settings ────────────────────────────────────────────────────
+// Advisory "someone is on this request" store config (content-scripts/
+// task-presence.js reads these). presence.key is a practice credential:
+// stored locally only, deliberately excluded from Suite backups (same stance
+// as txn.callerKey).
+
+const presencePickFolderBtn = document.getElementById('presencePickFolderBtn');
+const presenceReallowBtn = document.getElementById('presenceReallowBtn');
+const presenceForgetFolderBtn = document.getElementById('presenceForgetFolderBtn');
+const presenceFolderStatus = document.getElementById('presenceFolderStatus');
+const presenceEnabledInput = document.getElementById('presenceEnabled');
+const presenceUrlInput = document.getElementById('presenceUrl');
+const presenceKeyInput = document.getElementById('presenceKey');
+const presenceNameInput = document.getElementById('presenceName');
+const presenceFileStatus = document.getElementById('presenceFileStatus');
+const savePresenceBtn = document.getElementById('savePresenceBtn');
+const presenceSaved = document.getElementById('presenceSaved');
+
+(async function initPresenceSection() {
+  try {
+    // Re-sync the shared-folder file first so the status line reflects the
+    // folder's CURRENT contents, not a stale cache.
+    try {
+      await chrome.runtime.sendMessage({ action: 'presence:syncFileConfig' });
+    } catch (_) {
+      /* SW asleep — cache below still shows last-known state */
+    }
+    const res = await chrome.storage.local.get([
+      'presence.enabled',
+      'presence.url',
+      'presence.key',
+      'presence.name',
+      'presence.fileCache',
+      'suite.display',
+    ]);
+    const pack = res['suite.ui.taskPresence'];
+    const legacy = res['presence.enabled'];
+    const presenceOn = pack === false ? false : pack === true ? true : legacy !== false;
+    if (presenceEnabledInput) presenceEnabledInput.checked = presenceOn;
+    if (presenceUrlInput) presenceUrlInput.value = res['presence.url'] || '';
+    if (presenceKeyInput) presenceKeyInput.value = res['presence.key'] || '';
+    if (presenceNameInput) presenceNameInput.value = res['presence.name'] || '';
+    if (presenceFileStatus) {
+      const fc = res['presence.fileCache'];
+      if (fc && fc.url) {
+        presenceFileStatus.textContent = `detected — ${fc.url}`;
+        presenceFileStatus.style.color = 'var(--green)';
+      } else {
+        presenceFileStatus.textContent = 'not found (drop presence-config.json into the extension folder)';
+        presenceFileStatus.style.color = 'var(--text-3)';
+      }
+    }
+    initPresenceLook(res['suite.display']);
+  } catch (e) {
+    console.warn('[Presence section init]', e.message);
+  }
+})();
+
+function presenceLookCurrent(display) {
+  const Look = typeof PresenceLook !== 'undefined' ? PresenceLook : null;
+  const raw = display && typeof display === 'object' ? display.presenceLook : null;
+  return Look
+    ? Look.sanitizePresenceLook(raw)
+    : { colour: 'fluoro', size: 'medium', highlight: 'fill', avatars: true, quiet: true, weight: 'bold' };
+}
+
+function presenceLookChoice(field, value, label, pressed) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ms-look-choice';
+  btn.dataset.lookField = field;
+  btn.dataset.lookValue = value;
+  btn.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+  btn.textContent = label;
+  return btn;
+}
+
+function renderPresenceLook(look) {
+  const Look = typeof PresenceLook !== 'undefined' ? PresenceLook : null;
+  if (!Look) return;
+  const safe = Look.sanitizePresenceLook(look);
+  const fill = (id, nodes) => {
+    const host = document.getElementById(id);
+    if (!host) return;
+    host.replaceChildren(...nodes);
+  };
+  fill(
+    'presenceLookColour',
+    Object.keys(Look.COLOURS).map((k) => {
+      const c = Look.COLOURS[k];
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ms-look-swatch';
+      btn.dataset.lookField = 'colour';
+      btn.dataset.lookValue = k;
+      btn.title = c.label;
+      btn.setAttribute('aria-label', c.label);
+      btn.setAttribute('aria-pressed', k === safe.colour ? 'true' : 'false');
+      btn.style.background = c.wash;
+      btn.style.borderColor = c.border;
+      return btn;
+    })
+  );
+  fill(
+    'presenceLookSize',
+    Object.keys(Look.SIZES).map((k) => presenceLookChoice('size', k, Look.SIZES[k].label, k === safe.size))
+  );
+  fill(
+    'presenceLookHighlight',
+    Object.keys(Look.HIGHLIGHTS).map((k) =>
+      presenceLookChoice('highlight', k, Look.HIGHLIGHTS[k].label, k === safe.highlight)
+    )
+  );
+  fill('presenceLookAvatars', [
+    presenceLookChoice('avatars', '1', 'On', safe.avatars),
+    presenceLookChoice('avatars', '0', 'Off', !safe.avatars),
+  ]);
+  fill('presenceLookQuiet', [
+    presenceLookChoice('quiet', '1', 'On', safe.quiet),
+    presenceLookChoice('quiet', '0', 'Off', !safe.quiet),
+  ]);
+  fill(
+    'presenceLookWeight',
+    Object.keys(Look.WEIGHTS).map((k) => presenceLookChoice('weight', k, Look.WEIGHTS[k].label, k === safe.weight))
+  );
+  const preview = document.getElementById('presenceLookPreview');
+  if (preview) {
+    Look.applyLookToEl(preview, safe);
+    preview.style.background = 'var(--ms-tp-wash)';
+    preview.style.borderColor = 'var(--ms-tp-border)';
+    preview.style.color = 'var(--ms-tp-text)';
+    preview.style.fontSize = 'var(--ms-tp-font)';
+    preview.style.padding = 'var(--ms-tp-pad-y) var(--ms-tp-pad-x)';
+    preview.style.fontWeight = safe.weight === 'regular' ? '400' : '700';
+    const av = preview.querySelector('.ms-tp-av');
+    if (av) av.style.display = safe.avatars ? '' : 'none';
+    const q = preview.querySelector('.ms-tp-quiet');
+    if (q) {
+      q.style.display = safe.quiet ? '' : 'none';
+      q.style.color = 'var(--ms-tp-quiet)';
+    }
+    if (safe.highlight === 'edge') {
+      preview.style.background = 'var(--bg-elev)';
+      preview.style.borderLeft = '5px solid var(--ms-tp-border)';
+    } else {
+      preview.style.borderLeft = '';
+    }
+  }
+}
+
+async function persistPresenceLook(look) {
+  const Look = typeof PresenceLook !== 'undefined' ? PresenceLook : null;
+  const safe = Look ? Look.sanitizePresenceLook(look) : look;
+  const r = await chrome.storage.local.get('suite.display');
+  const cur = r['suite.display'] && typeof r['suite.display'] === 'object' ? r['suite.display'] : {};
+  await chrome.storage.local.set({ 'suite.display': { ...cur, presenceLook: safe } });
+  renderPresenceLook(safe);
+}
+
+function initPresenceLook(display) {
+  const look = presenceLookCurrent(display);
+  renderPresenceLook(look);
+  const block = document.getElementById('presenceLookBlock');
+  if (!block) return;
+  block.addEventListener('click', async (e) => {
+    const btn = e.target && e.target.closest && e.target.closest('[data-look-field]');
+    if (!btn) return;
+    const field = btn.getAttribute('data-look-field');
+    const value = btn.getAttribute('data-look-value');
+    const next = { ...presenceLookCurrent((await chrome.storage.local.get('suite.display'))['suite.display']) };
+    if (field === 'avatars') next.avatars = value === '1';
+    else if (field === 'quiet') next.quiet = value === '1';
+    else if (field === 'colour' || field === 'size' || field === 'highlight' || field === 'weight') next[field] = value;
+    else return;
+    await persistPresenceLook(next);
+  });
+}
+
+// ── Folder store: pick / re-allow / disconnect ────────────────────────────────
+// The FSA picker and any permission prompt REQUIRE a user gesture, which is
+// why this lives here and not in the service worker. The handle persists in
+// extension IndexedDB (shared/presence-folder.js) and the worker does all
+// subsequent IO. Chrome's own prompt offers "Allow on every visit" — that is
+// what makes this one-click-forever; the re-allow button covers installs
+// where the grant lapsed instead.
+
+async function presenceRenderFolderStatus() {
+  if (!presenceFolderStatus || typeof PresenceFolder === 'undefined') return;
+  try {
+    const handle = await PresenceFolder.loadHandle();
+    if (!handle) {
+      presenceFolderStatus.textContent = 'not connected';
+      presenceFolderStatus.style.color = 'var(--text-3)';
+      if (presenceReallowBtn) presenceReallowBtn.style.display = 'none';
+      if (presenceForgetFolderBtn) presenceForgetFolderBtn.style.display = 'none';
+      return;
+    }
+    const perm = await PresenceFolder.permissionState(handle);
+    if (presenceForgetFolderBtn) presenceForgetFolderBtn.style.display = '';
+    if (perm === 'granted') {
+      presenceFolderStatus.textContent = `connected — "${handle.name}" (presence files in ${PresenceFolder.DIR_NAME}/)`;
+      presenceFolderStatus.style.color = 'var(--green)';
+      if (presenceReallowBtn) presenceReallowBtn.style.display = 'none';
+    } else {
+      presenceFolderStatus.textContent = `"${handle.name}" needs access re-allowed (Chrome dropped the grant)`;
+      presenceFolderStatus.style.color = 'var(--amber)';
+      if (presenceReallowBtn) presenceReallowBtn.style.display = '';
+    }
+  } catch (e) {
+    presenceFolderStatus.textContent = `status check failed: ${e.message}`;
+    presenceFolderStatus.style.color = 'var(--amber)';
+  }
+}
+presenceRenderFolderStatus();
+
+presencePickFolderBtn?.addEventListener('click', async () => {
+  if (typeof PresenceFolder === 'undefined' || typeof window.showDirectoryPicker !== 'function') {
+    alert('Folder access is not available in this browser.');
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ms-presence' });
+    await PresenceFolder.saveHandle(handle);
+    await presenceRenderFolderStatus();
+  } catch (e) {
+    if (e && e.name !== 'AbortError') console.warn('[Presence folder pick]', e.message);
+  }
+});
+
+presenceReallowBtn?.addEventListener('click', async () => {
+  try {
+    const handle = await PresenceFolder.loadHandle();
+    if (!handle) return;
+    await handle.requestPermission({ mode: 'readwrite' });
+    await presenceRenderFolderStatus();
+  } catch (e) {
+    console.warn('[Presence folder re-allow]', e.message);
+  }
+});
+
+presenceForgetFolderBtn?.addEventListener('click', async () => {
+  try {
+    await PresenceFolder.clearHandle();
+    await presenceRenderFolderStatus();
+  } catch (e) {
+    console.warn('[Presence folder disconnect]', e.message);
+  }
+});
+
+savePresenceBtn?.addEventListener('click', async () => {
+  const url = (presenceUrlInput?.value || '').trim().replace(/\/+$/, '');
+  // Same gate the content script applies (validPresenceConfig): https on
+  // *.supabase.co, matching the manifest host permission. Reject here so a
+  // typo is a visible error at save time, not a silently-dormant feature.
+  if (url) {
+    let ok = false;
+    try {
+      const u = new URL(url);
+      ok = u.protocol === 'https:' && /^[a-z0-9-]+\.supabase\.co$/i.test(u.hostname);
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) {
+      alert('Store URL must be https://<project>.supabase.co');
+      return;
+    }
+  }
+  const presenceOn = presenceEnabledInput ? presenceEnabledInput.checked === true : true;
+  await chrome.storage.local.set({
+    'presence.enabled': presenceOn,
+    'suite.ui.taskPresence': presenceOn,
+    'presence.url': url,
+    'presence.key': (presenceKeyInput?.value || '').trim(),
+    'presence.name': (presenceNameInput?.value || '').trim(),
+  });
+  if (presenceSaved) {
+    presenceSaved.classList.add('show');
+    setTimeout(() => presenceSaved.classList.remove('show'), 2000);
+  }
+});
+
+// ── Capacity Forecast preset editor ──────────────────────────────────────────
+
+const presetEditor = document.getElementById('capPresetEditor');
+let editingPresetId = null;
+let availableTypes = []; // {id, name} from API
+
+async function loadAvailableTypes() {
+  // Prefer tab-detected code, fall back to storage
+  let siteId = null;
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://*.medicus.health/*' });
+    for (const t of tabs) {
+      const m = t.url && t.url.match(/england\.medicus\.health\/([a-f0-9]{4,8})\//i);
+      if (m?.[1]) {
+        siteId = m[1].toLowerCase();
+        break;
+      }
+    }
+  } catch (e) {}
+  if (!siteId) {
+    const stored = await chrome.storage.local.get('suite.practiceCode');
+    siteId = stored['suite.practiceCode'] || null;
+  }
+  if (!siteId) return [];
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const url = `https://${siteId}.api.england.medicus.health/scheduling/data/appointment-book/embedded-overview?date=${today}&filterByUsualLocation=false`;
+    const r = await fetch(url, { credentials: 'include' });
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.appointmentTypeOptions || [])
+      .map((t) => ({ id: t.label, name: t.label }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
+async function renderPresetEditor() {
+  if (!presetEditor) return;
+  const { 'capacity.presets': presets = [] } = await chrome.storage.local.get('capacity.presets');
+
+  if (availableTypes.length === 0) availableTypes = await loadAvailableTypes();
+
+  presetEditor.innerHTML = `
+    <div class="preset-list">
+      ${
+        presets.length === 0
+          ? '<div style="color:var(--text-4);font-size:12px;padding:8px 0">No presets yet — create one below.</div>'
+          : presets
+              .map(
+                (p) => `
+        <div class="preset-card">
+          <div class="preset-card-header">
+            <div class="preset-card-name">${escHtml(p.name)}</div>
+            <div class="preset-card-actions">
+              <button class="pc-btn" data-edit="${escAttr(p.id)}">Edit</button>
+              <button class="pc-btn danger" data-delete="${escAttr(p.id)}">Delete</button>
+            </div>
+          </div>
+          <div class="preset-card-meta">
+            <span>${capPresetMinimumSummary(p)}</span>
+            <span>Tight at ${p.thresholds?.tight ?? 75}%</span>
+            <span>Low at ${p.thresholds?.low ?? 50}%</span>
+            <span>${p.slotTypes.length} slot type${p.slotTypes.length !== 1 ? 's' : ''}</span>
+          </div>
+          <div class="preset-card-types">${escHtml(p.slotTypes.slice(0, 3).join(', '))}${p.slotTypes.length > 3 ? ` and ${p.slotTypes.length - 3} more` : ''}</div>
+        </div>
+      `
+              )
+              .join('')
+      }
+    </div>
+    <button class="add-preset-btn" id="addPresetBtn">+ New preset</button>
+  `;
+
+  presetEditor
+    .querySelectorAll('[data-edit]')
+    .forEach((b) => b.addEventListener('click', () => openForm(b.dataset.edit)));
+  presetEditor
+    .querySelectorAll('[data-delete]')
+    .forEach((b) => b.addEventListener('click', () => deletePreset(b.dataset.delete)));
+  presetEditor.querySelector('#addPresetBtn')?.addEventListener('click', () => openForm(null));
+}
+
+async function openForm(presetId) {
+  editingPresetId = presetId;
+  const { 'capacity.presets': presets = [] } = await chrome.storage.local.get('capacity.presets');
+  const editingRaw = presetId ? presets.find((p) => p.id === presetId) : null;
+  const editing = editingRaw
+    ? { ...editingRaw, minimumByDay: editingRaw.minimumByDay || capDefaultMinimumByDay(editingRaw.minimumPerDay) }
+    : null;
+  const p = editing || {
+    name: '',
+    slotTypes: [],
+    minimumByDay: { mon: 20, tue: 20, wed: 20, thu: 20, fri: 20, sat: 0, sun: 0 },
+    thresholds: { tight: 75, low: 50 },
+  };
+
+  if (availableTypes.length === 0) {
+    availableTypes = await loadAvailableTypes();
+  }
+
+  // Merge available types with any saved types not currently visible (so unknown saved types still show)
+  const allTypeNames = new Set([...availableTypes.map((t) => t.name), ...p.slotTypes]);
+  const sortedTypes = Array.from(allTypeNames).sort();
+
+  const weekdayInputs = CAP_WEEKDAYS.map(
+    (d) => `
+    <div class="cap-day-min">
+      <label class="cap-day-min-label">${d.label}</label>
+      <input type="number" class="cap-day-min-input" data-day="${d.key}" value="${p.minimumByDay[d.key] ?? 0}" min="0" max="999" />
+    </div>
+  `
+  ).join('');
+
+  presetEditor.innerHTML = `
+    <div class="preset-form">
+      <h3>${editing ? 'Edit preset' : 'New preset'}</h3>
+      <div class="form-row full">
+        <label>Name</label>
+        <input type="text" id="fName" value="${escAttr(p.name)}" placeholder="e.g. GP Routine" />
+      </div>
+      <div class="form-row full">
+        <div class="cap-min-label-row">
+          <label>Minimum free slots per weekday</label>
+          <button type="button" class="cap-copy-mon" id="fCopyMon">Copy Mon to all weekdays</button>
+        </div>
+        <div class="cap-day-mins-row">${weekdayInputs}</div>
+        <div class="cap-min-hint">Set 0 for days when no minimum applies (e.g. weekends, half-day clinics).</div>
+      </div>
+      <div class="form-row full">
+        <label>Thresholds (% of minimum)</label>
+        <div class="threshold-row">
+          <span>Tight at</span>
+          <input type="number" id="fTight" value="${p.thresholds?.tight ?? 75}" min="1" max="99" />
+          <span>%, Low at</span>
+          <input type="number" id="fLow" value="${p.thresholds?.low ?? 50}" min="1" max="99" />
+          <span>%</span>
+        </div>
+      </div>
+      <div class="form-row full">
+        <label>Slot types (${p.slotTypes.length} selected)</label>
+        <div class="types-multiselect" id="fTypes">
+          ${
+            sortedTypes.length === 0
+              ? '<div style="color:var(--text-4);padding:8px;font-size:11px;font-family:var(--sans)">No slot types loaded. Set the practice code in Suite tab first.</div>'
+              : sortedTypes
+                  .map(
+                    (t) => `
+            <label class="type-check-row">
+              <input type="checkbox" value="${escAttr(t)}" ${p.slotTypes.includes(t) ? 'checked' : ''} />
+              <label>${escHtml(t)}</label>
+            </label>
+          `
+                  )
+                  .join('')
+          }
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="add-preset-btn" id="fSave">${editing ? 'Save changes' : 'Create preset'}</button>
+        <button class="ghost-btn-opt" id="fCancel">Cancel</button>
+      </div>
+    </div>
+  `;
+
+  presetEditor.querySelector('#fSave').addEventListener('click', () => savePreset(editing));
+  presetEditor.querySelector('#fCancel').addEventListener('click', renderPresetEditor);
+  presetEditor.querySelector('#fCopyMon')?.addEventListener('click', () => {
+    const monVal = presetEditor.querySelector('input[data-day="mon"]').value;
+    ['tue', 'wed', 'thu', 'fri'].forEach((d) => {
+      const el = presetEditor.querySelector(`input[data-day="${d}"]`);
+      if (el) el.value = monVal;
+    });
+  });
+}
+
+async function savePreset(editing) {
+  const name = presetEditor.querySelector('#fName').value.trim();
+  const minimumByDay = {};
+  CAP_WEEKDAYS.forEach((d) => {
+    const el = presetEditor.querySelector(`input[data-day="${d.key}"]`);
+    minimumByDay[d.key] = parseInt(el?.value, 10) || 0;
+  });
+  const tightRaw = parseInt(presetEditor.querySelector('#fTight').value, 10);
+  const lowRaw = parseInt(presetEditor.querySelector('#fLow').value, 10);
+  const tight = Number.isFinite(tightRaw) ? tightRaw : 75;
+  const low = Number.isFinite(lowRaw) ? lowRaw : 50;
+  const slotTypes = Array.from(presetEditor.querySelectorAll('#fTypes input[type=checkbox]:checked')).map(
+    (i) => i.value
+  );
+
+  if (!name) {
+    alert('Preset needs a name.');
+    return;
+  }
+  if (slotTypes.length === 0) {
+    alert('Select at least one slot type.');
+    return;
+  }
+  if (tight < 0 || low < 0) {
+    alert('Thresholds must be non-negative.');
+    return;
+  }
+  if (low >= tight) {
+    alert('Low threshold must be below Tight threshold.');
+    return;
+  }
+  if (tight >= 100 || low >= 100) {
+    alert('Thresholds must be below 100%.');
+    return;
+  }
+
+  const { 'capacity.presets': presets = [] } = await chrome.storage.local.get('capacity.presets');
+
+  const preset = editing
+    ? { ...editing, name, slotTypes, minimumByDay, thresholds: { tight, low } }
+    : {
+        id: 'p_' + Math.random().toString(36).slice(2, 10),
+        name,
+        slotTypes,
+        minimumByDay,
+        thresholds: { tight, low },
+        createdAt: new Date().toISOString(),
+      };
+  delete preset.minimumPerDay;
+
+  const updated = editing ? presets.map((p) => (p.id === editing.id ? preset : p)) : [...presets, preset];
+
+  await chrome.storage.local.set({ 'capacity.presets': updated });
+
+  // Set as active if it's the first one
+  if (!editing && updated.length === 1) {
+    await chrome.storage.local.set({ 'capacity.activePresetId': preset.id });
+  }
+
+  renderPresetEditor();
+}
+
+async function deletePreset(presetId) {
+  if (!confirm('Delete this preset?')) return;
+  const { 'capacity.presets': presets = [], 'capacity.activePresetId': activeId } = await chrome.storage.local.get([
+    'capacity.presets',
+    'capacity.activePresetId',
+  ]);
+  const updated = presets.filter((p) => p.id !== presetId);
+  const newActive = activeId === presetId ? updated[0]?.id || null : activeId;
+  await chrome.storage.local.set({ 'capacity.presets': updated, 'capacity.activePresetId': newActive });
+  renderPresetEditor();
+}
+
+// Render editor when Capacity tab is opened
+document.querySelectorAll('.nav-item').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.section === 'capacity') renderPresetEditor();
+  });
+});
+
+// ── Phase 2: Backup & Restore ─────────────────────────────────────────────────
+// Uses SuiteEnvelope from shared/io/suite-envelope.js (loaded as a script tag).
+// IO functions are inlined here to avoid ES module issues in options pages.
+
+// --- Backup helpers — delegate to per-module IO files (loaded in options.html).
+//     See shared/io/suite-envelope.js for the convention: when you add a new
+//     storage key, update the relevant shared/io/<module>-io.js only. ---
+
+async function doFullExport() {
+  const [
+    capacity,
+    triage,
+    triageAlerts,
+    slots,
+    submissions,
+    popout,
+    referrals,
+    requestMonitor,
+    reception,
+    knowledge,
+    notifications,
+    leaflets,
+    patientAlerts,
+    problemDescriptionCleanup,
+    phrases,
+    rota,
+    allocationGroups,
+    stackchan,
+    templateOrganiser,
+    availability,
+  ] = await Promise.all([
+    capacityExport(),
+    triageExport(),
+    TriageAlertIO.exportData(),
+    slotCounterExport(),
+    submissionsExport(),
+    popoutExport(),
+    referralsExport(),
+    requestMonitorExport(),
+    receptionExport(),
+    knowledgeExport(),
+    notificationsExport(),
+    leafletsExport(),
+    patientAlertsExport(),
+    problemDescriptionCleanupExport(),
+    phrasesExport(),
+    rotaExport(),
+    allocationGroupsExport(),
+    stackchanExport(),
+    templateOrganiserExport(),
+    availabilityExport(),
+  ]);
+  const suite = await suiteExport();
+  return window.SuiteEnvelope.wrap(
+    'suite',
+    {
+      sentinel,
+      capacity,
+      triage,
+      triageAlerts,
+      slots,
+      submissions,
+      popout,
+      referrals,
+      requestMonitor,
+      reception,
+      knowledge,
+      notifications,
+      leaflets,
+      patientAlerts,
+      problemDescriptionCleanup,
+      phrases,
+      rota,
+      allocationGroups,
+      stackchan,
+      templateOrganiser,
+      availability,
+      suite,
+    },
+    chrome.runtime.getManifest().version
+  );
+}
+
+async function doModuleExport(scope) {
+  const exporters = {
+    capacity: () => capacityExport(),
+    triage: () => triageExport(),
+    triageAlerts: () => TriageAlertIO.exportData(),
+    slots: () => slotCounterExport(),
+    submissions: () => submissionsExport(),
+    popout: () => popoutExport(),
+    referrals: () => referralsExport(),
+    requestMonitor: () => requestMonitorExport(),
+    reception: () => receptionExport(),
+    knowledge: () => knowledgeExport(),
+    notifications: () => notificationsExport(),
+    leaflets: () => leafletsExport(),
+    patientAlerts: () => patientAlertsExport(),
+    problemDescriptionCleanup: () => problemDescriptionCleanupExport(),
+    phrases: () => phrasesExport(),
+    rota: () => rotaExport(),
+    allocationGroups: () => allocationGroupsExport(),
+    stackchan: () => stackchanExport(),
+    templateOrganiser: () => templateOrganiserExport(),
+    availability: () => availabilityExport(),
+  };
+  if (!exporters[scope]) throw new Error('Unknown scope: ' + scope);
+  const data = await exporters[scope]();
+  // Real manifest version (audit M18: the envelope's fallback stamped every
+  // backup "2.5.0", defeating the preview's provenance line).
+  return window.SuiteEnvelope.wrap(scope, { [scope]: data }, chrome.runtime.getManifest().version);
+}
+
+async function applyEnvelope(envelope) {
+  const mods = envelope.modules || {};
+  const notes = [];
+  // Build task list in the same order as doFullExport to make auditing straightforward.
+  // Only include modules that are present in this backup (same mods.X && gating).
+  // applyWithRollback runs them sequentially; if any throws, all writes are rolled back.
+  const tasks = [
+    mods.capacity && (() => capacityImport(mods.capacity)),
+    mods.triage && (() => triageImport(mods.triage)),
+    mods.triageAlerts && (() => TriageAlertIO.importData(mods.triageAlerts)),
+    mods.slots && (() => slotCounterImport(mods.slots)),
+    mods.submissions && (() => submissionsImport(mods.submissions)),
+    mods.popout && (() => popoutImport(mods.popout)),
+    mods.referrals && (() => referralsImport(mods.referrals)),
+    mods.requestMonitor && (() => requestMonitorImport(mods.requestMonitor)),
+    mods.reception && (() => receptionImport(mods.reception)),
+    mods.knowledge && (() => knowledgeImport(mods.knowledge)),
+    mods.notifications && (() => notificationsImport(mods.notifications)),
+    mods.leaflets && (() => leafletsImport(mods.leaflets)),
+    mods.patientAlerts &&
+      (async () => {
+        const res = await patientAlertsImport(mods.patientAlerts);
+        if (res && res.skippedByPatient) {
+          notes.push(
+            'Patient Alerts: per-patient flags were not restored (PHI stays off suite backups). Presets still imported.'
+          );
+        }
+      }),
+    mods.problemDescriptionCleanup && (() => problemDescriptionCleanupImport(mods.problemDescriptionCleanup)),
+    mods.phrases && (() => phrasesImport(mods.phrases)),
+    mods.rota && (() => rotaImport(mods.rota)),
+    mods.allocationGroups && (() => allocationGroupsImport(mods.allocationGroups)),
+    mods.stackchan && (() => stackchanImport(mods.stackchan)),
+    mods.templateOrganiser && (() => templateOrganiserImport(mods.templateOrganiser)),
+    mods.availability && (() => availabilityImport(mods.availability)),
+    mods.suite && (() => suiteImport(mods.suite)),
+  ].filter(Boolean);
+  await window.SuiteEnvelope.applyWithRollback(tasks);
+  if (mods.knowledge && window.KnowledgeSync) {
+    try {
+      await window.KnowledgeSync.pushLiveKnowledge({ requestPermission: true });
+    } catch (_) {
+      /* local restore still succeeded; share is best-effort */
+    }
+  }
+  return { notes };
+}
+
+function downloadJson(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function setBackupStatus(msg, isError) {
+  const targets = [document.getElementById('backupOutcome'), document.getElementById('backupStatus')].filter(Boolean);
+  for (const el of targets) {
+    el.textContent = msg || '';
+    el.style.display = msg ? 'block' : 'none';
+    el.style.color = isError ? '#ef4444' : '#166534';
+    el.style.background = isError ? 'rgba(239, 68, 68, 0.1)' : 'rgba(74, 222, 128, 0.12)';
+    el.style.border = '1px solid ' + (isError ? '#ef4444' : '#4ade80');
+    el.style.fontWeight = isError ? '600' : '500';
+    el.setAttribute('role', 'status');
+  }
+}
+
+// --- Pending import state ---
+let pendingEnvelope = null;
+
+// --- Suite-wide export ---
+document.getElementById('exportSuite')?.addEventListener('click', async () => {
+  try {
+    const env = await doFullExport();
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadJson(env, `medicus-suite-backup-${stamp}.json`);
+    setBackupStatus('Suite backup downloaded.');
+  } catch (e) {
+    setBackupStatus('Export failed: ' + e.message, true);
+  }
+});
+
+// --- Suite-wide import: open file picker ---
+document.getElementById('importSuiteBtn')?.addEventListener('click', () => {
+  document.getElementById('importSuiteFile')?.click();
+});
+
+document.getElementById('importSuiteFile')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = '';
+  const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // 10 MB
+  if (file.size > MAX_BACKUP_BYTES) {
+    setBackupStatus('Backup file is too large (max 10 MB). Import cancelled.', true);
+    return;
+  }
+  try {
+    const text = await file.text();
+    const raw = JSON.parse(text);
+    const { valid, errors, warnings, envelope } = window.SuiteEnvelope.unwrap(raw);
+    if (!valid) {
+      setBackupStatus('Invalid backup: ' + errors.join('; '), true);
+      return;
+    }
+    pendingEnvelope = envelope;
+    const lines = window.SuiteEnvelope.previewEnvelope(envelope);
+    const previewBox = document.getElementById('importPreviewBox');
+    if (previewBox) previewBox.textContent = lines.join('\n');
+    const warnEl = document.getElementById('importWarnings');
+    if (warnEl) warnEl.textContent = warnings.length ? 'Warnings: ' + warnings.join('; ') : '';
+    const previewWrap = document.getElementById('importPreviewWrap');
+    if (previewWrap) previewWrap.style.display = 'block';
+  } catch (err) {
+    setBackupStatus('Could not read backup: ' + err.message, true);
+  }
+});
+
+document.getElementById('confirmImportBtn')?.addEventListener('click', async () => {
+  if (!pendingEnvelope) return;
+  try {
+    const result = await applyEnvelope(pendingEnvelope);
+    pendingEnvelope = null;
+    const previewWrap = document.getElementById('importPreviewWrap');
+    if (previewWrap) previewWrap.style.display = 'none';
+    const noteSuffix = result && result.notes && result.notes.length ? ` (${result.notes.join('; ')})` : '';
+    setBackupStatus(`Restore complete${noteSuffix} — reloading settings page…`);
+    setTimeout(() => window.location.reload(), 1500);
+  } catch (err) {
+    setBackupStatus('Restore failed: ' + err.message, true);
+  }
+});
+
+document.getElementById('cancelImportBtn')?.addEventListener('click', () => {
+  pendingEnvelope = null;
+  const previewWrap = document.getElementById('importPreviewWrap');
+  if (previewWrap) previewWrap.style.display = 'none';
+});
+
+// --- Reset all ---
+document.getElementById('resetAllBtn')?.addEventListener('click', async () => {
+  if (!confirm('This will delete all Medicus Suite settings and cannot be undone. Continue?')) return;
+  if (!confirm('Are you sure? All presets, rules, and config will be cleared.')) return;
+  await chrome.storage.local.clear();
+  setBackupStatus('All settings cleared. Reload the page to see defaults.');
+});
+
+// --- Per-module export/import ---
+document.querySelectorAll('[data-mod-export]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const scope = btn.dataset.modExport;
+    try {
+      const env = await doModuleExport(scope);
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadJson(env, `medicus-${scope}-backup-${stamp}.json`);
+      setBackupStatus(`${scope} backup downloaded.`);
+    } catch (e) {
+      setBackupStatus(`Export failed: ${e.message}`, true);
+    }
+  });
+});
+
+document.querySelectorAll('[data-mod-import]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const scope = btn.dataset.modImport;
+    const fileInput = btn.closest('.module-export-card')?.querySelector('.mod-file-input[data-mod="' + scope + '"]');
+    fileInput?.click();
+  });
+});
+
+document.querySelectorAll('.mod-file-input').forEach((input) => {
+  input.addEventListener('change', async (e) => {
+    const scope = input.dataset.mod;
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    if (file.size > 10 * 1024 * 1024) {
+      setBackupStatus('File is too large (max 10 MB). Import cancelled.', true);
+      return;
+    }
+    try {
+      const text = await file.text();
+      const raw = JSON.parse(text);
+      const { valid, errors, warnings, envelope } = window.SuiteEnvelope.unwrap(raw, scope);
+      if (!valid) {
+        setBackupStatus('Invalid file: ' + errors.join('; '), true);
+        return;
+      }
+      const lines = window.SuiteEnvelope.previewEnvelope(envelope);
+      const msg = `Import ${scope}?\n\n${lines.join('\n')}${warnings.length ? '\n\nWarnings:\n' + warnings.join('\n') : ''}`;
+      if (!confirm(msg)) return;
+      const result = await applyEnvelope(envelope);
+      const noteSuffix = result && result.notes && result.notes.length ? ` (${result.notes.join('; ')})` : '';
+      setBackupStatus(`${scope} restored${noteSuffix} — reloading settings page…`);
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (err) {
+      setBackupStatus('Import failed: ' + err.message, true);
+    }
+  });
+});
+
+// ── Shared: the single "Accept for practice" action ──────────────────────────
+// Used by BOTH the Clinical Safety card and the Central attestations box. Sets the
+// suite-level flag plus the values the features need to actually be on (all
+// reception pathways enabled, alert library acknowledged). Honoured by the
+// reception/knowledge gates and the central-attestation gates; carried in a suite
+// backup so it propagates on restore.
+async function _allReceptionPathwayIds() {
+  const ids = {};
+  try {
+    const r = await fetch(chrome.runtime.getURL('rules/reception-pathways.json'));
+    const doc = await r.json();
+    for (const p of doc.pathways || []) if (p && p.id) ids[p.id] = true;
+  } catch (_) {}
+  try {
+    const s = await chrome.storage.local.get('reception.customPathways');
+    for (const p of s['reception.customPathways'] || []) if (p && p.id) ids[p.id] = true;
+  } catch (_) {}
+  return ids;
+}
+async function acceptForPractice() {
+  const now = new Date().toISOString();
+  const ids = await _allReceptionPathwayIds();
+  const cfgR = await chrome.storage.local.get('reception.config');
+  const cfg = cfgR['reception.config'] || {};
+  cfg.enabledPathways = { ...(cfg.enabledPathways || {}), ...ids };
+  await chrome.storage.local.set({
+    'suite.practiceAcceptedAt': now,
+    'reception.config': cfg,
+    'sentinel.alertLibrary.acknowledged': true,
+  });
+}
+async function withdrawPracticeAcceptance() {
+  await chrome.storage.local.remove('suite.practiceAcceptedAt');
+}
+async function isPracticeAccepted() {
+  try {
+    const r = await chrome.storage.local.get('suite.practiceAcceptedAt');
+    return r['suite.practiceAcceptedAt'] != null;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ── Practice Profile (v3.0) ──────────────────────────────────────────────────
+
+(async function initPracticeProfileSection() {
+  try {
+    if (!window.PracticeProfile) return;
+
+    const statusBlock = document.getElementById('ppStatusBlock');
+    const badge = document.getElementById('ppBadge');
+    const checkBtn = document.getElementById('ppCheckBtn');
+    const applyBtn = document.getElementById('ppApplyBtn');
+    const actionStatus = document.getElementById('ppActionStatus');
+    const publishBtn = document.getElementById('ppPublishBtn');
+    const publishStatus = document.getElementById('ppPublishStatus');
+    const labelInput = document.getElementById('ppLabelInput');
+    const publishedByInput = document.getElementById('ppPublishedByInput');
+    const modulePicker = document.getElementById('ppModulePicker');
+    const attestationRows = document.getElementById('ppAttestationRows');
+
+    if (!statusBlock) return;
+
+    let _profile = null;
+
+    // ── Module picker definition ──────────────────────────────────────────────
+    const PUBLISHER_KEY = 'suite.practiceProfile.publisher';
+
+    const MODULE_DEFS = [
+      {
+        id: 'knowledge',
+        label: 'Knowledge',
+        defaultChecked: true,
+        defaultMode: 'replace',
+        desc: 'The Knowledge tab — referral criteria, contacts, local pathways',
+      },
+      {
+        id: 'reception',
+        label: 'Reception',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Reception capture pathways and which ones are enabled',
+      },
+      {
+        id: 'triage',
+        label: 'Triage Lens',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Triage Lens settings, custom rules and thresholds',
+      },
+      {
+        id: 'triageAlerts',
+        label: 'Triage Capacity Alerts',
+        defaultChecked: false,
+        defaultMode: 'merge',
+        desc: 'Capacity-based triage alert rules',
+      },
+      {
+        id: 'slots',
+        label: 'Slot Counter',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Slot counter hidden types and alert rules',
+      },
+      {
+        id: 'submissions',
+        label: 'Submissions Tracker',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Submissions config and thresholds',
+      },
+      {
+        id: 'capacity',
+        label: 'Capacity Forecast',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Capacity forecast presets',
+      },
+      {
+        id: 'problemDescriptionCleanup',
+        label: 'Cleanup Code Preferences',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Learned SNOMED replacement-code preferences — tallies always combine; "enforce" makes a pinned override the practice-wide default',
+      },
+      {
+        id: 'referrals',
+        label: 'Referrals',
+        defaultChecked: false,
+        defaultMode: 'merge',
+        desc: 'Referrals tracker config (not locally discovered data)',
+      },
+      {
+        id: 'requestMonitor',
+        label: 'Request Monitor',
+        defaultChecked: false,
+        defaultMode: 'merge',
+        desc: 'Request monitor config and assignee',
+      },
+      {
+        id: 'allocationGroups',
+        label: 'Allocation groups',
+        defaultChecked: true,
+        defaultMode: 'replace',
+        desc: 'Replace: every group on this computer is replaced by the practice set. Merge: adds the practice groups and keeps yours.',
+      },
+      {
+        id: 'stackchan',
+        label: 'StackChan desk robot',
+        defaultChecked: false,
+        defaultMode: 'merge',
+        desc: 'LAN URL and enable flag for the desk robot. Off by default. Never carries patient data.',
+      },
+      {
+        id: 'availability',
+        label: 'Availability wall',
+        defaultChecked: false,
+        defaultMode: 'merge',
+        desc: 'Tile mapping for the triage-room availability wall. Merge fills a PC that has no saved mapping. Replace overwrites it.',
+      },
+      {
+        id: 'suite',
+        label: 'Practice code, feedback email and feature packs',
+        defaultChecked: true,
+        defaultMode: 'merge',
+        desc: 'Practice code, feedback email, and the feature packs that travel with the practice profile. Merge is sticky-on for a pack that is already on. Never personal display prefs or Accept-for-practice',
+      },
+    ];
+
+    // ── Central attestation gates ─────────────────────────────────────────────
+    // Each gate corresponds to a clinical attestation the admin may have accepted
+    // locally. If accepted, the admin can opt to attest it centrally so managed
+    // users inherit it. The single suite-level "Accept for practice" switch
+    // (suite.practiceAcceptedAt) satisfies ALL of them at once, so it also unlocks
+    // every gate here. Default opted-in for accepted gates.
+    async function practiceAccepted() {
+      try {
+        const r = await chrome.storage.local.get('suite.practiceAcceptedAt');
+        return r['suite.practiceAcceptedAt'] != null;
+      } catch (_) {
+        return false;
+      }
+    }
+    const GATE_DEFS = [
+      {
+        id: 'reception',
+        label: 'Reception disclaimer',
+        async accepted() {
+          try {
+            if (await practiceAccepted()) return true;
+            const r = await chrome.storage.local.get('reception.config');
+            return r['reception.config']?.disclaimerAcceptedAt != null;
+          } catch (_) {
+            return false;
+          }
+        },
+      },
+      {
+        id: 'knowledge',
+        label: 'Knowledge notice',
+        async accepted() {
+          try {
+            if (await practiceAccepted()) return true;
+            const r = await chrome.storage.local.get('knowledge.config');
+            return r['knowledge.config']?.noticeAcknowledgedAt != null;
+          } catch (_) {
+            return false;
+          }
+        },
+      },
+    ];
+
+    async function buildAttestationRows() {
+      if (!attestationRows) return;
+      attestationRows.innerHTML = '';
+      for (const g of GATE_DEFS) {
+        const accepted = await g.accepted();
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:8px; line-height:1.4;';
+
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.id = `ppAtt_${g.id}`;
+        chk.style.cssText = 'width:14px; height:14px; flex-shrink:0;';
+        chk.checked = accepted; // default opted-in for accepted gates
+        chk.disabled = !accepted;
+
+        const lbl = document.createElement('label');
+        lbl.htmlFor = `ppAtt_${g.id}`;
+        if (accepted) {
+          lbl.style.cssText = 'flex:1; cursor:pointer; color:var(--text-1);';
+          lbl.innerHTML = `<span style="font-weight:500;">${escHtml(g.label)}</span> <span style="color:var(--text-3);">— will be attested centrally</span>`;
+          chk.style.cursor = 'pointer';
+        } else {
+          row.style.opacity = '0.55';
+          lbl.style.cssText = 'flex:1; color:var(--text-3);';
+          lbl.innerHTML = `<span style="font-weight:500;">${escHtml(g.label)}</span> <span>— accept it yourself first to attest centrally</span>`;
+        }
+
+        row.appendChild(chk);
+        row.appendChild(lbl);
+        attestationRows.appendChild(row);
+      }
+      // Inline accept appears only until the practice has accepted, so the greyed
+      // gates can be unlocked right here without leaving for Clinical Safety.
+      const acceptInline = document.getElementById('ppAcceptInline');
+      if (acceptInline) acceptInline.style.display = (await isPracticeAccepted()) ? 'none' : '';
+    }
+
+    // ── FileSystemFileHandle persistence ──────────────────────────────────────
+    // Delegated to shared/io/fs-handle-store.js (extracted so
+    // shared/io/pdc-contribute.js can store its OWN handle under the same
+    // IndexedDB database without reaching into the publisher's). This
+    // section's own handle is keyed 'profileFile', unchanged from before.
+
+    async function loadFileHandle() {
+      return window.FsHandleStore.loadFileHandle('profileFile');
+    }
+
+    async function saveFileHandle(handle) {
+      return window.FsHandleStore.saveFileHandle(handle, 'profileFile');
+    }
+
+    // ── Status helpers ────────────────────────────────────────────────────────
+
+    function setPPStatus(msg, isError = false) {
+      if (!actionStatus) return;
+      actionStatus.textContent = msg;
+      actionStatus.style.color = isError ? '#ef4444' : 'var(--text-3)';
+      if (msg)
+        setTimeout(() => {
+          if (actionStatus.textContent === msg) actionStatus.textContent = '';
+        }, 4000);
+    }
+
+    function setPublishStatus(msg, isError = false) {
+      if (!publishStatus) return;
+      publishStatus.textContent = msg;
+      publishStatus.style.color = isError ? '#ef4444' : 'var(--text-3)';
+      if (msg)
+        setTimeout(() => {
+          if (publishStatus.textContent === msg) publishStatus.textContent = '';
+        }, 6000);
+    }
+
+    // ── Render status block ───────────────────────────────────────────────────
+
+    async function render() {
+      _profile = await window.PracticeProfile.fetchProfile();
+      const stored = await window.PracticeProfile.getStatus();
+
+      if (!_profile) {
+        statusBlock.innerHTML =
+          `<span style="color:var(--text-3);">No <code>practice-profile.json</code> found in the extension folder.</span><br>` +
+          `<span style="font-size:11px; color:var(--text-3);">Use <em>Publish to shared folder</em> below to create one. ` +
+          `See the setup guide for first-time instructions.</span>`;
+        if (badge) badge.style.display = 'none';
+        if (applyBtn) applyBtn.style.display = 'none';
+        return;
+      }
+
+      const incomingVersion = _profile.profileVersion;
+      const currentVersion = stored?.lastAppliedVersion;
+      const hasUpdate = currentVersion !== incomingVersion;
+      const appliedAt = stored?.lastAppliedAt ? new Date(stored.lastAppliedAt).toLocaleString() : null;
+      const autoApply = _profile.apply?.autoApplyOnStartup !== false;
+
+      let html =
+        `<div><strong>Profile found:</strong> ${escHtml(_profile.profileLabel || '(no label)')}</div>` +
+        `<div><strong>Version in folder:</strong> <code style="font-family:var(--mono);font-size:11px">${escHtml(incomingVersion)}</code></div>` +
+        `<div><strong>Auto-apply on startup:</strong> ${autoApply ? 'yes' : 'no'}</div>`;
+
+      if (stored?.lastAppliedVersion) {
+        html +=
+          `<div style="margin-top:4px;"><strong>Last applied:</strong> ` +
+          `<code style="font-family:var(--mono);font-size:11px">${escHtml(stored.lastAppliedVersion)}</code>` +
+          ` on ${escHtml(appliedAt || '—')}` +
+          `</div>`;
+      } else {
+        html += `<div style="margin-top:4px; color:var(--text-3);">Not yet applied on this install.</div>`;
+      }
+
+      if (stored?.lastCheckedAt) {
+        html += `<div style="margin-top:4px; font-size:11px; color:var(--text-3);">This PC last looked for profile updates at ${escHtml(new Date(stored.lastCheckedAt).toLocaleString())}.</div>`;
+      }
+
+      if (hasUpdate) {
+        html += `<div style="margin-top:6px; color:var(--accent); font-weight:500;">&#8593; A newer version is ready to apply.</div>`;
+      }
+
+      statusBlock.innerHTML = html;
+      if (badge) badge.style.display = hasUpdate ? '' : 'none';
+      if (applyBtn) applyBtn.style.display = hasUpdate || !stored?.lastAppliedVersion ? '' : 'none';
+    }
+
+    // ── Build module picker rows ──────────────────────────────────────────────
+
+    async function buildModulePicker() {
+      if (!modulePicker) return;
+
+      // Load persisted publisher state
+      let saved = {};
+      try {
+        const r = await chrome.storage.local.get(PUBLISHER_KEY);
+        saved = r[PUBLISHER_KEY] || {};
+      } catch (_) {}
+
+      // Pre-fill label and publishedBy
+      if (labelInput) {
+        const existingLabel = _profile?.profileLabel || saved.label || '';
+        labelInput.value = existingLabel;
+      }
+      if (publishedByInput) {
+        let byVal = saved.publishedBy || _profile?.publishedBy || '';
+        if (!byVal) {
+          try {
+            const r = await chrome.storage.local.get('suite.feedbackEmail');
+            byVal = r['suite.feedbackEmail'] || '';
+          } catch (_) {}
+        }
+        publishedByInput.value = byVal;
+      }
+
+      modulePicker.innerHTML = '';
+
+      for (const mod of MODULE_DEFS) {
+        const savedMod = (saved.modules || {})[mod.id] || {};
+        const isChecked = savedMod.checked !== undefined ? savedMod.checked : mod.defaultChecked;
+        const modeVal = savedMod.mode !== undefined ? savedMod.mode : mod.defaultMode;
+
+        const row = document.createElement('div');
+        row.style.cssText =
+          'display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:4px; background:var(--bg-mid);';
+
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.id = `ppMod_${mod.id}`;
+        chk.checked = isChecked;
+        chk.style.cssText = 'width:14px; height:14px; flex-shrink:0; cursor:pointer;';
+
+        const lbl = document.createElement('label');
+        lbl.htmlFor = `ppMod_${mod.id}`;
+        lbl.innerHTML = `<span style="font-weight:500; color:var(--text-1);">${mod.label}</span> <span style="color:var(--text-3);">— ${escHtml(mod.desc)}</span>`;
+        lbl.style.cssText = 'flex:1; cursor:pointer; line-height:1.4;';
+
+        const sel = document.createElement('select');
+        sel.id = `ppModMode_${mod.id}`;
+        sel.style.cssText =
+          'font-size:10px; padding:2px 4px; border:1px solid var(--border); border-radius:4px; background:var(--bg-elev); color:var(--text-1); cursor:pointer;';
+        const optMerge = document.createElement('option');
+        optMerge.value = 'merge';
+        optMerge.textContent = 'Fill gaps only (merge)';
+        const optReplace = document.createElement('option');
+        optReplace.value = 'replace';
+        optReplace.textContent = 'Enforce for everyone (replace)';
+        sel.appendChild(optMerge);
+        sel.appendChild(optReplace);
+        sel.value = modeVal;
+
+        row.appendChild(chk);
+        row.appendChild(lbl);
+        row.appendChild(sel);
+        modulePicker.appendChild(row);
+      }
+    }
+
+    // ── Persist picker state ──────────────────────────────────────────────────
+
+    async function savePickerState() {
+      const modules = {};
+      for (const mod of MODULE_DEFS) {
+        const chk = document.getElementById(`ppMod_${mod.id}`);
+        const sel = document.getElementById(`ppModMode_${mod.id}`);
+        modules[mod.id] = {
+          checked: chk ? chk.checked : mod.defaultChecked,
+          mode: sel ? sel.value : mod.defaultMode,
+        };
+      }
+      const state = {
+        label: labelInput?.value || '',
+        publishedBy: publishedByInput?.value || '',
+        modules,
+      };
+      try {
+        await chrome.storage.local.set({ [PUBLISHER_KEY]: state });
+      } catch (_) {}
+    }
+
+    // ── Version auto-bump ─────────────────────────────────────────────────────
+
+    async function nextProfileVersion() {
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      try {
+        const existing = await window.PracticeProfile.fetchProfile();
+        if (existing && existing.profileVersion) {
+          const m = existing.profileVersion.match(/^(\d{4}-\d{2}-\d{2})\.(\d+)$/);
+          if (m && m[1] === today) {
+            return `${today}.${parseInt(m[2], 10) + 1}`;
+          }
+        }
+      } catch (_) {}
+      return `${today}.1`;
+    }
+
+    // ── Write to file helper ──────────────────────────────────────────────────
+
+    async function writeProfileToHandle(handle, json) {
+      const writable = await handle.createWritable();
+      await writable.write(json);
+      await writable.close();
+    }
+
+    // ── OIR test-dictionary key rotation ──────────────────────────────────────
+    // The mechanics (and the three rules that make them safe — built-in keys
+    // are never rotated, the retired ledger is cumulative, rotation never runs
+    // unattended) live in shared/io/oir-key-rotation.js, where they are
+    // directly testable; this file only wires them into the publish. Applies
+    // the rotation result to the envelope AND back to this machine's own
+    // triagelens.config — see applyOirRotation below.
+    async function applyOirRotation(envelope, publishedTriageConfig) {
+      const triageConfig = envelope?.modules?.triage?.config;
+      if (!triageConfig || !window.OirKeyRotation) return null;
+      const published = publishedTriageConfig || {};
+      const builtinKeys = (window.SentinelOutstandingMatch?.TEST_DEFS || []).map((d) => d && d.key).filter(Boolean);
+
+      // The ledgers are CUMULATIVE and must be republished on EVERY publish,
+      // rotation or not — a machine that was offline for the one cycle in which
+      // a retirement was published would otherwise never see it. Carry the
+      // currently-published ledgers forward first, so they survive even when
+      // rotation itself doesn't run (nothing published yet, no local
+      // dictionary, no built-in key set); the rotation result then supersedes
+      // them below with its own union.
+      if (Array.isArray(published.retiredOirTests)) triageConfig.retiredOirTests = published.retiredOirTests;
+      if (Array.isArray(published.retiredOirKeys)) triageConfig.retiredOirKeys = published.retiredOirKeys;
+      if (Array.isArray(published.supersededOirTests)) triageConfig.supersededOirTests = published.supersededOirTests;
+
+      const result = window.OirKeyRotation.rotateEditedOirTestKeys(triageConfig.oirTests, published.oirTests, {
+        attended: true, // never reached in auto mode — the helper refuses too
+        builtinKeys,
+        previousRetiredOirTests: published.retiredOirTests,
+        previousRetiredOirKeys: published.retiredOirKeys,
+        previousSupersededOirTests: published.supersededOirTests,
+      });
+      if (!result) return null;
+
+      triageConfig.oirTests = result.oirTests;
+      if (result.retiredOirTests.length > 0) triageConfig.retiredOirTests = result.retiredOirTests;
+      if (result.retiredOirKeys.length > 0) triageConfig.retiredOirKeys = result.retiredOirKeys;
+      if (result.supersededOirTests.length > 0) triageConfig.supersededOirTests = result.supersededOirTests;
+
+      // Publisher self-race: rotation used to mutate only the envelope, so this
+      // machine's own triagelens.config kept the OLD keys. A second edit before
+      // the alarm's self-apply then diffed the (already-rotated) published copy
+      // against unrotated local keys, found no key collision, and published with
+      // no rotation at all — resurrecting the duplicate. Adopt the rotated keys
+      // locally straight away so the next diff is honest.
+      if (result.rotated) {
+        try {
+          const r = await chrome.storage.local.get('triagelens.config');
+          const localCfg = r['triagelens.config'];
+          if (localCfg && typeof localCfg === 'object') {
+            await chrome.storage.local.set({
+              'triagelens.config': Object.assign({}, localCfg, { oirTests: result.oirTests }),
+            });
+          }
+        } catch (_) {}
+      }
+      return result;
+    }
+
+    // ── Publish handler ───────────────────────────────────────────────────────
+    // Attended-only: a real click, always. The unattended daily refresh that
+    // used to live here as opts.auto has moved to shared/io/pdc-contribute.js
+    // ("contributing" — see its own header for why that's a materially
+    // smaller, safer operation than fully automating this button ever was).
+    // A publish here is a deliberate, attended act: it says "this machine's
+    // settings are what the practice should have", so a full-profile
+    // overwrite of every module the admin has opted into is correct.
+
+    async function doPublish() {
+      if (!publishBtn) return;
+      publishBtn.disabled = true;
+      publishBtn.textContent = 'Publishing…';
+
+      try {
+        await savePickerState();
+
+        const label = labelInput?.value?.trim() || 'Practice defaults';
+        const publishedBy = publishedByInput?.value?.trim() || '';
+        const version = await nextProfileVersion();
+
+        // What's currently in the shared folder — read ONCE and reused by every
+        // merge below (pdc union, OIR rotation).
+        let sharedProfile = null;
+        try {
+          sharedProfile = await window.PracticeProfile.fetchProfile();
+        } catch (_) {
+          sharedProfile = null;
+        }
+
+        // Build apply.modules map
+        const applyModules = {};
+        for (const mod of MODULE_DEFS) {
+          const chk = document.getElementById(`ppMod_${mod.id}`);
+          const sel = document.getElementById(`ppModMode_${mod.id}`);
+          if (chk && chk.checked) {
+            applyModules[mod.id] = sel && sel.value === 'replace' ? 'replace' : 'merge';
+          }
+        }
+
+        let profileJson = null;
+        let envelope = null;
+
+        // ── Request Monitor ↔ practice-code coupling ──────────────────────────
+        // Request Monitor needs suite.practiceCode to make API calls on managed
+        // installs. If the admin published Request Monitor, ensure the suite
+        // module is ALSO included (so suite.practiceCode is applied) and the
+        // envelope carries the code. The code lives in ONE place (the suite
+        // module) — never duplicated into the requestMonitor section.
+        if (applyModules.requestMonitor) {
+          let localCode = '';
+          try {
+            const r = await chrome.storage.local.get('suite.practiceCode');
+            localCode = (r['suite.practiceCode'] || '').trim();
+          } catch (_) {}
+          if (!localCode) {
+            setPublishStatus(
+              'Request Monitor needs a practice code — set your practice code first, or it won’t work for managed users.',
+              true
+            );
+            return; // do NOT silently publish a request-monitor profile without the code
+          }
+          // Force the suite module in so suite.practiceCode is applied. Merge mode
+          // is safe (fills the gap without clobbering a user's own code).
+          if (!applyModules.suite) applyModules.suite = 'merge';
+        }
+
+        {
+          envelope = await doFullExport();
+
+          // ── Central practice attestation (SAFETY-CRITICAL) ──────────────────
+          // Only gates the admin has accepted locally AND not opted out of are
+          // attested. Only emit the block if at least one gate is true.
+          const gates = {};
+          for (const g of GATE_DEFS) {
+            const accepted = await g.accepted();
+            const chk = document.getElementById(`ppAtt_${g.id}`);
+            // opted-in = checkbox present, checked, and the gate is genuinely
+            // accepted locally (defensive — never attest a gate not locally held).
+            if (accepted && chk && chk.checked) gates[g.id] = true;
+          }
+          let practiceAttestation = null;
+          if (Object.keys(gates).length > 0) {
+            practiceAttestation = {
+              attestedBy: publishedBy,
+              attestedAt: new Date().toISOString(),
+              gates,
+            };
+          }
+
+          // Cleanup Code Preferences: merge with what's CURRENTLY shared rather
+          // than blindly overwriting it — see problem-description-cleanup-io.js's
+          // problemDescriptionCleanupMergeForPublish for why. Unlike every other
+          // module here (admin-curated from one machine, so overwrite-with-local
+          // is correct), this one accumulates from multiple machines' local
+          // usage — a raw overwrite could regress another machine's growth that
+          // hasn't made it back to THIS machine via a pull yet.
+          if (applyModules.problemDescriptionCleanup) {
+            const existingPdc = sharedProfile?.envelope?.modules?.problemDescriptionCleanup;
+            if (existingPdc) {
+              envelope.modules.problemDescriptionCleanup = problemDescriptionCleanupMergeForPublish(
+                existingPdc,
+                envelope.modules.problemDescriptionCleanup,
+                { includeOverride: true }
+              );
+            }
+            // Shared file missing/unreadable — publish this machine's own
+            // snapshot. Safe here (and only here): a manual publish IS the
+            // attended decision that this machine's state is the practice's.
+          }
+
+          // OIR test-dictionary key rotation — attended publishes only (the
+          // helper refuses without attended:true as well, so a future call site
+          // can't reintroduce unattended rotation by omission).
+          if (applyModules.triage) {
+            try {
+              await applyOirRotation(envelope, sharedProfile?.envelope?.modules?.triage?.config);
+            } catch (e) {
+              console.warn('[Practice Profile] OIR key rotation skipped:', e && e.message);
+            }
+          }
+
+          profileJson = {
+            format: 'medicus-suite-practice-profile',
+            formatVersion: 2,
+            profileVersion: version,
+            profileLabel: label,
+            publishedAt: new Date().toISOString(),
+            publishedBy: publishedBy,
+            apply: {
+              modules: applyModules,
+              autoApplyOnStartup: true,
+              checkEveryMinutes: 15,
+              autoReloadOnNewVersion: true,
+              notifyUserOnApply: false,
+            },
+            ...(practiceAttestation ? { practiceAttestation } : {}),
+            envelope,
+          };
+        }
+
+        const jsonStr = JSON.stringify(profileJson, null, 2);
+
+        // ACCEPTED LIMITATION — concurrent publishes are last-writer-wins.
+        // There is no lock on a shared network file: two admins publishing
+        // within the same window each read, merge and write, and the later
+        // write silently supersedes the earlier one. Mitigations, deliberately
+        // chosen over a locking scheme nobody would maintain: the one module
+        // that genuinely accumulates per-machine (Cleanup Code Preferences) is
+        // UNION-merged against the fetched shared copy rather than overwritten,
+        // so its content survives either ordering; everything else is
+        // admin-curated from one machine, and the losing publish is recovered
+        // simply by publishing again.
+        //
+        // Try remembered handle first.
+        let usedHandle = null;
+        if (typeof showSaveFilePicker === 'function') {
+          const remembered = await loadFileHandle();
+          if (remembered) {
+            try {
+              let perm = await remembered.queryPermission({ mode: 'readwrite' });
+              if (perm !== 'granted') {
+                perm = await remembered.requestPermission({ mode: 'readwrite' });
+              }
+              if (perm === 'granted') {
+                await writeProfileToHandle(remembered, jsonStr);
+                usedHandle = remembered;
+                setPublishStatus(
+                  `Published v${version} to ${remembered.name}. Other PCs will pick it up within about 15 minutes, or on their next browser start.`
+                );
+              }
+            } catch (_) {
+              // Permission denied or stale handle — fall through to picker.
+            }
+          }
+
+          if (!usedHandle) {
+            // Show save picker
+            let handle;
+            try {
+              handle = await showSaveFilePicker({
+                suggestedName: 'practice-profile.json',
+                types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+              });
+            } catch (err) {
+              if (err && err.name === 'AbortError') {
+                setPublishStatus('Publish cancelled.');
+                return;
+              }
+              throw err;
+            }
+            await writeProfileToHandle(handle, jsonStr);
+            await saveFileHandle(handle);
+            usedHandle = handle;
+            setPublishStatus(
+              `Published v${version}. Other PCs will pick it up within about 15 minutes, or on their next browser start.`
+            );
+          }
+        } else {
+          // Fallback: download via blob. The file lands in the user's Downloads
+          // folder and they still have to move it into the shared folder
+          // themselves — which they may never do.
+          downloadJson(profileJson, 'practice-profile.json');
+          setPublishStatus(
+            `Profile downloaded as practice-profile.json (v${version}). Move it into the shared extension folder, replacing the old file, and the update will reach everyone within 15 minutes.`
+          );
+        }
+
+        await render();
+      } catch (e) {
+        setPublishStatus('Publish failed: ' + e.message, true);
+      } finally {
+        publishBtn.disabled = false;
+        publishBtn.textContent = 'Publish to shared folder';
+      }
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    // The once-daily unattended refresh that used to live here as
+    // maybeAutoPublish()/doPublish({auto:true}) has moved to
+    // shared/io/pdc-contribute.js's runPdcContribution() (see
+    // initPdcContributeSection below) — a materially smaller, pdc-only
+    // operation that doesn't require this machine to have ever published.
+
+    await render();
+    await buildModulePicker();
+    await buildAttestationRows();
+
+    // Inline "Accept all for this practice" (so a greyed gate isn't a dead end).
+    const ppAcceptTick = document.getElementById('ppAcceptTick');
+    const ppAcceptBtn = document.getElementById('ppAcceptBtn');
+    ppAcceptTick?.addEventListener('change', () => {
+      if (ppAcceptBtn) ppAcceptBtn.disabled = !ppAcceptTick.checked;
+    });
+    ppAcceptBtn?.addEventListener('click', async () => {
+      if (!ppAcceptTick?.checked) return;
+      await acceptForPractice();
+      if (ppAcceptTick) ppAcceptTick.checked = false;
+      ppAcceptBtn.disabled = true;
+      await buildAttestationRows(); // re-render: all three gates now tick + the inline control hides
+    });
+
+    checkBtn?.addEventListener('click', async () => {
+      checkBtn.disabled = true;
+      checkBtn.textContent = 'Checking…';
+      await render();
+      checkBtn.disabled = false;
+      checkBtn.textContent = 'Check for update';
+      if (!_profile) {
+        setPPStatus('No practice-profile.json found in the extension folder.');
+      } else {
+        const stored = await window.PracticeProfile.getStatus();
+        setPPStatus(
+          stored?.lastAppliedVersion === _profile.profileVersion
+            ? 'Up to date.'
+            : 'New version available — click Apply now.'
+        );
+      }
+    });
+
+    applyBtn?.addEventListener('click', async () => {
+      if (!_profile) return;
+      applyBtn.disabled = true;
+      applyBtn.textContent = 'Applying…';
+      try {
+        const result = await window.PracticeProfile.applyProfile(_profile, { force: true });
+        if (result.skipped) {
+          setPPStatus('Nothing to apply.');
+        } else {
+          const mods = (result.modulesApplied || []).join(', ') || 'no modules changed';
+          setPPStatus(`Applied successfully — ${mods}.`);
+        }
+        await render();
+      } catch (e) {
+        setPPStatus('Apply failed: ' + e.message, true);
+      }
+      applyBtn.disabled = false;
+      applyBtn.textContent = 'Apply now';
+    });
+
+    publishBtn?.addEventListener('click', () => doPublish());
+  } catch (e) {
+    console.warn('[Practice Profile section]', e.message);
+  }
+})();
+
+// ── Cleanup Code Preferences: automatic practice-pool contribution ───────────
+// Distinct from the Practice Profile publish flow above — see
+// shared/io/pdc-contribute.js's header for exactly what a "contributor" is
+// and isn't allowed to do, and why it's safe to run without ever completing
+// the full Publish flow. This section owns the enable toggle + connect
+// button; the side panel (side-panel/panel.js) fires the same
+// runPdcContribution() silently on its own init, so contribution doesn't
+// depend on anyone ever opening Options.
+(async function initPdcContributeSection() {
+  try {
+    if (!window.PdcContribute || !window.FsHandleStore) return;
+
+    const enabledTick = document.getElementById('pdcContribEnabled');
+    const connectBtn = document.getElementById('pdcContribConnectBtn');
+    const statusEl = document.getElementById('pdcContribStatus');
+    if (!enabledTick) return;
+
+    const STATE_KEY = window.PdcContribute.PDC_CONTRIBUTE_STATE_KEY;
+    const CONTRIB_HANDLE_KEY = 'pdcContribFile';
+
+    async function getState() {
+      const r = await chrome.storage.local.get(STATE_KEY);
+      return r[STATE_KEY] || null;
+    }
+    async function setState(patch) {
+      const current = (await getState()) || {};
+      await chrome.storage.local.set({ [STATE_KEY]: Object.assign({}, current, patch) });
+    }
+
+    // Reuse an already-established publisher handle when this machine has
+    // one — a machine that already publishes needs no second file grant to
+    // also contribute. Falls back to this section's own handle otherwise.
+    async function resolveHandle() {
+      return (
+        (await window.FsHandleStore.loadFileHandle(CONTRIB_HANDLE_KEY)) ||
+        (await window.FsHandleStore.loadFileHandle('profileFile'))
+      );
+    }
+
+    function setStatus(msg, isError) {
+      if (!statusEl) return;
+      statusEl.textContent = msg;
+      statusEl.style.color = isError ? '#ef4444' : 'var(--text-3)';
+    }
+
+    async function runOnce() {
+      const handle = await resolveHandle();
+      if (!handle) return;
+      try {
+        const result = await window.PdcContribute.runPdcContribution({
+          getState,
+          setState,
+          getPublisherState: async () => {
+            const r = await chrome.storage.local.get('suite.practiceProfile.publisher');
+            return r['suite.practiceProfile.publisher'] || null;
+          },
+          loadHandle: resolveHandle,
+          readHandleText: async (h) => (await h.getFile()).text(),
+          writeHandleText: async (h, text) => {
+            const w = await h.createWritable();
+            await w.write(text);
+            await w.close();
+          },
+          fetchProfile: () => window.PracticeProfile.fetchProfile(),
+          getLocalPdc: () => problemDescriptionCleanupExport(),
+          mergePdc: problemDescriptionCleanupMergeForPublish,
+        });
+        if (result.ran && result.wrote) setStatus('Contributed your cleanup choices to the practice today.');
+      } catch (_) {
+        // Silent by contract — see pdc-contribute.js's runPdcContribution header.
+      }
+    }
+
+    async function refreshUI() {
+      const state = await getState();
+      enabledTick.checked = !!(state && state.enabled);
+      const handle = await resolveHandle();
+      if (!handle) {
+        if (connectBtn) {
+          connectBtn.textContent = 'Connect shared file';
+          connectBtn.style.display = '';
+        }
+        setStatus('');
+        return;
+      }
+      let perm = 'prompt';
+      try {
+        perm = await handle.queryPermission({ mode: 'readwrite' });
+      } catch (_) {}
+      if (connectBtn) {
+        connectBtn.style.display = perm === 'granted' ? 'none' : '';
+        connectBtn.textContent = 'Reconnect shared file';
+      }
+      if (state && state.lastContributedAt) {
+        setStatus(
+          state.lastResult === 'contributed'
+            ? `Last contributed ${state.lastContributedAt}.`
+            : `Last checked ${state.lastContributedAt} — nothing new to share.`
+        );
+      }
+    }
+
+    enabledTick.addEventListener('change', async () => {
+      if (!enabledTick.checked) {
+        await setState({ enabled: false });
+        return;
+      }
+      const handle = await resolveHandle();
+      if (!handle) {
+        // No handle at all on this machine yet — enabling requires connecting
+        // one first. Revert the tick rather than opening a picker off a
+        // checkbox click (keeps "what grants file access" limited to one
+        // obvious button).
+        enabledTick.checked = false;
+        setStatus('Connect a shared file first.', true);
+        return;
+      }
+      let perm;
+      try {
+        perm = await handle.queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'readwrite' });
+      } catch (_) {
+        perm = 'denied';
+      }
+      if (perm !== 'granted') {
+        enabledTick.checked = false;
+        setStatus('Permission not granted.', true);
+        return;
+      }
+      await setState({ enabled: true });
+      setStatus('Enabled — checking now…');
+      await runOnce();
+      await refreshUI();
+    });
+
+    connectBtn?.addEventListener('click', async () => {
+      if (typeof showOpenFilePicker !== 'function') {
+        setStatus('This browser does not support connecting a shared file directly.', true);
+        return;
+      }
+      // Reconnect case: a handle already exists, only its permission lapsed
+      // (e.g. after a browser restart) — re-request rather than picking again.
+      const existing = await resolveHandle();
+      if (existing) {
+        try {
+          const perm = await existing.requestPermission({ mode: 'readwrite' });
+          if (perm === 'granted') {
+            setStatus('Reconnected.');
+            await refreshUI();
+            return;
+          }
+        } catch (_) {}
+      }
+      try {
+        const [handle] = await showOpenFilePicker({
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        const file = await handle.getFile();
+        const text = await file.text();
+        const fetched = await window.PracticeProfile.fetchProfile().catch(() => null);
+        const verify = window.PdcContribute.verifyProfileFile(text, fetched);
+        if (!verify.ok) {
+          setStatus(verify.reason, true);
+          return;
+        }
+        const perm = await handle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          setStatus('Write permission not granted.', true);
+          return;
+        }
+        await window.FsHandleStore.saveFileHandle(handle, CONTRIB_HANDLE_KEY);
+        setStatus('Connected.');
+        await refreshUI();
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        setStatus('Could not connect file: ' + err.message, true);
+      }
+    });
+
+    await refreshUI();
+    // Fire-and-forget — never blocks page init. Re-render afterwards: the run
+    // may have just migrated a legacy auto-publisher to enabled:true (see
+    // pdc-contribute.js's migrateLegacyAutoPublisher), and the toggle should
+    // show that without a page reopen.
+    runOnce().then(() => refreshUI());
+  } catch (e) {
+    console.warn('[Pdc Contribute section]', e.message);
+  }
+})();
+
+// ── Debug section (v1.2.2) ────────────────────────────────────────────────────
+
+async function buildDebugState() {
+  const lines = [];
+  const now = new Date().toISOString();
+  lines.push(`Generated: ${now}`);
+
+  // Manifest info
+  try {
+    const m = chrome.runtime.getManifest();
+    lines.push(`Extension: ${m.name} v${m.version}`);
+  } catch (_) {}
+
+  // Resolve practice code, show both sources
+  let tabCode = null,
+    storageCode = null;
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://*.medicus.health/*' });
+    for (const t of tabs) {
+      const m = t.url && t.url.match(/england\.medicus\.health\/([a-f0-9]{4,8})\//i);
+      if (m?.[1]) {
+        tabCode = m[1].toLowerCase();
+        break;
+      }
+    }
+    lines.push(`Open Medicus tabs: ${tabs.length}`);
+    tabs.forEach((t) => lines.push(`  - ${t.url}`));
+  } catch (e) {
+    lines.push(`chrome.tabs.query failed: ${e.message}`);
+  }
+  try {
+    const r = await chrome.storage.local.get('suite.practiceCode');
+    storageCode = r['suite.practiceCode'] || null;
+  } catch (_) {}
+  lines.push(`Detected from tab: ${tabCode || '(none)'}`);
+  lines.push(`Saved in storage:  ${storageCode || '(none)'}`);
+  lines.push(`Effective code:    ${tabCode || storageCode || '(none — API calls will fail)'}`);
+  lines.push(`Code source:       ${tabCode ? 'tab' : storageCode ? 'storage' : 'none'}`);
+
+  // Submissions config (separate storage key — legacy)
+  try {
+    const r = await chrome.storage.local.get('submissions.config');
+    const subCode = r['submissions.config']?.practiceCode;
+    if (subCode)
+      lines.push(`Submissions config code: ${subCode}${subCode !== (tabCode || storageCode) ? ' ⚠ MISMATCH' : ''}`);
+  } catch (_) {}
+
+  lines.push('');
+  lines.push('--- Recent API calls (newest first) ---');
+  const entries = window.ApiDiag?.getEntries() || [];
+  if (entries.length === 0) {
+    lines.push('(no API calls recorded — open the side panel or popup to trigger one)');
+  } else {
+    entries.slice(0, 20).forEach((e) => {
+      const t = e.ts.slice(11, 19);
+      const tag = e.ok ? 'OK ' : 'ERR';
+      lines.push(
+        `${t} ${tag} [${e.module}] status=${e.status ?? '-'} code=${e.code || '-'} src=${e.codeSource || '-'}`
+      );
+      if (e.error) lines.push(`         ${e.error}`);
+    });
+  }
+  return lines.join('\n');
+}
+
+async function refreshDebugState() {
+  const el = document.getElementById('debugState');
+  if (el) el.textContent = await buildDebugState();
+}
+
+document.getElementById('debugRefreshBtn')?.addEventListener('click', refreshDebugState);
+
+document.getElementById('debugCopyBtn')?.addEventListener('click', async () => {
+  const text = await buildDebugState();
+  try {
+    await navigator.clipboard.writeText(text);
+    const s = document.getElementById('debugCopyStatus');
+    if (s) {
+      s.textContent = 'Copied ✓';
+      setTimeout(() => (s.textContent = ''), 2000);
+    }
+  } catch (e) {
+    // Fallback: select the text
+    const el = document.getElementById('debugState');
+    if (el) {
+      const range = document.createRange();
+      range.selectNode(el);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+    }
+  }
+});
+
+document.getElementById('debugClearLogBtn')?.addEventListener('click', () => {
+  window.ApiDiag?.clear();
+  refreshDebugState();
+});
+
+// Endpoint probe — try every endpoint the extension uses
+document.getElementById('debugProbeBtn')?.addEventListener('click', async () => {
+  const results = document.getElementById('debugProbeResults');
+  if (!results) return;
+  results.innerHTML = 'Probing…';
+
+  const { code, source } = await window.PracticeCode.resolve();
+  const lines = [];
+  lines.push(`Resolved code: ${escHtml(code || '(none)')} (${escHtml(source || 'no source')})`);
+  if (!code) {
+    lines.push('Cannot probe without a practice code. Open a Medicus tab or set one in Suite.');
+    results.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const probes = [
+    {
+      name: 'Waiting room',
+      url: `https://${code}.api.england.medicus.health/scheduling/data/homepage/my-appointments`,
+    },
+    {
+      name: 'Appointment book',
+      url: `https://${code}.api.england.medicus.health/scheduling/data/appointment-book/embedded-overview?date=${today}&filterByUsualLocation=false`,
+    },
+    {
+      name: 'Task list (admin)',
+      url: `https://${code}.api.england.medicus.health/tasks/data/admin/task-list?createdAt_startDate=${today}&createdAt_endDate=${today}`,
+    },
+  ];
+
+  results.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+  for (const p of probes) {
+    const t0 = Date.now();
+    let line;
+    try {
+      const r = await fetch(p.url, { credentials: 'include' });
+      const dur = Date.now() - t0;
+      const colour = r.ok ? '#4ade80' : '#f87171';
+      line = `<div style="color:${colour}"><strong>${escHtml(p.name)}:</strong> ${r.status} (${dur}ms) <span style="color:var(--text-4); font-size:10px">${escHtml(p.url)}</span></div>`;
+    } catch (e) {
+      line = `<div style="color:#f87171"><strong>${escHtml(p.name)}:</strong> network error: ${escHtml(e.message)}</div>`;
+    }
+    results.innerHTML += line;
+  }
+});
+
+// Refresh debug state when the Debug tab is opened
+document.querySelectorAll('.nav-item[data-section="diagnostics"]').forEach((btn) => {
+  btn.addEventListener('click', refreshDebugState);
+});
+
+// ── Rules currency status card (Monitoring section) ───────────────────────────
+// Fetches the four bundled rule files and renders a per-file age/status table.
+// Triggered on load (sentinel section may be active) and when the tab is opened.
+
+(async function initRulesCurrencyCard() {
+  const bodyEl = document.getElementById('rulesCurrencyBody');
+  const overallEl = document.getElementById('rulesCurrencyOverall');
+  if (!bodyEl) return;
+
+  async function loadRulesCurrency() {
+    if (!window.RuleCurrency) {
+      bodyEl.textContent = 'Rule currency helper not available.';
+      return;
+    }
+    try {
+      const base = chrome.runtime.getURL('rules/');
+      const [drug, qof, vax, alert, reception] = await Promise.all([
+        fetch(base + 'drug-rules.json').then((r) => r.json()),
+        fetch(base + 'qof-rules.json').then((r) => r.json()),
+        fetch(base + 'vaccine-rules.json').then((r) => r.json()),
+        fetch(base + 'alert-library.json').then((r) => r.json()),
+        fetch(base + 'reception-pathways.json').then((r) => r.json()),
+      ]);
+
+      const files = [
+        {
+          id: 'drug',
+          lastUpdated: drug.lastUpdated,
+          specVersion: drug.specVersion,
+          displayName: 'Drug rules (monitoring removed)',
+        },
+        { id: 'qof', lastUpdated: qof.lastUpdated, specVersion: qof.specVersion, displayName: 'QOF rules' },
+        { id: 'vaccine', lastUpdated: vax.lastUpdated, specVersion: vax.specVersion, displayName: 'Vaccine rules' },
+        { id: 'alert', lastUpdated: alert.lastUpdated, specVersion: alert.specVersion, displayName: 'Alert library' },
+        {
+          id: 'reception',
+          lastUpdated: reception.lastUpdated,
+          specVersion: reception.specVersion,
+          displayName: 'Reception capture pathways',
+        },
+      ];
+
+      const today = new Date().toISOString().slice(0, 10);
+      const result = window.RuleCurrency.assessRuleCurrency(files, today);
+
+      // Overall badge
+      if (overallEl) {
+        overallEl.style.display = '';
+        if (result.overall === 'red') {
+          overallEl.textContent = 'Needs urgent review';
+          overallEl.style.background = 'rgba(212,53,28,0.12)';
+          overallEl.style.color = 'var(--red, #d4351c)';
+        } else if (result.overall === 'amber') {
+          overallEl.textContent = 'Needs review';
+          overallEl.style.background = 'rgba(180,83,9,0.15)';
+          overallEl.style.color = 'var(--amber, #b45309)';
+        } else {
+          overallEl.textContent = 'Current';
+          overallEl.style.background = 'rgba(22,163,74,0.12)';
+          overallEl.style.color = 'var(--green, #16a34a)';
+        }
+      }
+
+      // File rows
+      const FILE_NAMES = {
+        drug: 'Drug rules (monitoring removed)',
+        qof: 'QOF rules',
+        vaccine: 'Vaccine rules',
+        alert: 'Alert library',
+      };
+      const rows = result.files
+        .map((f, i) => {
+          const displayName = files[i].displayName || FILE_NAMES[f.id] || f.id;
+          const levelColour =
+            f.level === 'red'
+              ? 'var(--red, #d4351c)'
+              : f.level === 'amber'
+                ? 'var(--amber, #b45309)'
+                : 'var(--green, #16a34a)';
+          const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${levelColour};margin-right:6px;vertical-align:middle;flex-shrink:0;"></span>`;
+          const ageStr = f.ageDays != null ? `${f.ageDays}d ago` : 'age unknown';
+          const specStr = f.specVersion ? escHtml(f.specVersion) : '<em style="color:var(--text-5)">none</em>';
+          const msgColour = f.level === 'red' ? 'var(--red,#d4351c)' : 'var(--amber,#b45309)';
+          const msgHtml = f.message
+            ? `<div style="font-size:11px;color:${msgColour};margin-top:2px;">${escHtml(f.message)}</div>`
+            : '';
+          return `<div style="display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-top:1px solid var(--border);">
+          <div style="flex-shrink:0;padding-top:2px;">${dot}</div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-weight:500;color:var(--text-2);">${escHtml(displayName)}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--text-4);margin-top:1px;">${specStr} &middot; ${escHtml(f.lastUpdated || 'unknown')} (${ageStr})</div>
+            ${msgHtml}
+          </div>
+        </div>`;
+        })
+        .join('');
+
+      // Warnings summary
+      const hasRedFile = result.files.some((f) => f.level === 'red');
+      const warnBg = hasRedFile ? 'rgba(212,53,28,0.08)' : 'rgba(180,83,9,0.08)';
+      const warnBdr = hasRedFile ? 'rgba(212,53,28,0.3)' : 'rgba(180,83,9,0.3)';
+      const warnClr = hasRedFile ? 'var(--red,#d4351c)' : 'var(--amber,#b45309)';
+      const warnHtml = result.warnings.length
+        ? `<div style="margin-top:10px;padding:8px 10px;background:${warnBg};border:1px solid ${warnBdr};border-radius:6px;font-size:11px;color:${warnClr};">${result.warnings.map((w) => escHtml(w)).join('<br>')}</div>`
+        : '';
+
+      bodyEl.innerHTML = `<div style="margin:-4px 0;">${rows}</div>${warnHtml}`;
+    } catch (err) {
+      bodyEl.textContent = 'Could not load rule file metadata: ' + err.message;
+    }
+  }
+
+  // Load on DOMContentLoaded (or immediately if already done)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', loadRulesCurrency);
+  } else {
+    loadRulesCurrency();
+  }
+
+  // Also refresh when the sentinel section is navigated to
+  document.querySelectorAll('.nav-item[data-section="sentinel"]').forEach((btn) => {
+    btn.addEventListener('click', loadRulesCurrency);
+  });
+})();
+
+// ── Request Monitor (v1.3) ────────────────────────────────────────────────────
+
+const rmEnabled = document.getElementById('rmEnabled');
+const rmAssigneeId = document.getElementById('rmAssigneeId');
+const rmPollSeconds = document.getElementById('rmPollSeconds');
+const rmNotifyEnabled = document.getElementById('rmNotifyEnabled');
+const rmNotifySound = document.getElementById('rmNotifySound');
+const rmConditional = document.getElementById('rmConditionalFields');
+const rmSaveBtn = document.getElementById('saveRm');
+const rmSavedTag = document.getElementById('rmSaved');
+const rmUseOpenInboxBtn = document.getElementById('rmUseOpenInbox');
+const rmInboxStatus = document.getElementById('rmInboxStatus');
+const rmInboxChoices = document.getElementById('rmInboxChoices');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Non-anchored variant for pulling a UUID out of a pasted string (URL/fragment).
+const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+// Accept a bare UUID, a full Medicus inbox URL, or a `masterAssignee=…` fragment
+// and return the bare assignee UUID. Users naturally copy the whole URL from the
+// task list rather than hand-trimming the 36-char UUID, so normalise it for them.
+// Returns '' if no UUID can be recovered.
+function extractAssigneeId(raw) {
+  const s = (raw || '').trim();
+  if (!s) return '';
+  if (UUID_RE.test(s)) return s.toLowerCase();
+  // Prefer the masterAssignee query param if the paste contains one (avoids
+  // grabbing some other UUID that might appear elsewhere in a URL path).
+  const param = s.match(/masterAssignee=([0-9a-f-]{36})/i);
+  if (param && UUID_RE.test(param[1])) return param[1].toLowerCase();
+  // Otherwise fall back to the first UUID-shaped substring anywhere in the paste.
+  const any = s.match(UUID_ANY_RE);
+  return any ? any[0].toLowerCase() : '';
+}
+
+// Fill-only scan of open Medicus tabs (H-045 addendum). Pure: no DOM, no
+// chrome.storage, no Request Monitor save. The button copies one assignee
+// UUID into the field; Save monitor settings is still required.
+const RM_INBOX_NONE_GUIDANCE =
+  'Open the task list in Medicus with your triage team filter (e.g. Triage Doctor) applied, then try again.';
+const RM_INBOX_CAUTION =
+  'This ID comes from whatever filter is open on that tab. Check it is the team triage inbox, not your personal inbox or Results.';
+const RM_INBOX_UNSAVED = 'Nothing is saved until you press Save monitor settings.';
+const RM_INBOX_CHOOSE =
+  'Several open Medicus tabs use different inboxes. Pick the team triage inbox, or close the other tabs and try again.';
+const RM_INBOX_NAME_PARAMS = ['assigneeName', 'masterAssigneeName', 'filterName', 'teamName', 'assignedToName'];
+// Queue slug is already on the task-list URL. Not a team-name lookup.
+const RM_INBOX_QUEUE_LABELS = {
+  medical_patient_request_task: 'Medical requests',
+  admin_patient_request_task: 'Admin requests',
+  review_investigation_results_task: 'Investigation results',
+  review_investigation_report: 'Investigation results',
+  investigation_result: 'Investigation results',
+  prescription_request_task_routine: 'Routine prescriptions',
+  prescription_request_task_non_routine: 'Non-routine prescriptions',
+  review_inbound_document_task: 'Inbound documents',
+};
+
+function isMedicusTaskListUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+  let u;
+  try {
+    u = new URL(s);
+  } catch (_) {
+    return false;
+  }
+  if (!/(^|\.)medicus\.health$/i.test(u.hostname)) return false;
+  const hash = u.hash || '';
+  const hashPath = hash.startsWith('#') ? hash.slice(1).split('?')[0] : '';
+  const path = (u.pathname || '') + (hashPath ? '/' + hashPath.replace(/^\//, '') : '');
+  return /\/task-list(?:\/|$)/i.test(path);
+}
+
+function assigneeIdFromOpenInboxUrl(raw) {
+  if (!isMedicusTaskListUrl(raw)) return '';
+  const m = String(raw).match(/[?&#]masterAssignee=([^&#]*)/i);
+  if (!m) return '';
+  let value = m[1];
+  try {
+    value = decodeURIComponent(value.replace(/\+/g, ' '));
+  } catch (_) {}
+  return extractAssigneeId('masterAssignee=' + value);
+}
+
+function inboxQueryValue(raw, key) {
+  let u;
+  try {
+    u = new URL(String(raw || ''));
+  } catch (_) {
+    return '';
+  }
+  const bags = [u.searchParams];
+  const hash = u.hash || '';
+  const q = hash.indexOf('?');
+  if (q !== -1) bags.push(new URLSearchParams(hash.slice(q + 1)));
+  for (let i = 0; i < bags.length; i++) {
+    const v = bags[i].get(key);
+    if (v && String(v).trim()) return String(v).trim();
+  }
+  return '';
+}
+
+function inboxQueueLabel(raw) {
+  const m = String(raw || '').match(/\/tasks\/(?:data\/)?([^/?#]+)\/task-list/i);
+  if (!m) return '';
+  let slug = m[1];
+  try {
+    slug = decodeURIComponent(slug);
+  } catch (_) {}
+  return RM_INBOX_QUEUE_LABELS[slug] || '';
+}
+
+function cleanInboxTitle(title) {
+  let t = String(title || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return '';
+  t = t.replace(/\s*[|·•–—-]\s*Medicus(?:\s+Suite)?\s*$/i, '').trim();
+  t = t.replace(/^Medicus(?:\s+Suite)?\s*[|·•–—-]\s*/i, '').trim();
+  if (!t || /^(medicus|medicus suite|tasks?|task list|home|dashboard)$/i.test(t)) return '';
+  if (UUID_RE.test(t)) return '';
+  if (t.length > 80) t = t.slice(0, 77) + '...';
+  return t;
+}
+
+function inboxNameFromUrl(raw) {
+  for (let i = 0; i < RM_INBOX_NAME_PARAMS.length; i++) {
+    const v = inboxQueryValue(raw, RM_INBOX_NAME_PARAMS[i]);
+    if (v && !UUID_RE.test(v)) return v.length > 80 ? v.slice(0, 77) + '...' : v;
+  }
+  return '';
+}
+
+function inboxTabLabel(tab) {
+  const url = (tab && tab.url) || '';
+  const named = inboxNameFromUrl(url);
+  const title = cleanInboxTitle(tab && tab.title);
+  const queue = inboxQueueLabel(url);
+  const head = named || title;
+  if (head && queue && head.toLowerCase().indexOf(queue.toLowerCase()) === -1) {
+    return head + ' — ' + queue;
+  }
+  return head || queue;
+}
+
+function scanMedicusInboxTabs(tabs) {
+  const list = Array.isArray(tabs) ? tabs : [];
+  const byId = new Map();
+  const order = [];
+  for (let i = 0; i < list.length; i++) {
+    const tab = list[i];
+    const assigneeId = assigneeIdFromOpenInboxUrl(tab && tab.url);
+    if (!assigneeId) continue;
+    const label = inboxTabLabel(tab);
+    if (!byId.has(assigneeId)) {
+      byId.set(assigneeId, { assigneeId: assigneeId, label: label });
+      order.push(assigneeId);
+    } else if (label) {
+      const prev = byId.get(assigneeId);
+      const parts = prev.label ? prev.label.split(' / ') : [];
+      if (!prev.label) prev.label = label;
+      else if (parts.indexOf(label) === -1) prev.label = prev.label + ' / ' + label;
+    }
+  }
+  const candidates = order.map((id) => byId.get(id));
+  if (candidates.length === 0) return { status: 'none', assigneeId: '', label: '', candidates: [] };
+  if (candidates.length === 1) {
+    return {
+      status: 'one',
+      assigneeId: candidates[0].assigneeId,
+      label: candidates[0].label,
+      candidates: candidates,
+    };
+  }
+  return { status: 'many', assigneeId: '', label: '', candidates: candidates };
+}
+
+function inboxFillCaution(label) {
+  const who = label ? 'Filled from ' + label + '. ' : '';
+  return who + RM_INBOX_CAUTION + ' ' + RM_INBOX_UNSAVED;
+}
+
+function inboxChooseMessage() {
+  return RM_INBOX_CHOOSE + ' ' + RM_INBOX_UNSAVED;
+}
+
+function inboxChoiceCaption(candidate, candidates) {
+  const label = (candidate && candidate.label) || 'Open inbox';
+  const same = (candidates || []).filter(
+    (c) => ((c && c.label) || '') === ((candidate && candidate.label) || '')
+  ).length;
+  if (!candidate || !candidate.label || same > 1) {
+    const id = (candidate && candidate.assigneeId) || '';
+    return label + (id ? ' (' + id.slice(0, 8) + '\u2026)' : '');
+  }
+  return label;
+}
+
+function clearRmInboxChoices() {
+  if (!rmInboxChoices) return;
+  while (rmInboxChoices.firstChild) rmInboxChoices.removeChild(rmInboxChoices.firstChild);
+  rmInboxChoices.hidden = true;
+}
+
+function showRmInboxNote(text, kind) {
+  if (!rmInboxStatus) return;
+  rmInboxStatus.hidden = false;
+  rmInboxStatus.className = 'rm-inbox-note rm-inbox-note-' + (kind === 'caution' ? 'caution' : 'guidance');
+  rmInboxStatus.textContent = text;
+}
+
+function fillRmAssigneeFromInbox(assigneeId, label) {
+  if (rmAssigneeId && assigneeId) rmAssigneeId.value = assigneeId;
+  clearRmInboxChoices();
+  showRmInboxNote(inboxFillCaution(label), 'caution');
+}
+
+function renderRmInboxScan(scan) {
+  if (!scan || scan.status === 'none') {
+    clearRmInboxChoices();
+    showRmInboxNote(RM_INBOX_NONE_GUIDANCE, 'guidance');
+    return;
+  }
+  if (scan.status === 'many') {
+    showRmInboxNote(inboxChooseMessage(), 'guidance');
+    if (!rmInboxChoices) return;
+    while (rmInboxChoices.firstChild) rmInboxChoices.removeChild(rmInboxChoices.firstChild);
+    rmInboxChoices.hidden = false;
+    scan.candidates.forEach((candidate) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ghost rm-inbox-btn';
+      const caption = inboxChoiceCaption(candidate, scan.candidates);
+      btn.textContent = caption;
+      btn.setAttribute(
+        'aria-label',
+        'Use ' + caption + '. Assignee ' + candidate.assigneeId + '. Fills the field only.'
+      );
+      btn.addEventListener('click', () => fillRmAssigneeFromInbox(candidate.assigneeId, candidate.label));
+      rmInboxChoices.appendChild(btn);
+    });
+    return;
+  }
+  fillRmAssigneeFromInbox(scan.assigneeId, scan.label);
+}
+
+// Queries open Medicus tabs and fills the field. Does not save.
+async function fillAssigneeFromOpenMedicusTabs() {
+  if (rmUseOpenInboxBtn) {
+    rmUseOpenInboxBtn.disabled = true;
+    rmUseOpenInboxBtn.setAttribute('aria-busy', 'true');
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://*.medicus.health/*' });
+    renderRmInboxScan(scanMedicusInboxTabs(tabs));
+  } catch (_) {
+    renderRmInboxScan({ status: 'none', assigneeId: '', label: '', candidates: [] });
+  } finally {
+    if (rmUseOpenInboxBtn) {
+      rmUseOpenInboxBtn.disabled = false;
+      rmUseOpenInboxBtn.removeAttribute('aria-busy');
+    }
+  }
+}
+
+function toggleRmConditional() {
+  if (!rmConditional || !rmEnabled) return;
+  rmConditional.style.display = rmEnabled.checked ? 'block' : 'none';
+}
+
+(async function initRmSection() {
+  try {
+    if (!window.RequestMonitor) return;
+    const cfg = await window.RequestMonitor.getConfig();
+    if (rmEnabled) rmEnabled.checked = !!cfg.enabled;
+    if (rmAssigneeId) rmAssigneeId.value = cfg.assigneeId || '';
+    if (rmPollSeconds) rmPollSeconds.value = cfg.pollSeconds || 300;
+    if (rmNotifyEnabled) rmNotifyEnabled.checked = !!cfg.notifyEnabled;
+    if (rmNotifySound) rmNotifySound.checked = !!cfg.notifySound;
+    toggleRmConditional();
+  } catch (e) {
+    console.warn('[RM init]', e.message);
+  }
+})();
+
+rmEnabled?.addEventListener('change', toggleRmConditional);
+
+rmUseOpenInboxBtn?.addEventListener('click', () => {
+  fillAssigneeFromOpenMedicusTabs();
+});
+
+rmAssigneeId?.addEventListener('input', () => {
+  if (rmInboxStatus) rmInboxStatus.hidden = true;
+  clearRmInboxChoices();
+});
+
+rmSaveBtn?.addEventListener('click', async () => {
+  const rawAssignee = rmAssigneeId?.value || '';
+  // Tolerate a pasted inbox URL / `masterAssignee=…` fragment, not just a bare UUID.
+  const assigneeId = extractAssigneeId(rawAssignee);
+  // Reflect the cleaned UUID back into the field so the user sees what was saved.
+  if (rmAssigneeId && assigneeId && rmAssigneeId.value.trim() !== assigneeId) {
+    rmAssigneeId.value = assigneeId;
+  }
+  const enabled = !!rmEnabled?.checked;
+  let pollSeconds = parseInt(rmPollSeconds?.value, 10);
+  if (isNaN(pollSeconds) || pollSeconds < 120) pollSeconds = 300;
+  if (pollSeconds > 600) pollSeconds = 600;
+
+  // Validate UUID if enabling. `assigneeId` is the extracted value, so this only
+  // fails when the paste contains no recoverable UUID at all.
+  if (enabled && rawAssignee.trim() && !UUID_RE.test(assigneeId)) {
+    if (rmSavedTag) {
+      rmSavedTag.textContent = 'Invalid UUID — check format';
+      rmSavedTag.style.color = '#f87171';
+      rmSavedTag.classList.add('show');
+      setTimeout(() => {
+        rmSavedTag.classList.remove('show');
+        rmSavedTag.textContent = 'Saved ✓';
+        rmSavedTag.style.color = '';
+      }, 3000);
+    }
+    return;
+  }
+
+  // Request browser notification permission if user is enabling notifications
+  if (enabled && rmNotifyEnabled?.checked) {
+    try {
+      if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+    } catch (_) {}
+  }
+
+  await window.RequestMonitor.setConfig({
+    enabled,
+    assigneeId,
+    pollSeconds,
+    notifyEnabled: !!rmNotifyEnabled?.checked,
+    notifySound: !!rmNotifySound?.checked,
+  });
+
+  // Normalised values back to form
+  if (rmPollSeconds) rmPollSeconds.value = pollSeconds;
+
+  if (rmSavedTag) {
+    rmSavedTag.classList.add('show');
+    setTimeout(() => rmSavedTag.classList.remove('show'), 2000);
+  }
+});
+
+// ── StackChan desk robot ─────────────────────────────────────────────────────
+
+const scEnabled = document.getElementById('scEnabled');
+const scBaseUrl = document.getElementById('scBaseUrl');
+const scToken = document.getElementById('scToken');
+const scRespectQuiet = document.getElementById('scRespectQuiet');
+const scHookSentinel = document.getElementById('scHookSentinel');
+const scHookRm = document.getElementById('scHookRm');
+const scHookCompanion = document.getElementById('scHookCompanion');
+const scSaveBtn = document.getElementById('saveStackchan');
+const scSavedTag = document.getElementById('scSaved');
+const scStatus = document.getElementById('scStatus');
+const scTestFaces = document.getElementById('scTestFaces');
+const scTestResult = document.getElementById('scTestResult');
+const scHealthBtn = document.getElementById('scHealthBtn');
+
+function scReadForm() {
+  const Bridge = window.StackchanBridge;
+  if (!Bridge) return null;
+  return Bridge.sanitiseConfig({
+    enabled: !!scEnabled?.checked,
+    baseUrl: scBaseUrl?.value || '',
+    token: scToken?.value || '',
+    respectQuiet: scRespectQuiet ? !!scRespectQuiet.checked : true,
+    hookSentinel: scHookSentinel ? !!scHookSentinel.checked : true,
+    hookRequestMonitor: scHookRm ? !!scHookRm.checked : true,
+    hookCompanion: scHookCompanion ? !!scHookCompanion.checked : true,
+  });
+}
+
+function scFillForm(cfg) {
+  if (scEnabled) scEnabled.checked = !!cfg.enabled;
+  if (scBaseUrl) scBaseUrl.value = cfg.baseUrl || '';
+  if (scToken) scToken.value = cfg.token || '';
+  if (scRespectQuiet) scRespectQuiet.checked = cfg.respectQuiet !== false;
+  if (scHookSentinel) scHookSentinel.checked = cfg.hookSentinel !== false;
+  if (scHookRm) scHookRm.checked = cfg.hookRequestMonitor !== false;
+  if (scHookCompanion) scHookCompanion.checked = cfg.hookCompanion !== false;
+}
+
+async function scEnsureOriginPermission(baseUrl) {
+  const Bridge = window.StackchanBridge;
+  if (!Bridge || !chrome.permissions?.request) return { ok: true };
+  const origin = Bridge.originFromBaseUrl(baseUrl);
+  if (!origin) return { ok: false, error: 'Set a valid http(s) base URL first' };
+  try {
+    const granted = await chrome.permissions.request({ origins: [origin + '/*'] });
+    return granted
+      ? { ok: true }
+      : { ok: false, error: 'LAN permission denied — Edge/Chrome blocked the robot origin' };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || 'permission request failed' };
+  }
+}
+
+(async function initStackchanSection() {
+  try {
+    if (!window.StackchanBridge) return;
+    scFillForm(await window.StackchanBridge.getConfig());
+  } catch (e) {
+    console.warn('[StackChan init]', e && e.message);
+  }
+})();
+
+if (scTestFaces && window.StackchanBridge) {
+  const colours = {
+    idle: '#334155',
+    calm: '#16a34a',
+    alert: '#dc2626',
+    wait: '#b45309',
+    done: '#15803d',
+    celebrate: '#7c3aed',
+    listen: '#2563eb',
+  };
+  window.StackchanBridge.COMMANDS.forEach((cmd) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost';
+    btn.textContent = cmd;
+    btn.dataset.scCmd = cmd;
+    btn.style.background = colours[cmd] || '';
+    btn.style.color = '#fff';
+    btn.style.border = '0';
+    scTestFaces.appendChild(btn);
+  });
+}
+
+scSaveBtn?.addEventListener('click', async () => {
+  const cfg = scReadForm();
+  if (!cfg || !window.StackchanBridge) return;
+  if (cfg.enabled && !cfg.baseUrl) {
+    if (scSavedTag) {
+      scSavedTag.textContent = 'Need a base URL to enable';
+      scSavedTag.style.color = '#f87171';
+      scSavedTag.classList.add('show');
+      setTimeout(() => {
+        scSavedTag.classList.remove('show');
+        scSavedTag.textContent = 'Saved ✓';
+        scSavedTag.style.color = '';
+      }, 3000);
+    }
+    return;
+  }
+  if (cfg.baseUrl) {
+    const perm = await scEnsureOriginPermission(cfg.baseUrl);
+    if (!perm.ok && scStatus) scStatus.textContent = perm.error;
+  }
+  const saved = await window.StackchanBridge.setConfig(cfg);
+  scFillForm(saved);
+  if (scSavedTag) {
+    scSavedTag.classList.add('show');
+    setTimeout(() => scSavedTag.classList.remove('show'), 2000);
+  }
+});
+
+async function scCallWorker(action, extra) {
+  const cfg = scReadForm();
+  if (!cfg) return { ok: false, error: 'bridge not loaded' };
+  if (cfg.baseUrl) {
+    const perm = await scEnsureOriginPermission(cfg.baseUrl);
+    if (!perm.ok) return perm;
+  }
+  await window.StackchanBridge.setConfig(cfg);
+  return await chrome.runtime.sendMessage(Object.assign({ action }, extra || {}));
+}
+
+scHealthBtn?.addEventListener('click', async () => {
+  if (scStatus) scStatus.textContent = 'pinging…';
+  try {
+    const res = await scCallWorker('stackchan:health');
+    if (scStatus) {
+      scStatus.textContent =
+        res && res.ok
+          ? `ok  v${res.version || '?'}  cmd=${res.cmd || '?'}  camera=${res.camera}  mic=${res.mic}`
+          : (res && res.error) || 'no response';
+    }
+  } catch (e) {
+    if (scStatus) scStatus.textContent = (e && e.message) || 'ping failed';
+  }
+});
+
+scTestFaces?.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('[data-sc-cmd]');
+  if (!btn) return;
+  const cmd = btn.dataset.scCmd;
+  if (scTestResult) scTestResult.textContent = `sending ${cmd}…`;
+  try {
+    const res = await scCallWorker('stackchan:test', { command: cmd });
+    if (scTestResult) {
+      scTestResult.textContent = res && res.ok ? `${cmd} → ${res.cmd || cmd}` : (res && res.error) || 'no response';
+    }
+  } catch (e) {
+    if (scTestResult) scTestResult.textContent = (e && e.message) || 'test failed';
+  }
+});
+
+// ── Leaflets (NHS Website Content API — optional tier 2) ─────────────────────
+// The API key is deliberately never round-tripped through leafletsExport() —
+// see shared/io/leaflets-io.js header. This section reads/writes
+// chrome.storage.local directly (same as the request-monitor section above)
+// rather than going through the IO file, because the IO file's job is the
+// backup boundary, not the settings-page load/save path.
+
+const lfEnabled = document.getElementById('lfEnabled');
+const lfApiKey = document.getElementById('lfApiKey');
+const lfSaveBtn = document.getElementById('saveLeaflets');
+const lfSavedTag = document.getElementById('leafletsSaved');
+
+(async function initLeafletsSection() {
+  try {
+    const r = await chrome.storage.local.get('leaflets.config');
+    const cfg = r['leaflets.config'] || {};
+    if (lfEnabled) lfEnabled.checked = cfg.enabled === true;
+    if (lfApiKey) lfApiKey.value = typeof cfg.apiKey === 'string' ? cfg.apiKey : '';
+  } catch (e) {
+    console.warn('[Leaflets init]', e.message);
+  }
+})();
+
+lfSaveBtn?.addEventListener('click', async () => {
+  const enabled = !!lfEnabled?.checked;
+  const apiKey = (lfApiKey?.value || '').trim();
+  await chrome.storage.local.set({ 'leaflets.config': { enabled, apiKey } });
+  if (lfSavedTag) {
+    lfSavedTag.classList.add('show');
+    setTimeout(() => lfSavedTag.classList.remove('show'), 2000);
+  }
+});
+
+// ── Cleanup code preferences (pdc.preferredDescriptions + pdc.conceptRemap) ──
+// Reads/writes chrome.storage.local directly, same rationale as the Leaflets
+// section above — this is the settings-page load/save path, not the backup
+// boundary (shared/io/problem-description-cleanup-io.js is that boundary,
+// used only by the Export/Import buttons under Backup & Restore). Business
+// logic (resolving the effective default, tallying, override set/clear) all
+// lives in shared/preferred-descriptions.js (window.MSPreferredDescriptions,
+// loaded before this script) so it's identical to what the content script
+// uses — this panel never re-implements the resolution rule.
+//
+// ONE generic factory, instantiated twice below — the "Preferred wording"
+// and "Code remapping" blocks are structurally identical (tally + override,
+// same cap/sort/filter rules) and differ only in storage key, DOM ids, and
+// how a candidate renders/sorts/matches a filter. Building this once avoids
+// two near-duplicate 200-line blocks silently drifting apart over time.
+function initPdcTallySection(cfg) {
+  const listEl = document.getElementById(cfg.listElId);
+  const filterEl = document.getElementById(cfg.filterElId);
+  const summaryEl = document.getElementById(cfg.summaryElId);
+  const showAllBtn = document.getElementById(cfg.showAllBtnId);
+  const PD = window.MSPreferredDescriptions;
+  if (!listEl || !PD) return;
+
+  // Rendering every tracked key unconditionally doesn't scale — a practice's
+  // tally can grow to hundreds/thousands of entries over time. Default view
+  // is a small capped "most recently used" list (cheap regardless of total
+  // size); the filter box and the explicit "Show all" toggle are the two
+  // ways to see more, both sorted ALPHABETICALLY rather than by recency —
+  // once you're searching or auditing everything, alphabetical is what's
+  // scannable, "recent" only makes sense for the default at-a-glance view.
+  const RECENT_CAP = 20;
+  const FILTER_CAP = 100;
+
+  let _all = {}; // topKey -> entry
+  let _filter = '';
+  let _showAll = false;
+
+  function sortKey(topKey) {
+    const resolved = PD.resolvePreferred(_all[topKey]);
+    if (resolved) return cfg.sortText(resolved.candidate).toLowerCase();
+    const norm = PD.normaliseEntry(_all[topKey]);
+    const firstKey = Object.keys(norm.tally)[0];
+    return firstKey ? cfg.sortText(norm.tally[firstKey].candidate).toLowerCase() : '';
+  }
+
+  async function load() {
+    const r = await chrome.storage.local.get(cfg.storageKey);
+    _all = r[cfg.storageKey] && typeof r[cfg.storageKey] === 'object' ? r[cfg.storageKey] : {};
+    render();
+  }
+
+  async function persist() {
+    await chrome.storage.local.set({ [cfg.storageKey]: _all });
+  }
+
+  function mostRecentTimestamp(entry) {
+    const norm = PD.normaliseEntry(entry);
+    let latest = '';
+    Object.keys(norm.tally).forEach((k) => {
+      const t = norm.tally[k].lastUsed || '';
+      if (t > latest) latest = t;
+    });
+    return latest;
+  }
+
+  function matchesFilter(topKey, entry) {
+    if (!_filter) return true;
+    const needle = _filter.toLowerCase();
+    if (topKey.toLowerCase().includes(needle)) return true;
+    const norm = PD.normaliseEntry(entry);
+    if (norm.override && cfg.filterText(norm.override.candidate).toLowerCase().includes(needle)) return true;
+    return Object.keys(norm.tally).some((k) => cfg.filterText(norm.tally[k].candidate).toLowerCase().includes(needle));
+  }
+
+  function formatWhen(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? escHtml(iso) : d.toLocaleDateString();
+  }
+
+  function renderBlock(topKey) {
+    const norm = PD.normaliseEntry(_all[topKey]);
+    const resolved = PD.resolvePreferred(_all[topKey]);
+    // Rows come from the tally, plus a synthetic row for an override whose
+    // key was never actually tallied on this device (e.g. arrived via an
+    // imported backup) — kept visible/clearable rather than hidden.
+    const rows = Object.keys(norm.tally).map((key) => ({
+      key,
+      candidate: norm.tally[key].candidate,
+      count: norm.tally[key].count,
+      lastUsed: norm.tally[key].lastUsed,
+    }));
+    if (norm.override && !norm.tally[norm.override.key]) {
+      rows.push({ key: norm.override.key, candidate: norm.override.candidate, count: 0, lastUsed: null });
+    }
+    rows.sort((a, b) => b.count - a.count);
+
+    const rowsHtml = rows
+      .map((row) => {
+        const isOverride = norm.override && norm.override.key === row.key;
+        const isEffective = resolved && resolved.key === row.key;
+        const badge = isEffective
+          ? `<span style="color: var(--green, #16a34a); font-size: 10px; font-weight: 600">★ ${isOverride ? 'PRACTICE DEFAULT (MANUAL)' : 'PRACTICE DEFAULT (MOST USED)'}</span>`
+          : '';
+        const actionHtml = isOverride
+          ? `<button class="ghost" style="font-size: 10px; padding: 3px 8px" data-pdc-clear="${escAttr(topKey)}">Clear override</button>`
+          : `<button class="ghost" style="font-size: 10px; padding: 3px 8px" data-pdc-setoverride="${escAttr(topKey)}" data-pdc-row-key="${escAttr(row.key)}">Set as practice default</button>`;
+        return `
+          <tr style="border-bottom: 1px solid var(--border)">
+            <td style="padding: 6px 8px 6px 0; color: var(--text-2)">${cfg.renderCandidate(row.candidate)}${badge ? '<br>' + badge : ''}</td>
+            <td style="padding: 6px 8px; text-align: right; color: var(--text-3); font-family: var(--mono)">${row.count}</td>
+            <td style="padding: 6px 8px; color: var(--text-4); font-size: 11px">${formatWhen(row.lastUsed)}</td>
+            <td style="padding: 6px 0 6px 8px; text-align: right">${actionHtml}</td>
+          </tr>`;
+      })
+      .join('');
+
+    return `
+      <div style="border: 1px solid var(--border); border-radius: var(--r-md); margin-bottom: 12px; overflow: hidden">
+        <div style="padding: 8px 12px; background: var(--bg-mid); font-family: var(--mono); font-size: 11px; color: var(--text-3)">
+          ${cfg.blockLabel(topKey)}
+        </div>
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px">
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function render() {
+    const allKeys = Object.keys(_all);
+    const total = allKeys.length;
+
+    if (!total) {
+      if (summaryEl) summaryEl.textContent = '';
+      if (showAllBtn) showAllBtn.style.display = 'none';
+      listEl.innerHTML = cfg.emptyMessage;
+      return;
+    }
+
+    const overrideCount = allKeys.filter((k) => PD.normaliseEntry(_all[k]).override).length;
+    if (summaryEl) {
+      summaryEl.textContent = `${total} ${cfg.unitLabel(total)} tracked, ${overrideCount} with a manual override.`;
+    }
+    if (showAllBtn) {
+      showAllBtn.style.display = _filter ? 'none' : '';
+      showAllBtn.textContent = _showAll ? 'Show recent only' : `Show all ${total}`;
+    }
+
+    let keys;
+    let capNote = '';
+    if (_filter) {
+      const matched = allKeys
+        .filter((k) => matchesFilter(k, _all[k]))
+        .sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+      if (!matched.length) {
+        listEl.innerHTML = 'No matches for that filter.';
+        return;
+      }
+      keys = matched.slice(0, FILTER_CAP);
+      if (matched.length > FILTER_CAP) {
+        capNote = `Showing first ${FILTER_CAP} of ${matched.length} matches — narrow your search to see the rest.`;
+      }
+    } else if (_showAll) {
+      keys = allKeys.slice().sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+    } else {
+      keys = allKeys
+        .slice()
+        .sort((a, b) => mostRecentTimestamp(_all[b]).localeCompare(mostRecentTimestamp(_all[a])))
+        .slice(0, RECENT_CAP);
+      if (total > RECENT_CAP) {
+        capNote = `Showing ${RECENT_CAP} most recently used of ${total} total — search or "Show all" to see the rest.`;
+      }
+    }
+
+    const capNoteHtml = capNote
+      ? `<div style="margin-bottom: 10px; color: var(--text-4); font-size: 11px">${escHtml(capNote)}</div>`
+      : '';
+    listEl.innerHTML = capNoteHtml + keys.map(renderBlock).join('');
+  }
+
+  // Clearing an override is a DECISION, not an absence — so it is timestamped
+  // and stored as a tombstone (`overrideCleared`), and pinning one records
+  // `overrideSetAt`. Without them the practice-profile merge in
+  // shared/io/problem-description-cleanup-io.js has no way to tell "this
+  // machine never had an override" from "someone deliberately removed it", so
+  // the next daily sync simply put the cleared override back and a
+  // practice-wide override could never be removed at all. PD.setOverride /
+  // PD.clearOverride return a fresh {tally, override} entry, which is exactly
+  // what we want: the new decision replaces any previous marker.
+  function withOverrideSet(entry, rowKey, candidate) {
+    const next = PD.setOverride(entry, rowKey, candidate);
+    next.overrideSetAt = new Date().toISOString();
+    return next;
+  }
+  function withOverrideCleared(entry) {
+    const next = PD.clearOverride(entry);
+    next.overrideCleared = new Date().toISOString();
+    return next;
+  }
+
+  listEl.addEventListener('click', async (e) => {
+    const clearBtn = e.target.closest('[data-pdc-clear]');
+    if (clearBtn) {
+      const topKey = clearBtn.getAttribute('data-pdc-clear');
+      _all[topKey] = withOverrideCleared(_all[topKey]);
+      await persist();
+      render();
+      return;
+    }
+    const setBtn = e.target.closest('[data-pdc-setoverride]');
+    if (setBtn) {
+      const topKey = setBtn.getAttribute('data-pdc-setoverride');
+      const rowKey = setBtn.getAttribute('data-pdc-row-key');
+      const norm = PD.normaliseEntry(_all[topKey]);
+      const row = norm.tally[rowKey];
+      if (!row) return;
+      _all[topKey] = withOverrideSet(_all[topKey], rowKey, row.candidate);
+      await persist();
+      render();
+    }
+  });
+
+  filterEl?.addEventListener('input', () => {
+    _filter = filterEl.value.trim();
+    render();
+  });
+
+  showAllBtn?.addEventListener('click', () => {
+    _showAll = !_showAll;
+    render();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', load);
+  } else {
+    load();
+  }
+  document
+    .querySelectorAll(`.nav-item[data-section="${cfg.navSection}"]`)
+    .forEach((btn) => btn.addEventListener('click', load));
+}
+
+initPdcTallySection({
+  storageKey: 'pdc.preferredDescriptions',
+  listElId: 'pdcPrefsList',
+  filterElId: 'pdcPrefsFilter',
+  summaryElId: 'pdcPrefsSummary',
+  showAllBtnId: 'pdcPrefsShowAll',
+  navSection: 'pdc-prefs',
+  emptyMessage: `No description choices recorded yet — they'll appear here once someone uses "Clean up code" on Clinical Summary.`,
+  unitLabel: (n) => (n === 1 ? 'concept' : 'concepts'),
+  blockLabel: (conceptId) => `SNOMED ${escHtml(conceptId)}`,
+  sortText: (candidate) => (candidate && candidate.description) || '',
+  filterText: (candidate) => (candidate && candidate.description) || '',
+  renderCandidate: (candidate) => escHtml((candidate && candidate.description) || ''),
+});
+
+initPdcTallySection({
+  storageKey: 'pdc.conceptRemap',
+  listElId: 'pdcRemapList',
+  filterElId: 'pdcRemapFilter',
+  summaryElId: 'pdcRemapSummary',
+  showAllBtnId: 'pdcRemapShowAll',
+  navSection: 'pdc-prefs',
+  emptyMessage: `No code remaps recorded yet — they'll appear here once someone manually replaces a code from "Clean up code" on Clinical Summary.`,
+  unitLabel: (n) => (n === 1 ? 'code' : 'codes'),
+  blockLabel: (sourceConceptId) => `SNOMED ${escHtml(sourceConceptId)} replaced with:`,
+  sortText: (candidate) => (candidate && candidate.description) || '',
+  filterText: (candidate) =>
+    `${(candidate && candidate.description) || ''} ${(candidate && candidate.conceptId) || ''}`,
+  renderCandidate: (candidate) =>
+    `${escHtml((candidate && candidate.description) || '')} <span style="color: var(--text-4); font-family: var(--mono); font-size: 10px">(${escHtml((candidate && candidate.conceptId) || '')})</span>`,
+});
+
+// ── Triage capacity alerts ────────────────────────────────────────────────────
+
+(async function initTriageAlerts() {
+  try {
+    if (!window.TriageAlertIO) return;
+    const container = document.getElementById('triageAlertRules');
+    if (!container) return;
+
+    let rules = await window.TriageAlertIO.getRules();
+
+    function renderRules() {
+      container.innerHTML = rules
+        .map(
+          (rule, i) => `
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer; min-width:120px;">
+            <input type="checkbox" class="ta-enabled" data-i="${i}" ${rule.enabled ? 'checked' : ''} />
+            <span style="font-size:12px; color:var(--text-2);">${escHtml(rule.label)}</span>
+          </label>
+          <span style="font-size:11px; color:var(--text-4);">Alert when ≥</span>
+          <input type="number" class="ta-threshold" data-i="${i}" value="${rule.threshold}" min="1" max="500"
+            style="width:64px; background:var(--bg-elev); border:1px solid var(--border-hi); color:var(--text-2);
+                   font-family:var(--mono); font-size:11px; border-radius:5px; padding:3px 6px;" />
+          <span style="font-size:11px; color:var(--text-4);">tasks</span>
+        </div>
+      `
+        )
+        .join('');
+
+      container.querySelectorAll('.ta-enabled').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          rules[+cb.dataset.i].enabled = cb.checked;
+        });
+      });
+      container.querySelectorAll('.ta-threshold').forEach((inp) => {
+        inp.addEventListener('change', () => {
+          const v = parseInt(inp.value, 10);
+          if (!isNaN(v) && v >= 1) rules[+inp.dataset.i].threshold = v;
+        });
+      });
+    }
+
+    renderRules();
+
+    document.getElementById('saveTriageAlerts')?.addEventListener('click', async () => {
+      await window.TriageAlertIO.setRules(rules);
+      const tag = document.getElementById('triageAlertSaved');
+      if (tag) {
+        tag.classList.add('show');
+        setTimeout(() => tag.classList.remove('show'), 2000);
+      }
+    });
+  } catch (e) {
+    console.warn('[Triage alerts init]', e.message);
+  }
+})();
+
+// ── Notifications section ─────────────────────────────────────────────────────
+
+(async function initNotificationsSection() {
+  try {
+    const desktopCb = document.getElementById('notifDesktopEnabled');
+    const soundCb = document.getElementById('notifSoundEnabled');
+    const badgeCb = document.getElementById('notifBadgeEnabled');
+    const savedTag = document.getElementById('notifChannelSaved');
+    const quietStatusEl = document.getElementById('quietStatusText');
+    if (!desktopCb || !soundCb || !badgeCb) return;
+
+    // ── Helper: HH:MM format ──────────────────────────────────────────────────
+    function fmtHHMM(epochMs) {
+      const d = new Date(epochMs);
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+
+    // ── Render quiet mode status ──────────────────────────────────────────────
+    async function renderQuietStatus() {
+      if (!quietStatusEl) return;
+      try {
+        const r = await chrome.storage.local.get('suite.quietUntil');
+        const until = r['suite.quietUntil'];
+        const isActive = until && typeof until === 'number' && until > Date.now();
+        quietStatusEl.textContent = isActive ? `Quiet until ${fmtHHMM(until)}` : 'Off';
+        quietStatusEl.style.color = isActive ? 'var(--amber)' : 'var(--text-2)';
+      } catch (_) {}
+    }
+
+    // ── Load current values via RequestMonitor.getConfig + notifications prefs ─
+    // Use RequestMonitor.getConfig() so we never touch the bare suite.requestMonitor
+    // key directly — the IO file covers the sub-keys. Badge pref uses suite.notifications.
+    const notifPrefKey = 'suite.notifications';
+
+    const [rmCfg, notifRes] = await Promise.all([
+      window.RequestMonitor ? window.RequestMonitor.getConfig() : Promise.resolve({}),
+      chrome.storage.local.get(notifPrefKey),
+    ]);
+    const notifPrefs = notifRes[notifPrefKey] || {};
+
+    desktopCb.checked = rmCfg.notifyEnabled !== false;
+    soundCb.checked = rmCfg.notifySound !== false;
+    badgeCb.checked = notifPrefs.badgeEnabled !== false; // default true
+
+    await renderQuietStatus();
+
+    // ── Flash saved ───────────────────────────────────────────────────────────
+    function flashSaved() {
+      if (!savedTag) return;
+      savedTag.classList.add('show');
+      setTimeout(() => savedTag.classList.remove('show'), 2000);
+    }
+
+    // ── Instant-save checkboxes ───────────────────────────────────────────────
+    async function saveDesktopSound() {
+      if (window.RequestMonitor) {
+        const cur = await window.RequestMonitor.getConfig();
+        await window.RequestMonitor.setConfig({
+          ...cur,
+          notifyEnabled: desktopCb.checked,
+          notifySound: soundCb.checked,
+        });
+      }
+      flashSaved();
+    }
+
+    async function saveBadge() {
+      const cur = (await chrome.storage.local.get(notifPrefKey))[notifPrefKey] || {};
+      await chrome.storage.local.set({
+        [notifPrefKey]: { ...cur, badgeEnabled: badgeCb.checked },
+      });
+      flashSaved();
+    }
+
+    desktopCb.addEventListener('change', saveDesktopSound);
+    soundCb.addEventListener('change', saveDesktopSound);
+    badgeCb.addEventListener('change', saveBadge);
+
+    // ── Clinic mode buttons ───────────────────────────────────────────────────
+    document.getElementById('quietBtn30m')?.addEventListener('click', async () => {
+      await window.QuietMode?.set(Date.now() + 30 * 60 * 1000);
+      renderQuietStatus();
+    });
+    document.getElementById('quietBtn1h')?.addEventListener('click', async () => {
+      await window.QuietMode?.set(Date.now() + 60 * 60 * 1000);
+      renderQuietStatus();
+    });
+    document.getElementById('quietBtnUntil18')?.addEventListener('click', async () => {
+      const now = new Date();
+      let until18 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 18, 0, 0, 0).getTime();
+      // Past 18:00 already? Roll to tomorrow's 18:00 so the button is never a
+      // dead click that silently leaves clinic mode off.
+      if (until18 <= Date.now()) until18 += 24 * 60 * 60 * 1000;
+      await window.QuietMode?.set(until18);
+      renderQuietStatus();
+    });
+    document.getElementById('quietBtnOff')?.addEventListener('click', async () => {
+      await window.QuietMode?.clear();
+      renderQuietStatus();
+    });
+
+    // ── Keep RM section checkboxes in sync via storage.onChanged ─────────────
+    // We watch the specific sub-keys covered by the IO file (not the bare parent key).
+    chrome.storage.onChanged.addListener((changes) => {
+      if (changes['suite.requestMonitor.notifyEnabled'] || changes['suite.requestMonitor.notifySound']) {
+        if (window.RequestMonitor) {
+          window.RequestMonitor.getConfig().then((cfg) => {
+            desktopCb.checked = cfg.notifyEnabled !== false;
+            soundCb.checked = cfg.notifySound !== false;
+          });
+        }
+      }
+      if (changes[notifPrefKey]) {
+        const v = changes[notifPrefKey].newValue || {};
+        badgeCb.checked = v.badgeEnabled !== false;
+      }
+      if ('suite.quietUntil' in changes) {
+        renderQuietStatus();
+      }
+    });
+  } catch (e) {
+    console.warn('[Notifications section init]', e.message);
+  }
+})();
+
+// ── Slot alert rules ──────────────────────────────────────────────────────────
+
+(async function initSlotAlerts() {
+  try {
+    const container = document.getElementById('slotAlertRules');
+    const addBtn = document.getElementById('addSlotAlertRule');
+    const savedTag = document.getElementById('slotAlertSaved');
+    if (!container || !addBtn) return;
+
+    const r = await chrome.storage.local.get('slots.alertRules');
+    let rules = r['slots.alertRules'] ?? [];
+
+    function save() {
+      chrome.storage.local.set({ 'slots.alertRules': rules });
+      if (savedTag) {
+        savedTag.classList.add('show');
+        setTimeout(() => savedTag.classList.remove('show'), 2000);
+      }
+    }
+
+    function renderRules() {
+      container.innerHTML = '';
+      rules.forEach((rule, i) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:8px; flex-wrap:wrap;';
+        row.innerHTML = `
+          <input type="checkbox" class="sar-enabled" ${rule.enabled ? 'checked' : ''} title="Enable this rule" />
+          <input type="text" class="sar-type" value="${escAttr(rule.typeName)}" placeholder="Slot type name (exact)"
+            style="flex:1; min-width:140px; background:var(--bg-elev); border:1px solid var(--border-hi);
+                   color:var(--text-2); font-family:var(--mono); font-size:11px; border-radius:5px; padding:4px 8px;" />
+          <span style="font-size:11px; color:var(--text-4);">≤</span>
+          <input type="number" class="sar-threshold" value="${rule.threshold}" min="0" max="100"
+            style="width:60px; background:var(--bg-elev); border:1px solid var(--border-hi); color:var(--text-2);
+                   font-family:var(--mono); font-size:11px; border-radius:5px; padding:4px 6px;" />
+          <span style="font-size:11px; color:var(--text-4);">slots</span>
+          <button class="sar-delete ghost" style="padding:2px 8px; font-size:11px;" title="Remove rule">✕</button>
+        `;
+        row.querySelector('.sar-enabled').addEventListener('change', (e) => {
+          rules[i].enabled = e.target.checked;
+          save();
+        });
+        row.querySelector('.sar-type').addEventListener('change', (e) => {
+          rules[i].typeName = e.target.value.trim();
+          save();
+        });
+        row.querySelector('.sar-threshold').addEventListener('change', (e) => {
+          const v = parseInt(e.target.value, 10);
+          if (!isNaN(v) && v >= 0) {
+            rules[i].threshold = v;
+            save();
+          }
+        });
+        row.querySelector('.sar-delete').addEventListener('click', () => {
+          rules.splice(i, 1);
+          save();
+          renderRules();
+        });
+        container.appendChild(row);
+      });
+    }
+
+    renderRules();
+
+    addBtn.addEventListener('click', () => {
+      rules.push({ id: Date.now().toString(36), typeName: '', threshold: 0, enabled: true });
+      renderRules();
+    });
+  } catch (e) {
+    console.warn('[Slot alerts init]', e.message);
+  }
+})();
+
+// ── Submission thresholds ─────────────────────────────────────────────────────
+
+(async function initSubmissionThresholds() {
+  try {
+    const DEFAULT_THRESHOLDS = {
+      medical: { amber: 30, red: 60, enabled: false },
+      admin: { amber: 20, red: 40, enabled: false },
+    };
+    const LABELS = { medical: 'Medical requests', admin: 'Admin requests' };
+
+    const grid = document.getElementById('submissionThresholds');
+    const saveBtn = document.getElementById('saveSubmissionThresholds');
+    const status = document.getElementById('submissionThresholdSaved');
+    if (!grid || !saveBtn) return;
+
+    const stored = await chrome.storage.local.get('submissions.thresholds');
+    const thresholds = { ...DEFAULT_THRESHOLDS, ...(stored['submissions.thresholds'] || {}) };
+
+    grid.innerHTML = Object.entries(LABELS)
+      .map(([key, label]) => {
+        const t = { ...DEFAULT_THRESHOLDS[key], ...(thresholds[key] || {}) };
+        return `
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text-2);min-width:110px">${label}</span>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-3)">
+            <input type="checkbox" data-key="${key}" data-field="enabled" ${t.enabled ? 'checked' : ''}> Enabled
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-3)">
+            Amber ≥ <input type="number" min="1" max="999" data-key="${key}" data-field="amber" value="${t.amber}"
+              style="width:54px;background:var(--bg-elev);border:1px solid var(--border-hi);color:var(--text-2);font-family:var(--mono);font-size:10px;border-radius:5px;padding:2px 5px">
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-3)">
+            Red ≥ <input type="number" min="1" max="999" data-key="${key}" data-field="red" value="${t.red}"
+              style="width:54px;background:var(--bg-elev);border:1px solid var(--border-hi);color:var(--text-2);font-family:var(--mono);font-size:10px;border-radius:5px;padding:2px 5px">
+          </label>
+        </div>`;
+      })
+      .join('');
+
+    saveBtn.addEventListener('click', async () => {
+      const out = {};
+      for (const key of Object.keys(LABELS)) {
+        out[key] = {
+          enabled: grid.querySelector(`[data-key="${key}"][data-field="enabled"]`)?.checked ?? false,
+          amber:
+            parseInt(grid.querySelector(`[data-key="${key}"][data-field="amber"]`)?.value) ||
+            DEFAULT_THRESHOLDS[key].amber,
+          red:
+            parseInt(grid.querySelector(`[data-key="${key}"][data-field="red"]`)?.value) || DEFAULT_THRESHOLDS[key].red,
+        };
+      }
+      await chrome.storage.local.set({ 'submissions.thresholds': out });
+      if (status) {
+        status.style.display = '';
+        setTimeout(() => {
+          status.style.display = 'none';
+        }, 2000);
+      }
+    });
+  } catch (e) {
+    console.warn('[Submission thresholds init]', e.message);
+  }
+})();
+
+// ── Waiting-room alert thresholds (visible entry point for suite.waitingRoom.thresholds) ──
+// Mirrors the in-palette editor (side-panel/thresholds). Per-device; the panel
+// applies changes live via its storage listener.
+(async function initWaitingThresholds() {
+  try {
+    const DEFAULT_WR = { amber: 10, red: 20 };
+    const amberEl = document.getElementById('wrAmber');
+    const redEl = document.getElementById('wrRed');
+    const saveBtn = document.getElementById('saveWaitingThresholds');
+    const resetBtn = document.getElementById('resetWaitingThresholds');
+    const saved = document.getElementById('waitingThresholdSaved');
+    const err = document.getElementById('waitingThresholdErr');
+    if (!amberEl || !redEl || !saveBtn) return;
+
+    const stored = await chrome.storage.local.get('suite.waitingRoom.thresholds');
+    const wr = { ...DEFAULT_WR, ...(stored['suite.waitingRoom.thresholds'] || {}) };
+    amberEl.value = wr.amber;
+    redEl.value = wr.red;
+
+    function showSaved() {
+      if (!saved) return;
+      saved.style.display = '';
+      setTimeout(() => {
+        saved.style.display = 'none';
+      }, 2000);
+    }
+    function showErr(msg) {
+      if (!err) return;
+      err.textContent = msg;
+      err.style.display = '';
+      setTimeout(() => {
+        err.style.display = 'none';
+      }, 2600);
+    }
+
+    saveBtn.addEventListener('click', async () => {
+      const amber = Math.round(Number(amberEl.value));
+      const red = Math.round(Number(redEl.value));
+      if (!Number.isFinite(amber) || !Number.isFinite(red) || amber < 1 || red < 1) {
+        showErr('Whole numbers above zero only.');
+        return;
+      }
+      if (red < amber) {
+        showErr('Red must be at least amber.');
+        return;
+      }
+      await chrome.storage.local.set({ 'suite.waitingRoom.thresholds': { amber, red } });
+      showSaved();
+    });
+
+    resetBtn?.addEventListener('click', async () => {
+      amberEl.value = DEFAULT_WR.amber;
+      redEl.value = DEFAULT_WR.red;
+      await chrome.storage.local.set({ 'suite.waitingRoom.thresholds': { ...DEFAULT_WR } });
+      showSaved();
+    });
+  } catch (e) {
+    console.warn('[Waiting thresholds init]', e.message);
+  }
+})();
+
+// ── Manual update check button (v3.0) ─────────────────────────────────────────
+
+(function initManualUpdateCheck() {
+  const btn = document.getElementById('checkUpdateBtn');
+  const result = document.getElementById('checkUpdateResult');
+  if (!btn || !window.UpdateChecker) return;
+
+  function formatTimeAgo(ts) {
+    if (!ts) return 'never';
+    const mins = Math.round((Date.now() - ts) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  }
+
+  async function setIdleStatus() {
+    const state = await window.UpdateChecker.getState();
+    const installed = window.UpdateChecker.getInstalledVersion();
+    if (!result) return;
+    if (state.error) {
+      // Also show when the failure occurred, if the service worker recorded it.
+      let failedAt = '';
+      try {
+        const sr = await chrome.storage.local.get('suite.updateCheck.status');
+        const status = sr['suite.updateCheck.status'];
+        if (status && status.lastError && status.lastError.ts) {
+          failedAt = ' (' + formatTimeAgo(status.lastError.ts) + ')';
+        }
+      } catch (_) {}
+      result.textContent = `Last check failed: ${state.error}${failedAt}`;
+      result.style.color = '#f59e0b';
+      return;
+    }
+    if (!state.latestVersion) {
+      result.textContent = 'Not checked yet';
+      result.style.color = '';
+      return;
+    }
+    const newer = window.UpdateChecker.isNewer(state.latestVersion, installed);
+    if (newer) {
+      result.textContent = `Update available: v${state.latestVersion} (you have v${installed}) · checked ${formatTimeAgo(state.checkedAt)}`;
+      result.style.color = '#4ade80';
+    } else {
+      result.textContent = `Up to date (v${installed}) · checked ${formatTimeAgo(state.checkedAt)}`;
+      result.style.color = 'var(--text-3)';
+    }
+  }
+
+  setIdleStatus();
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = 'Checking…';
+    if (result) {
+      result.textContent = 'Contacting GitHub…';
+      result.style.color = 'var(--text-3)';
+    }
+    try {
+      const res = await window.UpdateChecker.checkForUpdate({ force: true });
+      if (!res.ok && !res.quiet) {
+        if (result) {
+          result.textContent = `Check failed: ${res.error}`;
+          result.style.color = '#ef4444';
+        }
+      } else {
+        await setIdleStatus();
+      }
+    } catch (e) {
+      if (result) {
+        result.textContent = `Check failed: ${e.message}`;
+        result.style.color = '#ef4444';
+      }
+    }
+    btn.disabled = false;
+    btn.textContent = originalText;
+  });
+})();
+
+// ── Update banner (v1.3.1) ────────────────────────────────────────────────────
+
+(async function initUpdateBanner() {
+  try {
+    if (!window.UpdateChecker) return;
+    const banner = document.getElementById('updateBanner');
+    if (!banner) return;
+
+    // Trigger a check (respects internal 23h cooldown — won't hammer GitHub)
+    window.UpdateChecker.checkForUpdate().catch(() => {});
+
+    async function render() {
+      const state = await window.UpdateChecker.getState();
+      const installed = window.UpdateChecker.getInstalledVersion();
+      const available =
+        state.latestVersion && installed && window.UpdateChecker.isNewer(state.latestVersion, installed);
+
+      // Practice-managed bits (suite-release.json / sync-status.json on Source):
+      // do not send staff to a different GitHub zip than Pete's tree.
+      let practiceManaged = false;
+      try {
+        if (window.LocalBits) {
+          const bits = await window.LocalBits.getState();
+          practiceManaged = !!bits.practiceManaged;
+        }
+      } catch (_) {}
+
+      if (!available || practiceManaged) {
+        banner.style.display = 'none';
+        return;
+      }
+      banner.style.display = 'block';
+      const vEl = document.getElementById('updateBannerVersion');
+      const iEl = document.getElementById('updateBannerInstalled');
+      if (vEl) vEl.textContent = `v${state.latestVersion}`;
+      if (iEl) iEl.textContent = `v${installed}`;
+    }
+
+    await render();
+
+    // Re-render whenever the stored update state changes
+    chrome.storage.onChanged.addListener((changes) => {
+      if (Object.keys(changes).some((k) => k.startsWith('suite.update.') || k.startsWith('suite.localBits.'))) render();
+    });
+
+    // Buttons
+    document.getElementById('updateBannerOpenBtn')?.addEventListener('click', async () => {
+      const state = await window.UpdateChecker.getState();
+      if (state.releaseUrl) chrome.tabs.create({ url: state.releaseUrl });
+    });
+
+    document.getElementById('updateBannerNotesBtn')?.addEventListener('click', async () => {
+      const notesEl = document.getElementById('updateBannerNotes');
+      if (!notesEl) return;
+      if (notesEl.style.display === 'none') {
+        const state = await window.UpdateChecker.getState();
+        notesEl.textContent = state.releaseNotes || '(no release notes)';
+        notesEl.style.display = 'block';
+      } else {
+        notesEl.style.display = 'none';
+      }
+    });
+  } catch (e) {
+    console.warn('[Update banner init]', e.message);
+  }
+})();
+
+// ── Local bits banner (practice OS-sync — not GitHub) ─────────────────────────
+
+(async function initLocalBitsBanner() {
+  try {
+    if (!window.LocalBits) return;
+    const banner = document.getElementById('localBitsBanner');
+    const older = document.getElementById('localBitsOlderNote');
+    if (!banner) return;
+
+    async function render(state) {
+      const st = state || (await window.LocalBits.getState());
+      const diskEl = document.getElementById('localBitsBannerDisk');
+      const runEl = document.getElementById('localBitsBannerRunning');
+      const noteEl = document.getElementById('localBitsBannerNote');
+      if (window.LocalBits.isReloadAvailable(st)) {
+        banner.style.display = 'block';
+        if (diskEl) diskEl.textContent = 'v' + st.diskVersion;
+        if (runEl) runEl.textContent = 'v' + (st.runningVersion || window.LocalBits.getInstalledVersion());
+        if (noteEl) {
+          noteEl.textContent =
+            'The Windows helper already copied files onto this PC. Reload applies them. The extension does not write files.';
+        }
+      } else {
+        banner.style.display = 'none';
+      }
+      if (older) {
+        if (st.status === 'older-ignored') {
+          older.style.display = 'block';
+          older.textContent =
+            'Reference / disk stamp v' +
+            st.diskVersion +
+            ' is older than running v' +
+            st.runningVersion +
+            ' — not applying (no silent downgrade).';
+        } else {
+          older.style.display = 'none';
+        }
+      }
+    }
+
+    window.LocalBits.checkAndPersist()
+      .then(render)
+      .catch(() => render());
+
+    chrome.storage.onChanged.addListener((changes) => {
+      if (Object.keys(changes).some((k) => k.startsWith('suite.localBits.'))) render();
+    });
+
+    document.getElementById('localBitsReloadBtn')?.addEventListener('click', () => {
+      try {
+        chrome.runtime.reload();
+      } catch (e) {
+        console.warn('[Local bits reload]', e && e.message);
+      }
+    });
+  } catch (e) {
+    console.warn('[Local bits banner init]', e.message);
+  }
+})();
+
+// ── Reception section ─────────────────────────────────────────────────────────
+// Pathway enable/disable (disclaimer-gated, all OFF by default), pathway
+// editor (bundled edits → reception.pathwayOverrides; practice-authored →
+// reception.customPathways), and the quick-wins chip filter
+// (reception.config.hiddenChipRules). Validation/sanitisation delegates to
+// shared/reception-pathway-utils.js — the same code path the backup import
+// uses, so nothing invalid can reach storage from either direction.
+
+// ── Clinical Safety: single "Accept for practice" switch ──────────────────────
+// Sets ONE suite-level flag (suite.practiceAcceptedAt) that the reception and
+// knowledge gates honour, and fans out to the values that must exist/travel for
+// the features to actually be on: all reception pathways enabled + the Sentinel
+// alert library acknowledged. The flag is carried in a suite backup, so this
+// acceptance PROPAGATES on restore (the per-install attestations deliberately do
+// not). Withdrawing clears only the flag, which re-locks reception + knowledge.
+(async function initPracticeAcceptanceSection() {
+  const card = document.getElementById('practiceAcceptCard');
+  if (!card) return;
+  const statusEl = document.getElementById('practiceAcceptStatus');
+  const confirmRow = document.getElementById('practiceAcceptConfirmRow');
+  const tick = document.getElementById('practiceAcceptTick');
+  const acceptBtn = document.getElementById('practiceAcceptBtn');
+  const withdrawBtn = document.getElementById('practiceWithdrawBtn');
+
+  async function render() {
+    const accepted = await isPracticeAccepted();
+    if (accepted) {
+      const r = await chrome.storage.local.get('suite.practiceAcceptedAt');
+      statusEl.innerHTML = `<span style="color: var(--green, #15803d); font-weight: 600">&#10003; Accepted for this practice</span> <span style="color: var(--text-3)">on ${escHtml(String(r['suite.practiceAcceptedAt']).slice(0, 10))}</span>`;
+      acceptBtn.style.display = 'none';
+      confirmRow.style.display = 'none';
+      withdrawBtn.style.display = '';
+    } else {
+      statusEl.innerHTML = `<span style="color: var(--text-3)">Not yet accepted &mdash; reception capture and the alert library stay off.</span>`;
+      acceptBtn.style.display = '';
+      confirmRow.style.display = '';
+      withdrawBtn.style.display = 'none';
+      tick.checked = false;
+      acceptBtn.disabled = true;
+    }
+  }
+
+  tick?.addEventListener('change', () => {
+    acceptBtn.disabled = !tick.checked;
+  });
+
+  acceptBtn?.addEventListener('click', async () => {
+    if (!tick.checked) return;
+    await acceptForPractice();
+    await render();
+  });
+
+  withdrawBtn?.addEventListener('click', async () => {
+    await withdrawPracticeAcceptance();
+    await render();
+  });
+
+  await render();
+})();
+
+(function initReceptionSection() {
+  const PU = window.ReceptionPathwayUtils;
+  const $ = (id) => document.getElementById(id);
+  if (!$('rcpoPathwayList') || !PU) return;
+
+  const DISCLAIMER_HTML = `
+    <div style="border:1px solid rgba(180,83,9,0.45); background:rgba(180,83,9,0.07); border-radius:8px; padding:12px 14px; font-size:12px; line-height:1.7; color:var(--text-2);">
+      <div style="font-weight:700; margin-bottom:6px;">Before enabling the reception capture pathways, the practice confirms:</div>
+      <ol style="margin:0 0 8px 18px; padding:0;">
+        <li>The capture tool records what callers report. It does <strong>not</strong> triage, diagnose, or replace clinical judgement — a clinician reviews every capture.</li>
+        <li>The red-flag questions are short, lay-phrased prompts derived from NICE CKS / NICE guideline red-flag lists. They are <strong>not exhaustive</strong>: a full set of "no" answers does not make a contact safe to handle routinely.</li>
+        <li>Reception staff must follow the practice's own escalation policy whenever a red flag is positive <em>or the caller sounds unwell</em>, even if every scripted question is answered "no".</li>
+        <li>The bundled pathway content, and any practice edits or custom pathways, must be clinically reviewed (CSO or nominated GP) before use and re-reviewed after every edit.</li>
+        <li>Staff using the tool have been briefed on the points above.</li>
+      </ol>
+      <label style="display:flex; gap:8px; align-items:flex-start; font-weight:600; cursor:pointer;">
+        <input type="checkbox" id="rcpoDisclaimerTick" style="margin-top:2px;">
+        <span>A clinician (CSO or nominated GP) has reviewed the pathway content and the practice accepts responsibility for it.</span>
+      </label>
+      <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+        <button class="primary" id="rcpoDisclaimerAccept" disabled style="font-size:11px; padding:5px 12px;">Accept &amp; enable all pathways</button>
+        <button class="ghost" id="rcpoDisclaimerCancel" style="font-size:11px; padding:5px 12px;">Cancel</button>
+      </div>
+    </div>`;
+
+  let _bundled = null; // pathways json doc
+  let _editing = null; // { pathway, origin } while editor open
+
+  async function getState() {
+    const r = await chrome.storage.local.get([
+      'reception.config',
+      'reception.customPathways',
+      'reception.pathwayOverrides',
+      'reception.routingAttestation',
+    ]);
+    return {
+      config: r['reception.config'] || {},
+      custom: r['reception.customPathways'] || [],
+      overrides: r['reception.pathwayOverrides'] || {},
+      routingAttestation: r['reception.routingAttestation'] || null,
+    };
+  }
+
+  async function setConfig(patch) {
+    const { config } = await getState();
+    await chrome.storage.local.set({ 'reception.config': Object.assign({}, config, patch) });
+  }
+
+  // Practice-editable free-text config (safeguarding lead, crisis line). Clamped
+  // to the same 200 chars the backup importer enforces, so a value that survives
+  // a save/export/restore round-trip is always the value the practice typed.
+  const RCPO_TEXT_MAX = 200;
+
+  // ── "NEW" badge on freshly-bundled pathways ─────────────────────────────────
+  // New bundled pathways ship DISABLED (correct for CSO-gated clinical content),
+  // which means a practice would otherwise never learn they arrived. seenBundledIds
+  // records the bundled ids this practice has already been shown; anything bundled,
+  // still off, and not in that list gets a NEW badge. Marked seen when the practice
+  // toggles it, edits it, or dismisses the badge — never automatically on render,
+  // or the badge would vanish before anyone read it.
+  async function markBundledSeen(ids) {
+    const { config } = await getState();
+    const seen = Array.isArray(config.seenBundledIds) ? config.seenBundledIds.slice() : [];
+    let changed = false;
+    for (const id of ids || []) {
+      if (id && seen.indexOf(id) === -1) {
+        seen.push(id);
+        changed = true;
+      }
+    }
+    if (changed) await setConfig({ seenBundledIds: seen });
+    return changed;
+  }
+
+  async function loadBundled() {
+    if (_bundled) return _bundled;
+    const r = await fetch(chrome.runtime.getURL('rules/reception-pathways.json'));
+    _bundled = await r.json();
+    return _bundled;
+  }
+
+  // ── Disclaimer ──────────────────────────────────────────────────────────────
+
+  function renderDisclaimerArea(config, resolved, centralProv) {
+    const host = $('rcpoDisclaimerBody');
+    if (!host) return;
+    if (config.disclaimerAcceptedAt) {
+      const enabledCount = resolved.all.filter((e) => e.enabled).length;
+      const acceptedLine = centralProv
+        ? `Accepted centrally by ${escHtml(centralProv.by || 'practice admin')} via practice profile`
+        : `Disclaimer accepted ${escHtml(String(config.disclaimerAcceptedAt).slice(0, 10))}`;
+      host.innerHTML = `
+        <div style="font-size:12px; color:var(--text-2); display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <span>${acceptedLine} · ${enabledCount}/${resolved.all.length} pathway(s) enabled.</span>
+          <button class="ghost" id="rcpoEnableAll" style="font-size:11px; padding:4px 10px;">Enable all</button>
+          <button class="ghost" id="rcpoDisableAll" style="font-size:11px; padding:4px 10px;">Disable all</button>
+        </div>`;
+      $('rcpoEnableAll')?.addEventListener('click', () => setAllEnabled(true));
+      $('rcpoDisableAll')?.addEventListener('click', () => setAllEnabled(false));
+      return;
+    }
+    host.innerHTML = `
+      <div style="border:1px solid rgba(185,28,28,0.4); background:rgba(185,28,28,0.06); border-radius:8px; padding:10px 14px; font-size:12px; color:var(--text-2); display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <span style="font-weight:700;">All capture pathways are disabled.</span>
+        <span>Review and accept the disclaimer to enable them.</span>
+        <button class="primary" id="rcpoShowDisclaimer" style="font-size:11px; padding:5px 12px;">Review disclaimer…</button>
+      </div>
+      <div id="rcpoDisclaimerExpand" style="display:none; margin-top:10px;"></div>`;
+    $('rcpoShowDisclaimer')?.addEventListener('click', () => {
+      const exp = $('rcpoDisclaimerExpand');
+      exp.style.display = '';
+      exp.innerHTML = DISCLAIMER_HTML;
+      const tick = $('rcpoDisclaimerTick');
+      const accept = $('rcpoDisclaimerAccept');
+      tick?.addEventListener('change', () => {
+        accept.disabled = !tick.checked;
+      });
+      accept?.addEventListener('click', async () => {
+        await setConfig({ disclaimerAcceptedAt: new Date().toISOString() });
+        await setAllEnabled(true);
+      });
+      $('rcpoDisclaimerCancel')?.addEventListener('click', () => {
+        exp.style.display = 'none';
+      });
+    });
+  }
+
+  async function setAllEnabled(on) {
+    const [{ config, custom, overrides }, bundled] = await Promise.all([getState(), loadBundled()]);
+    const resolved = PU.resolveEffectivePathways({
+      bundled: bundled.pathways || [],
+      overrides,
+      customPathways: custom,
+      enabledPathways: config.enabledPathways || {},
+      disclaimerAccepted: !!config.disclaimerAcceptedAt,
+    });
+    const map = {};
+    if (on)
+      for (const e of resolved.all) {
+        if (!e.invalid) map[e.pathway.id] = true;
+      }
+    await setConfig({ enabledPathways: map });
+    refresh();
+  }
+
+  // ── Pathway list ────────────────────────────────────────────────────────────
+
+  const ORIGIN_BADGE = {
+    bundled: ['Bundled', 'rgba(74,127,184,0.15)', 'var(--accent)'],
+    edited: ['Edited', 'rgba(180,83,9,0.15)', 'var(--amber, #b45309)'],
+    custom: ['Custom', 'rgba(22,163,74,0.15)', 'var(--green, #16a34a)'],
+  };
+
+  function renderPathwayList(resolved, config) {
+    const host = $('rcpoPathwayList');
+    if (!host) return;
+    const seenBundled = new Set(Array.isArray(config.seenBundledIds) ? config.seenBundledIds : []);
+    host.innerHTML =
+      resolved.all
+        .map((e) => {
+          const p = e.pathway;
+          // Bundled (or practice-edited bundled) pathway the practice has not been
+          // shown yet and has not enabled — flag it as newly arrived.
+          const isNew = e.origin !== 'custom' && !e.enabled && !seenBundled.has(p.id);
+          const newBadge = isNew
+            ? `<span style="font-size:10px; font-weight:700; padding:2px 7px; border-radius:3px; background:rgba(22,163,74,0.15); color:var(--green, #16a34a);">NEW</span>`
+            : '';
+          const newDismiss = isNew
+            ? `<button class="ghost" data-rcpo-seen="${escAttr(p.id)}" title="Stop showing the NEW badge for this pathway" style="font-size:10px; padding:3px 9px;">Dismiss</button>`
+            : '';
+          const [label, bg, fg] = ORIGIN_BADGE[e.origin] || ORIGIN_BADGE.bundled;
+          const invalid = e.invalid
+            ? `<span style="font-size:10px; font-weight:700; color:var(--red, #b91c1c);">INVALID — not shown to reception</span>`
+            : e.overrideInvalid
+              ? `<span style="font-size:10px; font-weight:700; color:var(--amber, #b45309);">EDIT INVALID — bundled version active</span>`
+              : '';
+          const actions = [
+            newDismiss,
+            `<button class="ghost" data-rcpo-edit="${escAttr(p.id)}" style="font-size:10px; padding:3px 9px;">Edit</button>`,
+            e.origin === 'edited'
+              ? `<button class="ghost" data-rcpo-reset="${escAttr(p.id)}" style="font-size:10px; padding:3px 9px;">Reset to bundled</button>`
+              : '',
+            e.origin === 'custom'
+              ? `<button class="ghost" data-rcpo-delete="${escAttr(p.id)}" style="font-size:10px; padding:3px 9px;">Delete</button>`
+              : '',
+          ].join('');
+          return `
+        <div style="display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; margin-bottom:6px;">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; min-width:0; flex:1;">
+            <input type="checkbox" data-rcpo-toggle="${escAttr(p.id)}" ${e.enabled ? 'checked' : ''} ${e.invalid ? 'disabled' : ''}>
+            <span style="font-weight:600; font-size:12px;">${escHtml(p.title)}</span>
+            <span style="font-size:10px; font-weight:700; padding:2px 7px; border-radius:3px; background:${bg}; color:${fg};">${label}</span>
+            ${newBadge}
+            ${p.sensitive === true ? `<span style="font-size:10px; font-weight:700; padding:2px 7px; border-radius:3px; background:rgba(180,83,9,0.15); color:var(--amber, #b45309);" title="Capture drafts are never auto-saved; taker initials required">SENSITIVE</span>` : ''}
+            ${invalid}
+          </label>
+          <div style="display:flex; gap:6px;">${actions}</div>
+        </div>`;
+        })
+        .join('') || '<div style="font-size:12px; color:var(--text-3);">No pathways found.</div>';
+
+    host.querySelectorAll('[data-rcpo-toggle]').forEach((cb) => {
+      cb.addEventListener('change', async () => {
+        const id = cb.dataset.rcpoToggle;
+        const { config } = await getState();
+        if (cb.checked && !config.disclaimerAcceptedAt) {
+          cb.checked = false;
+          alert('Review and accept the disclaimer above before enabling any pathway.');
+          return;
+        }
+        const map = Object.assign({}, config.enabledPathways || {});
+        if (cb.checked) map[id] = true;
+        else delete map[id];
+        await setConfig({ enabledPathways: map });
+        // Touching a pathway counts as having seen it — clear its NEW badge.
+        await markBundledSeen([id]);
+        refresh();
+      });
+    });
+    host.querySelectorAll('[data-rcpo-seen]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await markBundledSeen([btn.dataset.rcpoSeen]);
+        refresh();
+      });
+    });
+    host.querySelectorAll('[data-rcpo-edit]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await markBundledSeen([btn.dataset.rcpoEdit]);
+        openEditor(btn.dataset.rcpoEdit, resolved);
+      });
+    });
+    host.querySelectorAll('[data-rcpo-reset]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Discard the practice edit and restore the bundled version of this pathway?')) return;
+        const { overrides } = await getState();
+        delete overrides[btn.dataset.rcpoReset];
+        await chrome.storage.local.set({ 'reception.pathwayOverrides': overrides });
+        refresh();
+      });
+    });
+    host.querySelectorAll('[data-rcpo-delete]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete this custom pathway? This cannot be undone.')) return;
+        const { custom, config } = await getState();
+        const id = btn.dataset.rcpoDelete;
+        const map = Object.assign({}, config.enabledPathways || {});
+        delete map[id];
+        await chrome.storage.local.set({ 'reception.customPathways': custom.filter((p) => p.id !== id) });
+        await setConfig({ enabledPathways: map });
+        refresh();
+      });
+    });
+  }
+
+  // ── Editor ──────────────────────────────────────────────────────────────────
+
+  let _rowSeq = 0;
+  function rfRowHtml(rf) {
+    const id = rf?.id || `rf-new-${++_rowSeq}`;
+    return `
+      <div class="rcpo-rf-row" data-rfid="${escAttr(id)}" style="display:flex; gap:6px; margin-bottom:5px; align-items:center;">
+        <input type="text" class="rcpo-rf-ask" value="${escAttr(rf?.ask || '')}" placeholder="Red-flag question (lay wording, as asked on the phone)" style="flex:1; font-size:12px; padding:4px 7px;">
+        <select class="rcpo-rf-esc" style="font-size:12px; padding:4px;">
+          <option value="999" ${rf?.escalate === '999' ? 'selected' : ''}>999-level</option>
+          <option value="duty" ${rf?.escalate !== '999' ? 'selected' : ''}>Duty clinician</option>
+        </select>
+        <label style="display:flex; align-items:center; gap:4px; font-size:11px; color:var(--text-3); white-space:nowrap;" title="A YES also escalates to the practice safeguarding lead and bypasses all routing">
+          <input type="checkbox" class="rcpo-rf-sg" ${rf?.safeguarding === true ? 'checked' : ''}> Safeguarding
+        </label>
+        <button type="button" class="ghost rcpo-row-del" style="font-size:10px; padding:3px 8px;">✕</button>
+      </div>`;
+  }
+  function qRowHtml(q) {
+    const id = q?.id || `q-new-${++_rowSeq}`;
+    const type = q?.type || 'text';
+    const opts = (q?.options || []).join(', ');
+    return `
+      <div class="rcpo-q-row" data-qid="${escAttr(id)}" style="border:1px solid var(--border); border-radius:6px; padding:7px 9px; margin-bottom:6px;">
+        <div style="display:flex; gap:6px; margin-bottom:5px;">
+          <input type="text" class="rcpo-q-label" value="${escAttr(q?.label || '')}" placeholder="Short label (used in the pasted summary)" style="flex:0 0 220px; font-size:12px; padding:4px 7px;">
+          <select class="rcpo-q-type" style="font-size:12px; padding:4px;">
+            ${['text', 'yesno', 'choice', 'multi'].map((t) => `<option value="${t}" ${type === t ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <button type="button" class="ghost rcpo-row-del" style="font-size:10px; padding:3px 8px; margin-left:auto;">✕</button>
+        </div>
+        <input type="text" class="rcpo-q-ask" value="${escAttr(q?.ask || '')}" placeholder="Question as asked on the phone" style="width:100%; box-sizing:border-box; font-size:12px; padding:4px 7px; margin-bottom:5px;">
+        <input type="text" class="rcpo-q-opts" value="${escAttr(opts)}" placeholder="Options, comma-separated (choice/multi only)" style="width:100%; box-sizing:border-box; font-size:12px; padding:4px 7px; ${type === 'choice' || type === 'multi' ? '' : 'display:none;'}">
+      </div>`;
+  }
+
+  // ── Disposition editor rows (plan E) ────────────────────────────────────────
+  // Labels only — every vocabulary below comes from ReceptionPathwayUtils, so
+  // the editor cannot offer a destination, domain or condition the validator
+  // would reject.
+  const RCPO_DEST_LABELS = {
+    pharmacy_first: 'Pharmacy First',
+    anp: 'ANP / minor-illness nurse',
+    paramedic: 'Paramedic practitioner',
+    gp_routine: 'GP appointment',
+  };
+  const RCPO_DOMAIN_LABELS = {
+    minor_infection: 'Minor infection',
+    msk: 'Musculoskeletal',
+    gu_male: 'Genitourinary (male)',
+    gyn_female: 'Gynaecology (female)',
+    mental_health: 'Mental health',
+    other: 'Other',
+  };
+  const RCPO_WHEN_LABELS = {
+    pharmacyFirstEligible: 'Pharmacy First eligible',
+    ageUnder: 'Age under',
+    ageAtLeast: 'Age at least',
+  };
+
+  function dispRuleRowHtml(rule) {
+    const when = (rule && rule.when) || {};
+    const key = Object.keys(when).find((k) => PU.DISPOSITION_WHEN_KEYS.indexOf(k) !== -1) || 'pharmacyFirstEligible';
+    const isBool = key === 'pharmacyFirstEligible';
+    const boolVal = when.pharmacyFirstEligible === false ? 'false' : 'true';
+    const ageVal = isBool ? '' : when[key];
+    return `
+      <div class="rcpo-disp-row" style="display:flex; gap:6px; align-items:center; margin-bottom:5px; flex-wrap:wrap;">
+        <span style="font-size:11px; color:var(--text-3);">If</span>
+        <select class="rcpo-disp-when" style="font-size:12px; padding:4px;">
+          ${PU.DISPOSITION_WHEN_KEYS.map((k) => `<option value="${k}" ${k === key ? 'selected' : ''}>${escHtml(RCPO_WHEN_LABELS[k] || k)}</option>`).join('')}
+        </select>
+        <select class="rcpo-disp-bool" style="font-size:12px; padding:4px; ${isBool ? '' : 'display:none;'}">
+          <option value="true" ${boolVal === 'true' ? 'selected' : ''}>yes</option>
+          <option value="false" ${boolVal === 'false' ? 'selected' : ''}>no</option>
+        </select>
+        <input type="number" class="rcpo-disp-age" min="0" max="120" step="1" value="${escAttr(ageVal == null ? '' : String(ageVal))}" style="width:70px; font-size:12px; padding:4px 6px; ${isBool ? 'display:none;' : ''}">
+        <span style="font-size:11px; color:var(--text-3);">suggest</span>
+        <select class="rcpo-disp-suggest" style="font-size:12px; padding:4px;">
+          ${PU.DISPOSITION_DESTINATIONS.map((d) => `<option value="${d}" ${rule && rule.suggest === d ? 'selected' : ''}>${escHtml(RCPO_DEST_LABELS[d] || d)}</option>`).join('')}
+        </select>
+        <button type="button" class="ghost rcpo-disp-del" style="font-size:10px; padding:3px 8px;">✕</button>
+      </div>`;
+  }
+
+  function dispositionSectionHtml(pathway) {
+    const d = pathway && pathway.disposition;
+    const domain = d ? d.domain : '';
+    const allowed = (d && Array.isArray(d.allowed) ? d.allowed : []).slice();
+    const rules = d && Array.isArray(d.rules) ? d.rules : [];
+    return `
+      <div style="font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); margin:14px 0 5px;">Disposition &mdash; where this patient could safely go</div>
+      <div style="font-size:11px; color:var(--text-3); line-height:1.6; margin-bottom:7px;">
+        Optional. A <strong>suggestion</strong> shown only after every red flag has been answered and none is positive
+        &mdash; nothing is ever booked, and the receptionist always also offers a clinician callback. Leave the domain
+        as &ldquo;No routing&rdquo; for anything that should always go to a clinician. Age under 1 is always
+        clinician-only, and under 5 never reaches a nurse or paramedic, whatever is set here.
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:7px; flex-wrap:wrap;">
+        <label style="font-size:11px; color:var(--text-3); display:flex; gap:5px; align-items:center;">Domain
+          <select id="rcpoEdDispDomain" style="font-size:12px; padding:4px;">
+            <option value="" ${domain ? '' : 'selected'}>No routing (clinician only)</option>
+            ${PU.DISPOSITION_DOMAINS.map((dm) => `<option value="${dm}" ${dm === domain ? 'selected' : ''}>${escHtml(RCPO_DOMAIN_LABELS[dm] || dm)}</option>`).join('')}
+          </select>
+        </label>
+        <label style="font-size:11px; color:var(--text-3); display:flex; gap:5px; align-items:center;">If no rule matches
+          <select id="rcpoEdDispDefault" style="font-size:12px; padding:4px;">
+            ${PU.DISPOSITION_DEFAULTS.map((v) => `<option value="${v}" ${d && d.default === v ? 'selected' : ''}>${v === 'duty' ? 'Duty clinician' : 'GP appointment'}</option>`).join('')}
+          </select>
+        </label>
+      </div>
+      <div id="rcpoEdDispAllowed" style="display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--text-2); margin-bottom:4px;">
+        ${PU.DISPOSITION_DESTINATIONS.map(
+          (dest) => `
+          <label style="display:flex; gap:5px; align-items:center;" data-dest="${dest}">
+            <input type="checkbox" class="rcpo-disp-allowed" value="${dest}" ${allowed.indexOf(dest) !== -1 ? 'checked' : ''}>
+            <span>${escHtml(RCPO_DEST_LABELS[dest] || dest)}</span>
+          </label>`
+        ).join('')}
+      </div>
+      <div id="rcpoEdDispNote" style="font-size:11px; color:var(--amber, #b45309); margin-bottom:6px; display:none;"></div>
+      <div id="rcpoEdDispRules">${rules.map(dispRuleRowHtml).join('')}</div>
+      <button type="button" class="ghost" id="rcpoEdAddDispRule" style="font-size:10px; padding:3px 9px;">+ Add routing rule</button>`;
+  }
+
+  function openEditor(idOrNull, resolved) {
+    const host = $('rcpoEditorHost');
+    if (!host) return;
+    let pathway = null,
+      origin = 'custom';
+    if (idOrNull) {
+      const entry = resolved.all.find((e) => e.pathway.id === idOrNull);
+      if (!entry) return;
+      pathway = entry.pathway;
+      origin = entry.origin === 'custom' ? 'custom' : 'bundled-edit';
+    }
+    _editing = { id: idOrNull, origin };
+
+    const rfRows = (pathway?.redFlags || [{}]).map(rfRowHtml).join('');
+    const qRows = (pathway?.questions || [{}]).map(qRowHtml).join('');
+
+    host.innerHTML = `
+      <div style="border:1px solid var(--border-hi); border-radius:10px; padding:14px 16px; margin-top:12px;">
+        <div style="font-weight:700; font-size:13px; margin-bottom:10px;">
+          ${pathway ? `Edit pathway: ${escHtml(pathway.title)}` : 'New custom pathway'}
+          ${origin === 'bundled-edit' ? '<span style="font-size:10px; color:var(--text-3);"> (saved as a practice edit — the bundled original can be restored at any time)</span>' : ''}
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:8px;">
+          <input type="text" id="rcpoEdTitle" value="${escAttr(pathway?.title || '')}" placeholder="Pathway title" style="flex:1; font-size:12px; padding:5px 8px;">
+          <input type="text" id="rcpoEdApplies" value="${escAttr(pathway?.appliesTo || '')}" placeholder="Applies to (e.g. Adults)" style="flex:1; font-size:12px; padding:5px 8px;">
+        </div>
+        <label style="display:flex; align-items:flex-start; gap:7px; font-size:12px; color:var(--text-2); margin-bottom:8px; cursor:pointer;">
+          <input type="checkbox" id="rcpoEdSensitive" ${pathway?.sensitive === true ? 'checked' : ''} style="margin-top:2px;">
+          <span>Sensitive pathway &mdash; capture drafts are <strong>never</strong> auto-saved, and the receptionist's initials are required before a summary can be generated. Use for content that must not sit on a shared front-desk machine (e.g. mental health).</span>
+        </label>
+        <div style="font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); margin:10px 0 5px;">Red flags — asked first, every one must be answered</div>
+        <div id="rcpoEdRf">${rfRows}</div>
+        <button type="button" class="ghost" id="rcpoEdAddRf" style="font-size:10px; padding:3px 9px;">+ Add red flag</button>
+        <div style="font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); margin:14px 0 5px;">History questions</div>
+        <div id="rcpoEdQ">${qRows}</div>
+        <button type="button" class="ghost" id="rcpoEdAddQ" style="font-size:10px; padding:3px 9px;">+ Add question</button>
+        ${dispositionSectionHtml(pathway)}
+        <div id="rcpoEdErrors" style="color:var(--red, #b91c1c); font-size:11px; margin-top:8px; white-space:pre-line;"></div>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button class="primary" id="rcpoEdSave" style="font-size:11px; padding:5px 14px;">Save pathway</button>
+          <button class="ghost" id="rcpoEdCancel" style="font-size:11px; padding:5px 12px;">Cancel</button>
+          <span style="font-size:11px; color:var(--text-3); align-self:center;">Saving does not enable the pathway — review it clinically, then toggle it on.</span>
+        </div>
+      </div>`;
+
+    const wireRowDeletes = () =>
+      host.querySelectorAll('.rcpo-row-del').forEach((b) => {
+        b.onclick = () => b.closest('.rcpo-rf-row, .rcpo-q-row')?.remove();
+      });
+    const wireTypeToggles = () =>
+      host.querySelectorAll('.rcpo-q-type').forEach((sel) => {
+        sel.onchange = () => {
+          const opts = sel.closest('.rcpo-q-row').querySelector('.rcpo-q-opts');
+          opts.style.display = sel.value === 'choice' || sel.value === 'multi' ? '' : 'none';
+        };
+      });
+    // Disposition rows: the condition control switches between the yes/no
+    // selector and the age box, and clinician-only domains (or a sensitive
+    // pathway) grey out every non-clinician destination with a note — the
+    // engine refuses them anyway, so the editor must not pretend otherwise.
+    const wireDispRows = () => {
+      host.querySelectorAll('.rcpo-disp-del').forEach((b) => {
+        b.onclick = () => b.closest('.rcpo-disp-row')?.remove();
+      });
+      host.querySelectorAll('.rcpo-disp-when').forEach((sel) => {
+        sel.onchange = () => {
+          const row = sel.closest('.rcpo-disp-row');
+          const isBool = sel.value === 'pharmacyFirstEligible';
+          row.querySelector('.rcpo-disp-bool').style.display = isBool ? '' : 'none';
+          row.querySelector('.rcpo-disp-age').style.display = isBool ? 'none' : '';
+        };
+      });
+    };
+    const syncDispClinicianOnly = () => {
+      const domainSel = $('rcpoEdDispDomain');
+      const note = $('rcpoEdDispNote');
+      if (!domainSel || !note) return;
+      const clinicianOnly =
+        PU.CLINICIAN_ONLY_DOMAINS.indexOf(domainSel.value) !== -1 || !!$('rcpoEdSensitive')?.checked;
+      const frozenId = !!(pathway && PU.CLINICIAN_ONLY_IDS.indexOf(pathway.id) !== -1);
+      host.querySelectorAll('.rcpo-disp-allowed').forEach((cb) => {
+        const block = (clinicianOnly || frozenId) && cb.value !== 'gp_routine';
+        cb.disabled = block;
+        if (block) cb.checked = false;
+        const lbl = cb.closest('label');
+        if (lbl) lbl.style.opacity = block ? '0.45' : '';
+      });
+      if (frozenId) {
+        note.style.display = '';
+        note.textContent =
+          'This pathway is clinician-only in engine code — it can never suggest a non-clinician route, however it is edited here.';
+      } else if (clinicianOnly) {
+        note.style.display = '';
+        note.textContent =
+          'Clinician-only: sensitive pathways and the mental-health / male-GU / gynaecology domains never suggest a non-clinician route.';
+      } else {
+        note.style.display = 'none';
+        note.textContent = '';
+      }
+    };
+    wireRowDeletes();
+    wireTypeToggles();
+    wireDispRows();
+    syncDispClinicianOnly();
+    $('rcpoEdDispDomain')?.addEventListener('change', syncDispClinicianOnly);
+    $('rcpoEdSensitive')?.addEventListener('change', syncDispClinicianOnly);
+    $('rcpoEdAddDispRule')?.addEventListener('click', () => {
+      $('rcpoEdDispRules').insertAdjacentHTML('beforeend', dispRuleRowHtml(null));
+      wireDispRows();
+    });
+    $('rcpoEdAddRf')?.addEventListener('click', () => {
+      $('rcpoEdRf').insertAdjacentHTML('beforeend', rfRowHtml(null));
+      wireRowDeletes();
+    });
+    $('rcpoEdAddQ')?.addEventListener('click', () => {
+      $('rcpoEdQ').insertAdjacentHTML('beforeend', qRowHtml(null));
+      wireRowDeletes();
+      wireTypeToggles();
+    });
+    $('rcpoEdCancel')?.addEventListener('click', () => {
+      host.innerHTML = '';
+      _editing = null;
+    });
+    $('rcpoEdSave')?.addEventListener('click', () => saveEditor(pathway, origin));
+    host.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function slugify(title) {
+    return (
+      String(title)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40) || 'pathway'
+    );
+  }
+
+  async function saveEditor(original, origin) {
+    const host = $('rcpoEditorHost');
+    const errsEl = $('rcpoEdErrors');
+    const title = $('rcpoEdTitle')?.value.trim() || '';
+    const appliesTo = $('rcpoEdApplies')?.value.trim() || '';
+
+    const redFlags = Array.from(host.querySelectorAll('.rcpo-rf-row')).map((row) => {
+      const rf = {
+        id: row.dataset.rfid,
+        ask: row.querySelector('.rcpo-rf-ask')?.value.trim() || '',
+        escalate: row.querySelector('.rcpo-rf-esc')?.value || 'duty',
+      };
+      // Omitted rather than written false — absence is the schema's "not a
+      // safeguarding flag", and sanitisePathway only keeps a literal true.
+      if (row.querySelector('.rcpo-rf-sg')?.checked) rf.safeguarding = true;
+      return rf;
+    });
+    const questions = Array.from(host.querySelectorAll('.rcpo-q-row')).map((row) => {
+      const type = row.querySelector('.rcpo-q-type')?.value || 'text';
+      const q = {
+        id: row.dataset.qid,
+        ask: row.querySelector('.rcpo-q-ask')?.value.trim() || '',
+        type,
+        label: row.querySelector('.rcpo-q-label')?.value.trim() || undefined,
+      };
+      if (type === 'choice' || type === 'multi') {
+        q.options = (row.querySelector('.rcpo-q-opts')?.value || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      if (!q.label) delete q.label;
+      return q;
+    });
+
+    const { custom, overrides } = await getState();
+    const bundled = await loadBundled();
+    let id;
+    if (original) {
+      id = original.id;
+    } else {
+      id = slugify(title);
+      const taken = new Set([...(bundled.pathways || []).map((p) => p.id), ...custom.map((p) => p.id)]);
+      let n = 2;
+      while (taken.has(id)) id = `${slugify(title)}-${n++}`;
+    }
+
+    const candidate = {
+      id,
+      title,
+      appliesTo: appliesTo || undefined,
+      sources: original?.sources || ['Practice-authored — clinically review before use'],
+      redFlags,
+      questions,
+      pharmacyFirst: original?.pharmacyFirst, // not editable in v1; preserved on bundled edits
+    };
+    if ($('rcpoEdSensitive')?.checked) candidate.sensitive = true;
+
+    // Disposition block. Domain "" means no routing at all — the safe default.
+    // The four frozen clinician-only pathways never get a block written for
+    // them: the engine ignores routing on those ids anyway, and a block in the
+    // stored edit would (correctly) be rejected as a downgrade by
+    // resolveEffectivePathways, leaving the practice with a silently-ignored
+    // edit. Matching the shipped file — those four carry no block — is honest.
+    const domain = PU.CLINICIAN_ONLY_IDS.indexOf(id) !== -1 ? '' : $('rcpoEdDispDomain')?.value || '';
+    if (domain) {
+      const clinicianOnly =
+        PU.CLINICIAN_ONLY_DOMAINS.indexOf(domain) !== -1 ||
+        candidate.sensitive === true ||
+        PU.CLINICIAN_ONLY_IDS.indexOf(id) !== -1;
+      const allowed = clinicianOnly
+        ? ['gp_routine']
+        : Array.from(host.querySelectorAll('.rcpo-disp-allowed'))
+            .filter((cb) => cb.checked)
+            .map((cb) => cb.value);
+      const rules = Array.from(host.querySelectorAll('.rcpo-disp-row')).map((row) => {
+        const key = row.querySelector('.rcpo-disp-when')?.value || 'pharmacyFirstEligible';
+        const when = {};
+        if (key === 'pharmacyFirstEligible') {
+          when[key] = row.querySelector('.rcpo-disp-bool')?.value !== 'false';
+        } else {
+          const raw = (row.querySelector('.rcpo-disp-age')?.value || '').trim();
+          // Left blank / non-numeric stays as NaN so validatePathway rejects it
+          // rather than the editor guessing an age band.
+          when[key] = raw === '' ? null : Number(raw);
+        }
+        const suggest = row.querySelector('.rcpo-disp-suggest')?.value || 'gp_routine';
+        return { when, suggest: clinicianOnly ? 'gp_routine' : suggest };
+      });
+      candidate.disposition = { domain, allowed, rules, default: $('rcpoEdDispDefault')?.value || 'gp_routine' };
+    }
+    if (!candidate.pharmacyFirst) delete candidate.pharmacyFirst;
+    if (!candidate.appliesTo) delete candidate.appliesTo;
+
+    const errs = PU.validatePathway(candidate);
+    if (errs.length > 0) {
+      if (errsEl) errsEl.textContent = errs.join('\n');
+      return;
+    }
+    const clean = PU.sanitisePathway(candidate);
+
+    if (origin === 'bundled-edit') {
+      overrides[id] = clean;
+      await chrome.storage.local.set({ 'reception.pathwayOverrides': overrides });
+    } else {
+      const idx = custom.findIndex((p) => p.id === id);
+      if (idx >= 0) custom[idx] = clean;
+      else custom.push(clean);
+      await chrome.storage.local.set({ 'reception.customPathways': custom });
+    }
+    if (host) host.innerHTML = '';
+    _editing = null;
+    refresh();
+  }
+
+  // ── Escalation contacts (safeguarding lead / crisis line) ───────────────────
+  // Free practice text rendered verbatim to reception staff. Stored trimmed and
+  // clamped to RCPO_TEXT_MAX — the same clamp shared/io/reception-io.js applies on
+  // import, so a value cannot change shape by travelling through a backup.
+
+  let _contactsWired = false;
+
+  function renderContacts(config) {
+    const sg = $('rcpoSafeguardingContact');
+    const cl = $('rcpoCrisisLine');
+    if (!sg || !cl) return;
+    // Don't stomp what the admin is mid-way through typing.
+    if (document.activeElement !== sg) sg.value = config.safeguardingContact || '';
+    if (document.activeElement !== cl) cl.value = config.crisisLineText || '';
+    if (_contactsWired) return;
+    _contactsWired = true;
+
+    const status = $('rcpoContactsStatus');
+    const save = async () => {
+      await setConfig({
+        safeguardingContact: (sg.value || '').trim().slice(0, RCPO_TEXT_MAX),
+        crisisLineText: (cl.value || '').trim().slice(0, RCPO_TEXT_MAX),
+      });
+      if (status) {
+        status.textContent = 'Saved.';
+        setTimeout(() => {
+          if (status.textContent === 'Saved.') status.textContent = '';
+        }, 2000);
+      }
+    };
+    sg.addEventListener('change', save);
+    cl.addEventListener('change', save);
+  }
+
+  // ── Custom routing sign-off (plan E guardrail 6) ────────────────────────────
+  // reception.routingAttestation = { attestedBy, role: 'cso'|'partner',
+  //                                  attestedAt (ISO), scope: 'custom-routing' }
+  // Without a valid record, evaluateDisposition treats every custom and
+  // practice-edited pathway as clinician-only. The attester is the CSO or a
+  // partner and nobody else — the role list is closed here and in the validator.
+
+  let _routingWired = false;
+
+  async function renderRouting(attestation) {
+    const state = $('rcpoRoutingState');
+    const nameEl = $('rcpoRoutingName');
+    const roleEl = $('rcpoRoutingRole');
+    if (!state || !nameEl || !roleEl) return;
+
+    const valid = PU.isValidRoutingAttestation(attestation);
+    if (valid) {
+      const roleLabel = attestation.role === 'cso' ? 'clinical safety officer' : 'partner';
+      state.innerHTML = `
+        <div style="border:1px solid rgba(22,163,74,0.4); background:rgba(22,163,74,0.06); border-radius:8px; padding:10px 14px; font-size:12px; color:var(--text-2); display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <span><strong>Routing signed off</strong> by ${escHtml(attestation.attestedBy)} (${escHtml(roleLabel)}) on ${escHtml(String(attestation.attestedAt).slice(0, 10))}. Custom and edited pathways may suggest non-clinician routes.</span>
+          <button class="ghost" id="rcpoRoutingRevoke" style="font-size:11px; padding:4px 10px;">Revoke</button>
+        </div>`;
+      $('rcpoRoutingRevoke')?.addEventListener('click', async () => {
+        if (
+          !confirm(
+            'Revoke the custom routing sign-off? Custom and edited pathways go back to suggesting a clinician only.'
+          )
+        )
+          return;
+        await chrome.storage.local.remove('reception.routingAttestation');
+        refresh();
+      });
+    } else {
+      state.innerHTML = `
+        <div style="border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:12px; color:var(--text-3);">
+          <strong>No routing sign-off recorded.</strong> Custom and practice-edited pathways suggest a clinician only.
+          Bundled pathways are unaffected.
+        </div>`;
+    }
+    if (_routingWired) return;
+    _routingWired = true;
+
+    $('rcpoRoutingAttest')?.addEventListener('click', async () => {
+      const status = $('rcpoRoutingStatus');
+      const record = {
+        attestedBy: (nameEl.value || '').trim().slice(0, 120),
+        role: roleEl.value,
+        attestedAt: new Date().toISOString(),
+        scope: 'custom-routing',
+      };
+      // sanitiseRoutingAttestation returns null for anything that is not a
+      // complete, well-formed sign-off — a partial one must never be stored.
+      const clean = PU.sanitiseRoutingAttestation(record);
+      if (!clean) {
+        if (status) {
+          status.style.color = 'var(--red, #b91c1c)';
+          status.textContent = 'Enter the name of the CSO or partner signing off.';
+        }
+        return;
+      }
+      await chrome.storage.local.set({ 'reception.routingAttestation': clean });
+      if (status) {
+        status.style.color = 'var(--text-3)';
+        status.textContent = 'Sign-off recorded.';
+      }
+      nameEl.value = '';
+      refresh();
+    });
+  }
+
+  // ── Quick-wins chip filter ──────────────────────────────────────────────────
+
+  async function renderChipList(config) {
+    const host = $('rcpoChipList');
+    if (!host) return;
+    try {
+      const base = chrome.runtime.getURL('rules/');
+      const [drug, qof, vax, customRes] = await Promise.all([
+        fetch(base + 'drug-rules.json').then((r) => r.json()),
+        fetch(base + 'qof-rules.json').then((r) => r.json()),
+        fetch(base + 'vaccine-rules.json').then((r) => r.json()),
+        chrome.storage.local.get('sentinel.customRules'),
+      ]);
+      const customRules = (customRes['sentinel.customRules'] || []).filter((r) => r.enabled !== false);
+      const rules = [
+        ...(drug.rules || [])
+          .filter((r) => r.enabled !== false)
+          .map((r) => ({ id: r.id, name: r.displayName || r.id, kind: 'Drug allergy' })),
+        ...(qof.rules || [])
+          .filter((r) => r.enabled !== false)
+          .map((r) => ({
+            id: r.id,
+            name: r.displayName || r.name || r.id,
+            kind: r.type === 'qof-register' ? 'QOF register' : 'QOF / alert',
+          })),
+        ...(vax.rules || [])
+          .filter((r) => r.enabled !== false)
+          .map((r) => ({ id: r.id, name: r.displayName || r.id, kind: 'Vaccine' })),
+        ...customRules.map((r) => ({ id: r.id, name: r.displayName || r.name || r.id, kind: 'Custom (Sentinel)' })),
+      ];
+      const hidden = config.hiddenChipRules || {};
+      host.innerHTML =
+        rules
+          .map(
+            (r) => `
+        <label style="display:flex; align-items:center; gap:8px; padding:4px 2px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" data-rcpo-chip="${escAttr(r.id)}" ${hidden[r.id] === true ? '' : 'checked'}>
+          <span>${escHtml(r.name)}</span>
+          <span style="font-size:10px; color:var(--text-3);">${escHtml(r.kind)}</span>
+        </label>`
+          )
+          .join('') || '<div style="font-size:12px; color:var(--text-3);">No rules found.</div>';
+      host.querySelectorAll('[data-rcpo-chip]').forEach((cb) => {
+        cb.addEventListener('change', async () => {
+          const { config } = await getState();
+          const map = Object.assign({}, config.hiddenChipRules || {});
+          if (cb.checked) delete map[cb.dataset.rcpoChip];
+          else map[cb.dataset.rcpoChip] = true;
+          await setConfig({ hiddenChipRules: map });
+        });
+      });
+    } catch (e) {
+      host.innerHTML = `<div style="font-size:12px; color:var(--red, #b91c1c);">Could not load rules: ${escHtml(e.message)}</div>`;
+    }
+  }
+
+  // ── Orchestration ───────────────────────────────────────────────────────────
+
+  async function refresh() {
+    try {
+      const [{ config, custom, overrides, routingAttestation }, bundled] = await Promise.all([
+        getState(),
+        loadBundled(),
+      ]);
+      const resolved = PU.resolveEffectivePathways({
+        bundled: bundled.pathways || [],
+        overrides,
+        customPathways: custom,
+        enabledPathways: config.enabledPathways || {},
+        disclaimerAccepted: !!config.disclaimerAcceptedAt,
+      });
+      let centralProv = null;
+      try {
+        const pr = await chrome.storage.local.get('suite.practiceProfile.attestations');
+        const att = pr['suite.practiceProfile.attestations'];
+        if (att && att.reception && att.reception.via === 'practice-profile') centralProv = att.reception;
+      } catch (_) {}
+      renderDisclaimerArea(config, resolved, centralProv);
+      renderPathwayList(resolved, config);
+      renderContacts(config);
+      renderRouting(routingAttestation);
+      renderChipList(config);
+    } catch (e) {
+      const host = $('rcpoPathwayList');
+      if (host)
+        host.innerHTML = `<div style="font-size:12px; color:var(--red, #b91c1c);">Could not load reception settings: ${escHtml(e.message)}</div>`;
+    }
+  }
+
+  // Single persistent listener: resolve the current pathway set at click time.
+  $('rcpoNewPathway')?.addEventListener('click', async () => {
+    const [{ config, custom, overrides }, bundled] = await Promise.all([getState(), loadBundled()]);
+    const resolved = PU.resolveEffectivePathways({
+      bundled: bundled.pathways || [],
+      overrides,
+      customPathways: custom,
+      enabledPathways: config.enabledPathways || {},
+      disclaimerAccepted: !!config.disclaimerAcceptedAt,
+    });
+    openEditor(null, resolved);
+  });
+
+  // ── LLM pathway authoring tool ──────────────────────────────────────────────
+
+  $('rcpoLlmCopyPrompt')?.addEventListener('click', async () => {
+    const prompt = PU.pathwaySchemaPrompt();
+    const copiedEl = $('rcpoLlmCopied');
+    try {
+      await navigator.clipboard.writeText(prompt);
+    } catch (_) {
+      // Fallback: write to a temp textarea
+      const ta = document.createElement('textarea');
+      ta.value = prompt;
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand && document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if (copiedEl) {
+      copiedEl.style.opacity = '1';
+      setTimeout(() => {
+        copiedEl.style.opacity = '0';
+      }, 2000);
+    }
+  });
+
+  $('rcpoLlmImport')?.addEventListener('click', async () => {
+    const statusEl = $('rcpoLlmStatus');
+    const jsonEl = $('rcpoLlmJson');
+    if (!statusEl || !jsonEl) return;
+
+    const raw = (jsonEl.value || '').trim();
+    if (!raw) {
+      statusEl.style.color = 'var(--red, #b91c1c)';
+      statusEl.textContent = 'Paste the LLM JSON into the box first.';
+      return;
+    }
+
+    // Parse and normalise: accept single object, array, or wrapped { pathway, pathways }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      statusEl.style.color = 'var(--red, #b91c1c)';
+      statusEl.textContent = 'Could not parse JSON: ' + escHtml(e.message);
+      return;
+    }
+
+    let candidates = [];
+    if (Array.isArray(parsed)) {
+      candidates = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      if (parsed.pathways && Array.isArray(parsed.pathways)) {
+        candidates = parsed.pathways;
+      } else if (parsed.pathway && typeof parsed.pathway === 'object') {
+        candidates = [parsed.pathway];
+      } else {
+        candidates = [parsed];
+      }
+    } else {
+      statusEl.style.color = 'var(--red, #b91c1c)';
+      statusEl.textContent = 'Expected a JSON object or array of pathway objects.';
+      return;
+    }
+
+    if (candidates.length === 0) {
+      statusEl.style.color = 'var(--red, #b91c1c)';
+      statusEl.textContent = 'No pathway objects found in the pasted JSON.';
+      return;
+    }
+
+    // Validate each candidate; abort on first error
+    for (let i = 0; i < candidates.length; i++) {
+      const errs = PU.validatePathway(candidates[i]);
+      if (errs.length > 0) {
+        const label = candidates.length > 1 ? `Pathway ${i + 1}: ` : '';
+        statusEl.style.color = 'var(--red, #b91c1c)';
+        statusEl.innerHTML = escHtml(label + errs[0]);
+        return;
+      }
+    }
+
+    // Sanitise, resolve id collisions, append to customPathways
+    const [{ custom }, bundledDoc] = await Promise.all([getState(), loadBundled()]);
+    const taken = new Set([...(bundledDoc.pathways || []).map((p) => p.id), ...custom.map((p) => p.id)]);
+    const toAdd = [];
+    for (const c of candidates) {
+      const clean = PU.sanitisePathway(c);
+      let id = clean.id;
+      let n = 2;
+      while (taken.has(id)) id = clean.id + '-' + n++;
+      clean.id = id;
+      taken.add(id);
+      toAdd.push(clean);
+    }
+
+    // Write — do NOT touch enabledPathways (imported pathways stay off until reviewed)
+    await chrome.storage.local.set({ 'reception.customPathways': [...custom, ...toAdd] });
+    jsonEl.value = '';
+    statusEl.style.color = 'var(--green, #16a34a)';
+    statusEl.textContent = `Imported ${toAdd.length} pathway${toAdd.length !== 1 ? 's' : ''} — review and enable them below.`;
+    refresh();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', refresh);
+  } else {
+    refresh();
+  }
+  document
+    .querySelectorAll('.nav-item[data-section="reception"]')
+    .forEach((btn) => btn.addEventListener('click', refresh));
+})();
+
+// ── Knowledge options section ─────────────────────────────────────────────────
+// Starter-pack generation via external LLM (copy prompt → paste JSON →
+// validate → import). Mirrors the Reception LLM pathway flow above. Imported
+// entries are forced to source:'llm', reviewed:false regardless of what the
+// pasted JSON claims, and near-duplicate titles (KnowledgeUtils.findSimilar)
+// are skipped so repeated imports don't bloat the base.
+(() => {
+  const KU = window.KnowledgeUtils;
+  const $k = (id) => document.getElementById(id);
+
+  async function refreshStats() {
+    const el = $k('kboStats');
+    if (!el) return;
+    const r = await chrome.storage.local.get(['knowledge.items']);
+    const items = r['knowledge.items'] || [];
+    const unreviewed = items.filter((e) => e && e.source === 'llm' && e.reviewed !== true).length;
+    el.textContent =
+      `${items.length} entr${items.length === 1 ? 'y' : 'ies'} in the knowledge base` +
+      (unreviewed ? ` — ${unreviewed} AI-generated and awaiting review (badge shown on the tab).` : '.');
+    await refreshSync();
+  }
+
+  async function refreshSync() {
+    const el = $k('kboSync');
+    const KS = window.KnowledgeSync;
+    if (!el) return;
+    if (!KS) {
+      el.textContent =
+        'Only on this computer. Knowledge is stored in this browser profile until you share it via the practice folder.';
+      return;
+    }
+    const state = (await chrome.storage.local.get(KS.KNOWLEDGE_SYNC_STATE_KEY))[KS.KNOWLEDGE_SYNC_STATE_KEY] || {};
+    let hasHandle = false;
+    if (window.FsHandleStore) {
+      const h = await window.FsHandleStore.loadFileHandle(KS.PROFILE_FILE_KEY || 'profileFile');
+      hasHandle = !!h;
+    }
+    let hasSharedProfile = hasHandle;
+    if (!hasSharedProfile) {
+      try {
+        const meta = await chrome.storage.local.get('suite.practiceProfile');
+        hasSharedProfile = !!(meta['suite.practiceProfile'] && meta['suite.practiceProfile'].lastAppliedVersion);
+      } catch (_) {
+        hasSharedProfile = false;
+      }
+    }
+    const rItems = await chrome.storage.local.get(['knowledge.items']);
+    const localCount = Array.isArray(rItems['knowledge.items']) ? rItems['knowledge.items'].length : 0;
+    const ui = KS.describeSyncStatus(Object.assign({}, state, { hasHandle, hasSharedProfile, localCount }));
+    el.textContent = ui.text;
+  }
+
+  async function pushKnowledge() {
+    const KS = window.KnowledgeSync;
+    if (!KS) return { reason: 'no-sync' };
+    return KS.pushLiveKnowledge({ requestPermission: true });
+  }
+
+  function setIoStatus(msg, isError) {
+    const el = $k('kboIoStatus');
+    if (!el) return;
+    el.style.color = isError ? 'var(--red, #b91c1c)' : 'var(--green, #16a34a)';
+    el.textContent = msg;
+  }
+
+  $k('kboExportLive')?.addEventListener('click', async () => {
+    try {
+      const data = await knowledgeExport();
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadJson(KU.wrapLiveKnowledge(data.items, data.categories), `medicus-knowledge-${stamp}.json`);
+      setIoStatus('Backup downloaded.');
+    } catch (e) {
+      setIoStatus('Export failed: ' + e.message, true);
+    }
+  });
+
+  $k('kboImportFile')?.addEventListener('click', () => $k('kboFileInput')?.click());
+
+  $k('kboFileInput')?.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (err) {
+      setIoStatus('Could not parse JSON: ' + err.message, true);
+      return;
+    }
+    const extracted = KU.extractKnowledgeFromParsed(parsed);
+    if (extracted.error) {
+      setIoStatus(extracted.error, true);
+      return;
+    }
+    try {
+      if (extracted.mode === 'replace') {
+        const n = (extracted.items || []).length;
+        if (!window.confirm('Replace ' + n + ' ' + (n === 1 ? 'entry' : 'entries') + '?')) return;
+      }
+      const phi = KU.phiWarnings(extracted.items || []);
+      let shareOk = true;
+      if (phi.length > 0) {
+        if (!window.confirm(phi.join('\n') + '\n\nImport anyway? You can keep it on this computer only.')) return;
+        shareOk = window.confirm('This file may contain patient-identifiable text. Share it to the practice folder?');
+      }
+      if (extracted.mode === 'replace') {
+        await knowledgeImport({
+          items: extracted.items,
+          categories: extracted.categories !== undefined ? extracted.categories : [],
+        });
+      } else {
+        const r = await chrome.storage.local.get(['knowledge.items', 'knowledge.categories']);
+        const items = r['knowledge.items'] || [];
+        const categories = KU.sanitiseCategories(r['knowledge.categories']);
+        const catIds = new Set(categories.map((c) => c.id));
+        const taken = new Set(items.map((x) => x.id));
+        const toAdd = [];
+        for (const c of extracted.items || []) {
+          const errs = KU.validateEntry(c);
+          if (errs.length > 0) throw new Error(errs[0]);
+          if (KU.findSimilar(c.title, [...items, ...toAdd]).length > 0) continue;
+          const clean = KU.sanitiseEntry(c);
+          clean.source = 'import';
+          clean.id = KU.generateEntryId(clean.title, taken);
+          taken.add(clean.id);
+          if (!catIds.has(clean.category)) {
+            const name = clean.category.replace(/-/g, ' ').replace(/^./, (ch) => ch.toUpperCase());
+            categories.push({ id: clean.category, name });
+            catIds.add(clean.category);
+          }
+          toAdd.push(clean);
+        }
+        if (toAdd.length === 0) throw new Error('Nothing imported — every entry matched an existing title.');
+        await chrome.storage.local.set({
+          'knowledge.items': [...items, ...toAdd],
+          'knowledge.categories': categories,
+        });
+      }
+      let pushed = { wrote: false, reason: 'skipped' };
+      if (shareOk) pushed = await pushKnowledge();
+      const KS = window.KnowledgeSync;
+      setIoStatus(
+        !shareOk
+          ? 'Imported on this computer only — not shared, because of the identifier warning.'
+          : pushed && pushed.wrote
+            ? 'Imported and written to the practice shared folder.'
+            : pushed && pushed.reason === 'no-handle'
+              ? 'Imported on this computer only — click Share with practice to push it to everyone.'
+              : pushed && pushed.reason && pushed.reason !== 'no-change' && pushed.reason !== 'skipped'
+                ? (KS &&
+                    KS.shareErrorText(pushed.reason, pushed.detail || (pushed.dropped && pushed.dropped.length))) ||
+                  'Imported. Review the set on the Knowledge tab.'
+                : 'Imported. Review the set on the Knowledge tab.',
+        !!(
+          pushed &&
+          pushed.reason &&
+          !pushed.wrote &&
+          pushed.reason !== 'no-handle' &&
+          pushed.reason !== 'no-change' &&
+          pushed.reason !== 'skipped' &&
+          shareOk
+        )
+      );
+      await refreshStats();
+    } catch (err) {
+      setIoStatus('Import failed: ' + err.message, true);
+    }
+  });
+
+  $k('kboShare')?.addEventListener('click', async () => {
+    const KS = window.KnowledgeSync;
+    if (!KS) return setIoStatus('Knowledge sync is not loaded.', true);
+    if (
+      !window.confirm(
+        'The file must be practice-profile.json in the shared extension folder, next to manifest.json. The live Knowledge set will be written into that file so every computer using this folder sees it.'
+      )
+    ) {
+      return;
+    }
+    try {
+      let result = await KS.pushLiveKnowledge({ allowCreate: true, requestPermission: true });
+      if (
+        result.reason === 'no-handle' ||
+        result.reason === 'permission-not-granted' ||
+        result.reason === 'no-shared-profile'
+      ) {
+        if (typeof showSaveFilePicker === 'function') {
+          let handle;
+          try {
+            handle = await showSaveFilePicker({
+              suggestedName: 'practice-profile.json',
+              types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+            });
+          } catch (err) {
+            if (err && err.name === 'AbortError') return;
+            throw err;
+          }
+          if (handle && handle.name && handle.name !== 'practice-profile.json') {
+            if (
+              !window.confirm(
+                'That file is named "' +
+                  handle.name +
+                  '", not practice-profile.json. Other computers only load practice-profile.json next to manifest.json. Use it anyway?'
+              )
+            ) {
+              return;
+            }
+          }
+          if (window.FsHandleStore) await window.FsHandleStore.saveFileHandle(handle, 'profileFile');
+          result = await KS.pushLiveKnowledge({
+            allowCreate: true,
+            requestPermission: true,
+            loadHandle: async () => handle,
+          });
+        } else {
+          const data = await knowledgeExport();
+          const built = KS.buildKnowledgeContribution(null, data, { allowCreate: true, KU, now: new Date() });
+          if (built.json) {
+            downloadJson(built.json, 'practice-profile.json');
+            setIoStatus(
+              'Downloaded practice-profile.json. Put it next to manifest.json in the shared extension folder.'
+            );
+            await refreshSync();
+            return;
+          }
+        }
+      }
+      if (result.wrote || result.reason === 'no-change') {
+        setIoStatus(
+          'Written to the shared folder as practice-profile.json. Other computers using that folder will pick it up on next open or within about 15 minutes.'
+        );
+      } else {
+        setIoStatus(
+          KS.shareErrorText(result.reason, result.detail || (result.dropped && result.dropped.length)) ||
+            'Could not share. This computer still has your set.',
+          true
+        );
+      }
+      await refreshSync();
+    } catch (err) {
+      setIoStatus('Share failed: ' + err.message, true);
+    }
+  });
+
+  $k('kboLlmCopyPrompt')?.addEventListener('click', async () => {
+    const prompt = KU.kbSchemaPrompt();
+    const copiedEl = $k('kboLlmCopied');
+    try {
+      await navigator.clipboard.writeText(prompt);
+    } catch (_) {
+      const ta = document.createElement('textarea');
+      ta.value = prompt;
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand && document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if (copiedEl) {
+      copiedEl.style.opacity = '1';
+      setTimeout(() => {
+        copiedEl.style.opacity = '0';
+      }, 2000);
+    }
+  });
+
+  $k('kboLlmImport')?.addEventListener('click', async () => {
+    const statusEl = $k('kboLlmStatus');
+    const warnEl = $k('kboLlmWarnings');
+    const jsonEl = $k('kboLlmJson');
+    if (!statusEl || !jsonEl) return;
+    const fail = (msg) => {
+      statusEl.style.color = 'var(--red, #b91c1c)';
+      statusEl.textContent = msg;
+    };
+    warnEl.textContent = '';
+
+    const raw = (jsonEl.value || '').trim();
+    if (!raw) return fail('Paste the LLM JSON into the box first.');
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return fail('Could not parse JSON: ' + e.message);
+    }
+
+    let candidates;
+    if (Array.isArray(parsed)) candidates = parsed;
+    else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.entries)) candidates = parsed.entries;
+    else return fail('Expected { "entries": [ ... ] } or a JSON array of entries.');
+    if (candidates.length === 0) return fail('No entries found in the pasted JSON.');
+
+    for (let i = 0; i < candidates.length; i++) {
+      const errs = KU.validateEntry(candidates[i]);
+      if (errs.length > 0) return fail(`Entry ${i + 1}: ${errs[0]}`);
+    }
+
+    const r = await chrome.storage.local.get(['knowledge.items', 'knowledge.categories']);
+    const items = r['knowledge.items'] || [];
+    const categories = KU.sanitiseCategories(r['knowledge.categories']);
+    const catIds = new Set(categories.map((c) => c.id));
+    const taken = new Set(items.map((e) => e.id));
+
+    const toAdd = [];
+    let skipped = 0;
+    for (const c of candidates) {
+      // Anti-bloat: skip entries whose titles near-duplicate an existing or
+      // already-imported entry (token-normalised match, see knowledge-utils.js).
+      if (KU.findSimilar(c.title, [...items, ...toAdd]).length > 0) {
+        skipped++;
+        continue;
+      }
+      const clean = KU.sanitiseEntry(c);
+      clean.source = 'llm';
+      clean.reviewed = false;
+      clean.id = KU.generateEntryId(clean.title, taken);
+      taken.add(clean.id);
+      if (!catIds.has(clean.category)) {
+        // Preserve the LLM's grouping rather than silently re-filing it.
+        const name = clean.category.replace(/-/g, ' ').replace(/^./, (ch) => ch.toUpperCase());
+        categories.push({ id: clean.category, name });
+        catIds.add(clean.category);
+      }
+      toAdd.push(clean);
+    }
+
+    if (toAdd.length === 0) {
+      return fail(`Nothing imported — all ${skipped} entr${skipped === 1 ? 'y' : 'ies'} matched existing titles.`);
+    }
+
+    const phi = KU.phiWarnings(toAdd);
+    if (phi.length > 0) {
+      warnEl.innerHTML =
+        '<strong>Check before relying on these entries:</strong><br>' +
+        phi.map((w) => '&bull; ' + w.replace(/&/g, '&amp;').replace(/</g, '&lt;')).join('<br>');
+    }
+    let shareOk = true;
+    if (phi.length > 0) {
+      if (!window.confirm(phi.join('\n') + '\n\nImport anyway? You can keep them on this computer only.')) {
+        return fail('Import cancelled — identifier warning.');
+      }
+      shareOk = window.confirm(
+        'These entries may contain patient-identifiable text. Share them to the practice folder?'
+      );
+    }
+
+    await chrome.storage.local.set({
+      'knowledge.items': [...items, ...toAdd],
+      'knowledge.categories': categories,
+    });
+    jsonEl.value = '';
+    const pushed = shareOk ? await pushKnowledge() : { wrote: false, reason: 'skipped' };
+    statusEl.style.color = 'var(--green, #16a34a)';
+    statusEl.textContent =
+      `Imported ${toAdd.length} entr${toAdd.length === 1 ? 'y' : 'ies'}` +
+      (skipped ? ` (${skipped} skipped as near-duplicates)` : '') +
+      (!shareOk
+        ? ' on this computer only — not shared, because of the identifier warning.'
+        : pushed && pushed.wrote
+          ? ' and written to the practice shared folder.'
+          : pushed && pushed.reason === 'no-handle'
+            ? ' on this computer only — click Share with practice so everyone else sees them.'
+            : pushed && pushed.reason && pushed.reason !== 'no-change' && pushed.reason !== 'skipped'
+              ? '. ' +
+                ((window.KnowledgeSync && window.KnowledgeSync.shareErrorText(pushed.reason, pushed.detail)) ||
+                  'Review them on the Knowledge tab.')
+              : ' — review them on the Knowledge tab.');
+    refreshStats();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', refreshStats);
+  } else {
+    refreshStats();
+  }
+  document
+    .querySelectorAll('.nav-item[data-section="knowledge"]')
+    .forEach((btn) => btn.addEventListener('click', refreshStats));
+})();
+
+// ── Event Ledger section (F2) ─────────────────────────────────────────────────
+// Machine-local record of what the suite flagged — filter/table/CSV-export/clear
+// UI over shared/event-ledger.js (window.EventLedger, loaded before this script).
+// The ledger keys (day shards ledger.events.<date> + ledger.shardIndex, plus
+// the legacy ledger.events) are deliberately EXCLUDED from suite backup —
+// same doctrine as labfiling.auditLog; see the disclosure block in options.html
+// and the ALLOWLIST entries in test-backup-coverage.js.
+(function initLedgerSection() {
+  const EL = typeof window !== 'undefined' ? window.EventLedger : null;
+  const wrap = document.getElementById('ledgerTableWrap');
+  if (!EL || !wrap) return;
+
+  // Rows rendered in the table (newest first). The CSV export always includes
+  // EVERY filtered event — the cap is a render guard, not a data cap.
+  const RENDER_CAP = 200;
+
+  let _events = [];
+
+  const $ = (id) => document.getElementById(id);
+
+  function currentFilter() {
+    return {
+      patientRef: ($('ledgerFilterPatient')?.value || '').trim(),
+      from: $('ledgerFilterFrom')?.value || null,
+      to: $('ledgerFilterTo')?.value || null,
+    };
+  }
+
+  function filteredEvents() {
+    return EL.filterEvents(_events, currentFilter());
+  }
+
+  function fmtTs(ts) {
+    const d = new Date(ts);
+    return isNaN(d.getTime())
+      ? String(ts || '')
+      : d.toLocaleString('en-GB', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+  }
+
+  function renderTable() {
+    const rows = filteredEvents();
+    const summary = $('ledgerSummary');
+    if (summary) {
+      summary.textContent =
+        `${rows.length} of ${_events.length} event${_events.length === 1 ? '' : 's'}` +
+        (rows.length > RENDER_CAP ? ` — showing the newest ${RENDER_CAP}; Export CSV includes all filtered rows` : '');
+    }
+    if (rows.length === 0) {
+      wrap.innerHTML = `<div class="ledger-empty">${
+        _events.length ? 'No events match these filters.' : 'No events recorded yet on this machine.'
+      }</div>`;
+      return;
+    }
+    const body = rows
+      .slice(0, RENDER_CAP)
+      .map((e) => {
+        const sevCls = e.severity === 'red' ? 'ledger-sev-red' : e.severity === 'amber' ? 'ledger-sev-amber' : '';
+        const detail = escHtml(e.ruleId || '') + (e.ruleId && e.label ? ' · ' : '') + escHtml(e.label || '');
+        return `<tr>
+          <td>${escHtml(fmtTs(e.ts))}</td>
+          <td>${escHtml(e.source || '')}</td>
+          <td>${escHtml(e.patientRef || '—')}</td>
+          <td class="${sevCls}">${escHtml(e.severity || '')}</td>
+          <td class="ledger-td-label">${detail}</td>
+          <td>${escHtml(e.action || '')}</td>
+        </tr>`;
+      })
+      .join('');
+    wrap.innerHTML =
+      `<table class="ledger-table"><thead><tr>` +
+      `<th>When</th><th>Source</th><th>Patient (UUID)</th><th>Severity</th><th>Rule / detail</th><th>Action</th>` +
+      `</tr></thead><tbody>${body}</tbody></table>`;
+  }
+
+  async function refreshLedger() {
+    _events = await EL.getEvents();
+    renderTable();
+  }
+
+  // Filters re-render live (data already in memory — no storage churn).
+  ['ledgerFilterPatient', 'ledgerFilterFrom', 'ledgerFilterTo'].forEach((id) => {
+    $(id)?.addEventListener('input', renderTable);
+  });
+  $('ledgerResetFilter')?.addEventListener('click', () => {
+    ['ledgerFilterPatient', 'ledgerFilterFrom', 'ledgerFilterTo'].forEach((id) => {
+      const el = $(id);
+      if (el) el.value = '';
+    });
+    renderTable();
+  });
+
+  // CSV export — same client-side Blob pattern as the Lab Filing audit export;
+  // eventsCsv applies quote-escaping AND the spreadsheet formula-injection guard.
+  $('ledgerExportCsv')?.addEventListener('click', () => {
+    const csv = EL.eventsCsv(filteredEvents());
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `event-ledger-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // Clear ledger — destructive, so behind a TYPED confirmation ("CLEAR"), not
+  // just a click-through confirm dialog.
+  const clearInput = $('ledgerClearConfirm');
+  const clearBtn = $('ledgerClearBtn');
+  clearInput?.addEventListener('input', () => {
+    if (clearBtn) clearBtn.disabled = clearInput.value.trim() !== 'CLEAR';
+  });
+  clearBtn?.addEventListener('click', async () => {
+    if (!clearInput || clearInput.value.trim() !== 'CLEAR') return;
+    await EL.clearLedger();
+    clearInput.value = '';
+    clearBtn.disabled = true;
+    await refreshLedger();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', refreshLedger);
+  } else {
+    refreshLedger();
+  }
+  document
+    .querySelectorAll('.nav-item[data-section="diagnostics"]')
+    .forEach((btn) => btn.addEventListener('click', refreshLedger));
+})();
+
+// ── Suite Health section (Horizon-1 H2) ────────────────────────────────────────
+// Read-only table over chrome.storage.local['health.contracts'], written by the
+// runtime canary (shared/contract-canary.js, injected into the live Medicus
+// page — see manifest.json). This page never probes anything itself; it only
+// reads the canary's last result and the registry (shared/dom-contracts.js,
+// loaded before this script) for the plain-English feature/degradation text.
+// health.contracts is machine-local diagnostic state, deliberately EXCLUDED
+// from suite backup (see test-backup-coverage.js ALLOWLIST) — same doctrine as
+// the Event Ledger above.
+(function initHealthSection() {
+  const DC = typeof window !== 'undefined' ? window.DomContracts : null;
+  const wrap = document.getElementById('healthTableWrap');
+  const summaryEl = document.getElementById('healthSummary');
+  if (!DC || !wrap) return;
+
+  function fmtTs(iso) {
+    const d = new Date(iso);
+    if (!iso || isNaN(d.getTime())) return '—';
+    return d.toLocaleString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  function statusInfo(row, contract) {
+    if (contract.runtime === false) return { label: 'Fixture-tested only', cls: 'health-status--fixture' };
+    if (!row || !row.status) return { label: 'Not checked yet', cls: 'health-status--unchecked' };
+    if (row.status === 'degraded') return { label: 'Degraded', cls: 'health-status--degraded' };
+    if (row.status === 'ok') return { label: 'OK', cls: 'health-status--ok' };
+    return { label: 'Not applicable here', cls: 'health-status--na' };
+  }
+
+  async function refreshHealth() {
+    const r = await chrome.storage.local.get(['health.contracts', 'suite.swLoadErrors']);
+    const health = (r && r['health.contracts']) || {};
+    const swErrors = Array.isArray(r && r['suite.swLoadErrors']) ? r['suite.swLoadErrors'] : [];
+    const swBanner = document.getElementById('swLoadBanner');
+    if (swBanner) {
+      if (swErrors.length) {
+        const scripts = swErrors.map((e) => (e && e.script) || 'module').filter((s, i, arr) => arr.indexOf(s) === i);
+        swBanner.style.display = 'block';
+        swBanner.textContent =
+          'Extension module failed to load — some tools may be missing. Failed: ' +
+          scripts.join(', ') +
+          '. Reload the extension after a repair; if it persists, tell Dave.';
+      } else {
+        swBanner.style.display = 'none';
+        swBanner.textContent = '';
+      }
+    }
+    const contracts = DC.list();
+
+    const degradedCount = contracts.filter((c) => health[c.id]?.status === 'degraded').length;
+    const runtimeCount = contracts.filter((c) => c.runtime === true).length;
+    if (summaryEl) {
+      summaryEl.textContent =
+        degradedCount > 0
+          ? `${degradedCount} of ${contracts.length} feature${contracts.length === 1 ? '' : 's'} currently degraded.`
+          : `All checked features look OK — ${runtimeCount} of ${contracts.length} are live-checked; the rest are fixture-tested only (see the explanation column).`;
+    }
+
+    const rows = contracts
+      .map((c) => {
+        const row = health[c.id];
+        const { label, cls } = statusInfo(row, c);
+        const explanation = c.runtime === false ? c.runtimeNote || '' : '';
+        return `<tr>
+          <td class="health-td-feature">${escHtml(c.feature)}</td>
+          <td class="health-td-degrades">${escHtml(c.degradation)}</td>
+          <td><span class="health-status ${cls}">${escHtml(label)}</span></td>
+          <td class="health-td-checked">${row ? escHtml(fmtTs(row.lastProbe)) : '—'}</td>
+          <td class="health-td-explain">${escHtml(explanation)}</td>
+        </tr>`;
+      })
+      .join('');
+
+    wrap.innerHTML =
+      `<table class="health-table"><thead><tr>` +
+      `<th>Feature</th><th>What degrades</th><th>Status</th><th>Last checked</th><th>Why fixture-only</th>` +
+      `</tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', refreshHealth);
+  } else {
+    refreshHealth();
+  }
+  document
+    .querySelectorAll('.nav-item[data-section="diagnostics"]')
+    .forEach((btn) => btn.addEventListener('click', refreshHealth));
+
+  // Snappier than a re-open: the canary writes this key directly from the
+  // Medicus tab while Options may already be open in another tab.
+  chrome.storage.onChanged?.addListener((changes) => {
+    if (changes['health.contracts'] || changes['suite.swLoadErrors']) refreshHealth();
+  });
+})();
+
+// ── Quick Actions — GP → reception composer lists ──────────────────────────────
+//
+// Practice-wide editor for the four chip lists the injected composer
+// (content-scripts/reception-quick-actions.js) renders above a task's Internal
+// comment box. Same doctrine as the slot-alert-rules editor above: plain rows,
+// save-on-change, no drag. Nothing here is patient data — the GP's free-text
+// note is transient state in the widget and never reaches storage.
+//
+// The live example line is deliberately rendered through the SAME composeLine()
+// the widget uses, so a label that reads badly mid-sentence ("Book F2F appt with
+// Usual GP") is visible while it is being typed, not after it reaches reception.
+
+(async function initQuickActions() {
+  try {
+    const QA = window.QuickActionsCore;
+    const STORE_KEY = 'triagelens.quickActions';
+    const savedTag = document.getElementById('qaSaved');
+    const exampleEl = document.getElementById('qaExample');
+    const LISTS = [
+      { key: 'actions', host: 'qaActionsList', add: 'qaAddActions', max: 28, placeholder: 'e.g. Book F2F appt' },
+      { key: 'who', host: 'qaWhoList', add: 'qaAddWho', max: 28, placeholder: 'e.g. Duty doctor, or a name' },
+      { key: 'when', host: 'qaWhenList', add: 'qaAddWhen', max: 28, placeholder: 'e.g. Within 48h' },
+      {
+        key: 'fallbacks',
+        host: 'qaFallbacksList',
+        add: 'qaAddFallbacks',
+        max: 140,
+        placeholder: 'e.g. if no answer, text booking link',
+      },
+    ];
+    if (!QA || !exampleEl) return;
+
+    // Version-gated shipped-preset migration (mergeShippedPresets sanitises for us).
+    // Kept in LOCK-STEP with the widget's load path in
+    // content-scripts/reception-quick-actions.js: if only the widget migrated, this
+    // editor would save a stale-version config back and un-migrate the practice.
+    function migrate(stored) {
+      const merged = QA.mergeShippedPresets(stored);
+      if (merged.changed) chrome.storage.local.set({ [STORE_KEY]: merged.cfg });
+      return merged.cfg;
+    }
+
+    const r = await chrome.storage.local.get(STORE_KEY);
+    let cfg = migrate(r[STORE_KEY]);
+
+    function activeSet() {
+      return cfg.sets[cfg.activeSet] || cfg.sets.default;
+    }
+
+    // Deleting a SHIPPED entry records a tombstone so mergeShippedPresets never
+    // resurrects it on the next version bump; typing it back in clears the mark.
+    function tombstone(key, label) {
+      if (!QA.isShippedLabel(key, label)) return;
+      const n = QA.normaliseLabel(label);
+      if (n && !cfg.removedShipped.includes(n)) cfg.removedShipped.push(n);
+    }
+
+    function untombstone(label) {
+      const n = QA.normaliseLabel(label);
+      if (!n) return;
+      cfg.removedShipped = cfg.removedShipped.filter((t) => t !== n);
+    }
+
+    function save() {
+      cfg = QA.sanitiseConfig(cfg);
+      chrome.storage.local.set({ [STORE_KEY]: cfg });
+      if (savedTag) {
+        savedTag.classList.add('show');
+        setTimeout(() => savedTag.classList.remove('show'), 2000);
+      }
+    }
+
+    // The example uses the first entry of each list — the composer's own output
+    // for the simplest possible pick.
+    function renderExample() {
+      const set = activeSet();
+      const line = QA.composeLine({
+        action: set.actions[0] || '',
+        who: set.who[0] || '',
+        when: set.when[0] || '',
+        note: set.fallbacks[0] || '',
+      });
+      exampleEl.textContent = line || 'Add at least one action to see the composed sentence.';
+    }
+
+    function renderList(spec) {
+      const host = document.getElementById(spec.host);
+      if (!host) return;
+      const items = activeSet()[spec.key] || [];
+      host.innerHTML = '';
+      items.forEach((value, i) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:6px;';
+        row.innerHTML = `
+          <input type="text" class="qa-item" value="${escAttr(value)}" maxlength="${spec.max}"
+            placeholder="${escAttr(spec.placeholder)}"
+            style="flex:1; min-width:140px; background:var(--bg-elev); border:1px solid var(--border-hi);
+                   color:var(--text-2); font-family:var(--mono); font-size:11px; border-radius:5px; padding:4px 8px;" />
+          <button class="qa-up ghost" style="padding:2px 8px; font-size:11px;" title="Move up"${i === 0 ? ' disabled' : ''}>▲</button>
+          <button class="qa-down ghost" style="padding:2px 8px; font-size:11px;" title="Move down"${i === items.length - 1 ? ' disabled' : ''}>▼</button>
+          <button class="qa-del ghost" style="padding:2px 8px; font-size:11px;" title="Remove">✕</button>
+        `;
+        row.querySelector('.qa-item').addEventListener('change', (e) => {
+          const v = e.target.value.trim().slice(0, spec.max);
+          if (!v) {
+            tombstone(spec.key, value); // emptying the box is a removal
+            items.splice(i, 1);
+          } else {
+            if (v !== value) {
+              tombstone(spec.key, value); // edited away from a shipped label
+              untombstone(v);
+            }
+            items[i] = v;
+          }
+          save();
+          renderAll();
+        });
+        row.querySelector('.qa-up').addEventListener('click', () => {
+          if (i === 0) return;
+          [items[i - 1], items[i]] = [items[i], items[i - 1]];
+          save();
+          renderAll();
+        });
+        row.querySelector('.qa-down').addEventListener('click', () => {
+          if (i >= items.length - 1) return;
+          [items[i + 1], items[i]] = [items[i], items[i + 1]];
+          save();
+          renderAll();
+        });
+        row.querySelector('.qa-del').addEventListener('click', () => {
+          tombstone(spec.key, value);
+          items.splice(i, 1);
+          save();
+          renderAll();
+        });
+        host.appendChild(row);
+      });
+    }
+
+    function renderAll() {
+      LISTS.forEach(renderList);
+      renderExample();
+    }
+
+    LISTS.forEach((spec) => {
+      document.getElementById(spec.add)?.addEventListener('click', () => {
+        const items = activeSet()[spec.key];
+        if (items.length >= 24) return; // QA_LIMITS.list — sanitiseConfig would drop the overflow anyway
+        items.push('');
+        renderAll();
+        const host = document.getElementById(spec.host);
+        host?.querySelector('div:last-child .qa-item')?.focus();
+      });
+    });
+
+    document.getElementById('qaRestoreDefaults')?.addEventListener('click', () => {
+      if (!confirm('Replace all four Quick Actions lists with the shipped defaults? Your edits will be lost.')) return;
+      cfg = QA.sanitiseConfig(JSON.parse(JSON.stringify(QA.DEFAULT_CONFIG)));
+      save();
+      renderAll();
+    });
+
+    renderAll();
+
+    // Render lazily on nav click too, so a change made in another tab (or by a
+    // GP's "+ name" chip on the live page) is reflected when the section opens.
+    document.querySelectorAll('.nav-item').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (btn.dataset.section !== 'quickactions') return;
+        const fresh = await chrome.storage.local.get(STORE_KEY);
+        cfg = migrate(fresh[STORE_KEY]);
+        renderAll();
+      });
+    });
+  } catch (e) {
+    console.warn('[Quick Actions init]', e.message);
+  }
+})();
+
+(function initAllocationGroupsOptions() {
+  const Core = window.AllocationGroupsCore;
+  if (!Core || typeof loadAllocationGroupsState !== 'function') return;
+
+  const DAYS = Core.DAY_IDS;
+  let presets = [];
+  let staffCache = [];
+  let rotaStaff = [];
+
+  function flash() {
+    const el = document.getElementById('agSaved');
+    if (!el) return;
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 1200);
+  }
+
+  async function persist() {
+    await saveAllocationGroupsPresets(presets);
+    flash();
+    render();
+  }
+
+  function memberLabel(p, id) {
+    return (p.memberNames && p.memberNames[id]) || id.slice(0, 8);
+  }
+
+  function namedStaff(list) {
+    return (list || [])
+      .filter((s) => s && Core.isUuid(s.id) && (s.name || s.displayName))
+      .map((s) => ({
+        id: String(s.id).toLowerCase(),
+        name: s.name || s.displayName || '',
+      }));
+  }
+
+  function pickerStaff() {
+    const fromCache = namedStaff(staffCache);
+    if (fromCache.length) return fromCache;
+    return rotaStaff;
+  }
+
+  function render() {
+    const host = document.getElementById('agList');
+    if (!host) return;
+    if (!presets.length) {
+      host.innerHTML =
+        '<p class="section-desc">No groups yet. Encircle people on a canvas and Save as group, or start one here and add people from the canvas.</p>';
+      return;
+    }
+    const people = pickerStaff();
+    host.innerHTML = presets
+      .map((p) => {
+        const sched = p.schedule;
+        const dayChecks = DAYS.map((d) => {
+          const on = sched && sched.days && sched.days.indexOf(d) !== -1;
+          return (
+            '<label style="margin-right:8px;font-size:12px"><input type="checkbox" data-ag-day="' +
+            d +
+            '" data-ag-id="' +
+            escAttr(p.id) +
+            '"' +
+            (on ? ' checked' : '') +
+            '> ' +
+            d +
+            '</label>'
+          );
+        }).join('');
+        const members = (p.memberIds || [])
+          .map(
+            (id) =>
+              '<span class="chip" style="display:inline-flex;gap:6px;align-items:center;margin:0 6px 6px 0">' +
+              escHtml(memberLabel(p, id)) +
+              ' <button type="button" class="ghost" data-ag-drop-member="' +
+              escAttr(id) +
+              '" data-ag-id="' +
+              escAttr(p.id) +
+              '" aria-label="Remove">×</button></span>'
+          )
+          .join('');
+        const staffOpts = people
+          .filter((s) => s && s.id && (p.memberIds || []).indexOf(String(s.id).toLowerCase()) === -1)
+          .map((s) => '<option value="' + escAttr(String(s.id).toLowerCase()) + '">' + escHtml(s.name) + '</option>')
+          .join('');
+        const noNames = people.length
+          ? ''
+          : '<p class="section-desc" data-ag-no-names>No names yet on this computer. Open Draft a split (nothing is sent)… once on Medicus and the people will appear here.</p>';
+        return (
+          '<div class="card" data-ag-card="' +
+          escAttr(p.id) +
+          '" style="padding:12px;border:1px solid var(--border);border-radius:8px">' +
+          '<input type="text" data-ag-name data-ag-id="' +
+          escAttr(p.id) +
+          '" value="' +
+          escAttr(p.name) +
+          '" maxlength="' +
+          Core.MAX_NAME +
+          '" aria-label="Group name" style="font-weight:600;width:min(280px,100%)">' +
+          '<div style="margin-top:8px">' +
+          (members || '<span class="section-desc">No people yet. Add them from the list below.</span>') +
+          '</div>' +
+          (staffOpts
+            ? '<label class="field-label" style="margin-top:8px">Add a person' +
+              '<select data-ag-add-staff data-ag-id="' +
+              escAttr(p.id) +
+              '"><option value="">Choose…</option>' +
+              staffOpts +
+              '</select></label>'
+            : noNames) +
+          '<div style="margin-top:10px;font-size:12px;color:var(--text-3)">When this chip appears (optional)</div>' +
+          '<div style="margin-top:4px">' +
+          dayChecks +
+          '</div>' +
+          '<div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+          '<label>From <input type="time" data-ag-start data-ag-id="' +
+          escAttr(p.id) +
+          '" value="' +
+          escAttr((sched && sched.start) || '') +
+          '"></label>' +
+          '<label>to <input type="time" data-ag-end data-ag-id="' +
+          escAttr(p.id) +
+          '" value="' +
+          escAttr((sched && sched.end) || '') +
+          '"></label>' +
+          '<span class="section-desc">Leave blank for always. Overnight windows wrap past midnight (for example 18:00 to 08:00).</span>' +
+          '</div>' +
+          '<button type="button" class="ghost danger-quiet" data-ag-delete data-ag-id="' +
+          escAttr(p.id) +
+          '" style="margin-top:10px">Delete group</button>' +
+          '</div>'
+        );
+      })
+      .join('');
+  }
+
+  function findPreset(id) {
+    return presets.filter((p) => p.id === id)[0];
+  }
+
+  function scheduleFromCard(p, card) {
+    const days = [];
+    card.querySelectorAll('[data-ag-day]').forEach((box) => {
+      if (box.checked) days.push(box.getAttribute('data-ag-day'));
+    });
+    const start = card.querySelector('[data-ag-start]')?.value || '';
+    const end = card.querySelector('[data-ag-end]')?.value || '';
+    if (!days.length && !start && !end) return null;
+    if (!days.length || !start || !end) return p.schedule || null;
+    const raw = { days: days, start: start, end: end };
+    if (Core.scheduleErrors(raw).length) return p.schedule || null;
+    return Core.normaliseSchedule(raw);
+  }
+
+  async function load() {
+    const state = await loadAllocationGroupsState();
+    presets = state.presets || [];
+    const cache = await chrome.storage.local.get(['allocationGroups.staffCache', 'rota.staff']);
+    staffCache = Array.isArray(cache['allocationGroups.staffCache']) ? cache['allocationGroups.staffCache'] : [];
+    const rawRota = Array.isArray(cache['rota.staff']) ? cache['rota.staff'] : [];
+    rotaStaff = rawRota
+      .filter((s) => s && Core.isUuid(s.id) && (s.name || s.displayName))
+      .map((s) => ({
+        id: String(s.id).toLowerCase(),
+        name: s.name || s.displayName || '',
+      }));
+    render();
+  }
+
+  document.getElementById('agAdd')?.addEventListener('click', async () => {
+    const res = Core.upsertPreset(
+      presets,
+      {
+        name: 'New group',
+        memberIds: [],
+        memberNames: {},
+      },
+      { allowEmpty: true }
+    );
+    if (!res.ok) {
+      const host = document.getElementById('agList');
+      if (host) {
+        const note = document.createElement('p');
+        note.className = 'section-desc';
+        note.setAttribute('data-ag-add-error', '1');
+        note.textContent = (res.errors && res.errors[0]) || 'Could not start a group.';
+        host.prepend(note);
+      }
+      return;
+    }
+    presets = res.presets;
+    await persist();
+  });
+
+  document.getElementById('agList')?.addEventListener('change', async (ev) => {
+    const id = ev.target && ev.target.getAttribute('data-ag-id');
+    if (!id) return;
+    const p = findPreset(id);
+    const card = ev.target.closest('[data-ag-card]');
+    if (!p || !card) return;
+    if (ev.target.hasAttribute('data-ag-name')) p.name = ev.target.value;
+    if (ev.target.hasAttribute('data-ag-add-staff')) {
+      const sid = ev.target.value;
+      const staff = pickerStaff().filter((s) => String(s.id).toLowerCase() === sid)[0];
+      if (staff && Core.isUuid(sid)) {
+        p.memberIds = (p.memberIds || []).concat([sid]);
+        p.memberNames = Object.assign({}, p.memberNames || {}, { [sid]: staff.name });
+      }
+      ev.target.value = '';
+    }
+    const schedEl =
+      ev.target.hasAttribute('data-ag-day') ||
+      ev.target.hasAttribute('data-ag-start') ||
+      ev.target.hasAttribute('data-ag-end');
+    if (schedEl) {
+      const days = [];
+      card.querySelectorAll('[data-ag-day]').forEach((box) => {
+        if (box.checked) days.push(box.getAttribute('data-ag-day'));
+      });
+      const start = card.querySelector('[data-ag-start]')?.value || '';
+      const end = card.querySelector('[data-ag-end]')?.value || '';
+      if (!days.length && !start && !end) {
+        p.schedule = null;
+      } else if (!days.length || !start || !end) {
+        return;
+      } else {
+        const raw = { days, start, end };
+        const errs = Core.scheduleErrors(raw);
+        if (errs.length) {
+          let note = card.querySelector('[data-ag-sched-error]');
+          if (!note) {
+            note = document.createElement('p');
+            note.className = 'section-desc';
+            note.setAttribute('data-ag-sched-error', '1');
+            card.appendChild(note);
+          }
+          note.textContent = errs[0];
+          return;
+        }
+        const oldNote = card.querySelector('[data-ag-sched-error]');
+        if (oldNote) oldNote.remove();
+        p.schedule = Core.normaliseSchedule(raw);
+      }
+    } else {
+      p.schedule = scheduleFromCard(p, card);
+    }
+    const res = Core.upsertPreset(presets, p, { allowEmpty: true });
+    if (res.ok) {
+      presets = res.presets;
+      await persist();
+    }
+  });
+
+  document.getElementById('agList')?.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-ag-delete], [data-ag-drop-member]');
+    if (!btn) return;
+    const id = btn.getAttribute('data-ag-id');
+    if (btn.hasAttribute('data-ag-delete')) {
+      if (!window.confirm('Delete this group?')) return;
+      presets = Core.removePreset(presets, id).presets;
+      await persist();
+      return;
+    }
+    const p = findPreset(id);
+    if (!p) return;
+    const drop = btn.getAttribute('data-ag-drop-member');
+    p.memberIds = (p.memberIds || []).filter((m) => m !== drop);
+    if (p.memberNames) delete p.memberNames[drop];
+    const res = Core.upsertPreset(presets, p, { allowEmpty: true });
+    if (res.ok) presets = res.presets;
+    await persist();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', load);
+  } else {
+    load();
+  }
+})();

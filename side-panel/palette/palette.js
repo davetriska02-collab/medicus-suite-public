@@ -1,0 +1,571 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — command palette (Ctrl+K) engine
+//
+// One keystroke to anywhere: jump to any tab, change display settings, open
+// a specific Options section, replay the tour. Shell-owned (panel.js and
+// pop-out.js both call initPalette); styles live in panel.css
+// (suite-palette-*). Pure scoring/ranking logic is in palette-core.js.
+//
+// Commands are built fresh on every open:
+//   - navigation commands take their label and icon from the live .nav-tab
+//     DOM (panel vs pop-out, hidden tabs included) and are listed in section
+//     order (tab-sections.js). Slots and Monitoring stay ungrouped. Running
+//     one clicks the real tab. Rota manager and Duplicates are off the strip;
+//     both shells get an open:* command in Practice;
+//   - everything else is a small static registry below.
+//
+// Recents ('suite.palette.recents', localStorage) hold command ids only —
+// never patient data.
+
+'use strict';
+
+import { rankCommands, pushRecent, patientScopedCommands, PATIENT_COMMAND_IDS } from './palette-core.js';
+import { startTour } from '../tour/tour.js';
+import { openRotaTab } from '../modules/rota/rota-open.js';
+import { openDuplicateCheckerTab } from '../duplicate-checker-open.js';
+import { openAvailabilityTab } from '../../availability/wall-open.js';
+import { orderedMenuIds, paletteGroupFor } from '../tab-sections.js';
+
+const RECENTS_KEY = 'suite.palette.recents';
+
+let _layer = null;
+let _commands = [];
+let _filtered = [];
+let _selected = 0;
+let _hotkeyHandler = null;
+
+function loadRecents() {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENTS_KEY));
+    return Array.isArray(v) ? v : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveRecents(rec) {
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(rec));
+  } catch (_) {
+    /* storage unavailable — recents are a nicety, not state */
+  }
+}
+
+// Merge a partial display-pref change into suite.display; display-prefs.js
+// listens for the storage change and re-applies on every extension page.
+async function setDisplay(patch) {
+  const r = await chrome.storage.local.get('suite.display');
+  const cur = r['suite.display'] || {};
+  await chrome.storage.local.set({ 'suite.display': { ...cur, ...patch } });
+}
+
+function optionsSectionUrl(section) {
+  return chrome.runtime.getURL(`options/options.html#sect-${section}`);
+}
+
+// Live patient-context detection for the palette's patient-scoped commands
+// (item 10 / Dave-council roadmap step 4). Same lookup path as record.js's
+// findMedicusTab + patientUuidFromContentScript: active tab → is it Medicus →
+// ask the content script's cached Sentinel snapshot for a patient identity.
+// Best-effort — any failure (no tab, no content script, navigating) means "no
+// patient", which is the safe default (commands simply don't appear).
+async function detectPatientContext() {
+  try {
+    const active = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = active[0];
+    if (!tab?.id || !tab?.url || !/medicus\.health/.test(tab.url)) return false;
+    const snap = await chrome.tabs.sendMessage(tab.id, { action: 'getSentinelSnapshot' });
+    const pc = snap && snap.patientContext;
+    return !!(pc && (pc.patientName || pc.patientUuid));
+  } catch (_) {
+    return false;
+  }
+}
+
+const SEARCH_ICON =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
+const GENERIC_ICONS = {
+  display:
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
+  settings:
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg>',
+  help: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  window:
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>',
+  doc: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
+  person:
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+};
+
+// Options sections (ids match options.html sect-* / options.js deep-linking).
+const OPTIONS_SECTIONS = [
+  ['suite', 'Suite', 'practice code feedback email letterhead tour request monitor'],
+  [
+    'practice-features',
+    'Practice features',
+    'packs allocate canvases contacts routine-rx quick actions template organiser document and template organiser workload tracker staff teams dashboard',
+  ],
+  ['notifications', 'Notifications', 'alerts sounds desktop quiet clinic mode mute'],
+  ['slots', 'Slot Counter', 'appointments'],
+  ['capacity', 'Capacity Forecast', 'forecast'],
+  ['submissions', 'Submissions', 'demand thresholds'],
+  ['triage', 'Triage chips', 'triage lens keywords red flags pharmacy first ask-back request row'],
+  ['reception', 'Reception', 'pathways'],
+  ['knowledge', 'Knowledge', 'reference'],
+  ['allocation-groups', 'Allocation groups', 'duty teams share out split equally morning afternoon triage'],
+  ['safety', 'Clinical Safety', 'hazard disclaimer'],
+  ['diagnostics', 'Diagnostics', 'event ledger suite health debug api log'],
+  ['backup', 'Backup & Restore', 'export import suite backup'],
+  ['stackchan', 'StackChan', 'desk robot face presence stackchan avatar'],
+];
+
+// Build the command list from the live DOM + static registry.
+// hasPatient gates the patient-scoped commands (item 10) — resolved by the
+// caller (openPalette) via detectPatientContext before this runs.
+function buildCommands(hasPatient) {
+  const cmds = [];
+
+  // Navigation — one command per tab in this shell, in section order.
+  // Hidden tabs (suite.hiddenTabs) stay reachable here — the palette is the
+  // escape hatch that makes hiding a tab de-cluttering, not lock-out.
+  const tabsById = new Map([...document.querySelectorAll('.nav-tab')].map((tab) => [tab.dataset.module, tab]));
+  const placed = new Set();
+
+  function pushNav(tab) {
+    placed.add(tab.dataset.module);
+    const label = tab.getAttribute('aria-label') || tab.querySelector('span')?.textContent || tab.dataset.module;
+    cmds.push({
+      id: `nav:${tab.dataset.module}`,
+      label: `Go to ${label}`,
+      group: paletteGroupFor(tab.dataset.module),
+      keywords: tab.dataset.module + (tab.classList.contains('nav-tab-hidden') ? ' hidden' : ''),
+      icon: tab.querySelector('svg')?.outerHTML || GENERIC_ICONS.doc,
+      run: () => tab.click(),
+    });
+  }
+
+  function offStripIcon(id) {
+    const svg = document.getElementById('offStripLaunchers')?.content?.querySelector(`[data-module="${id}"] svg`);
+    return svg?.outerHTML || GENERIC_ICONS.doc;
+  }
+
+  for (const id of orderedMenuIds()) {
+    const tab = tabsById.get(id);
+    if (tab) {
+      pushNav(tab);
+      continue;
+    }
+    // Full-tab launchers have no strip button. Same commands in panel and pop-out.
+    if (id === 'rota-app') {
+      placed.add(id);
+      cmds.push({
+        id: 'open:rota',
+        label: 'Open Rota manager',
+        group: paletteGroupFor('rota-app'),
+        keywords: 'rota manager rota-app staff duty leave cover sessions template',
+        icon: offStripIcon('rota-app'),
+        run: () => openRotaTab(),
+      });
+    } else if (id === 'duplicate-checker') {
+      placed.add(id);
+      cmds.push({
+        id: 'open:duplicates',
+        label: 'Open Duplicates',
+        group: paletteGroupFor('duplicate-checker'),
+        keywords: 'duplicate-checker duplicates duplicate problem checker gp2gp scan',
+        icon: offStripIcon('duplicate-checker'),
+        run: () => openDuplicateCheckerTab(),
+      });
+    } else if (id === 'availability') {
+      placed.add(id);
+      cmds.push({
+        id: 'open:availability',
+        label: 'Open availability wall',
+        group: paletteGroupFor('availability'),
+        keywords: 'availability wall slots free capacity tv triage room screen',
+        icon: offStripIcon('availability'),
+        run: () => openAvailabilityTab(),
+      });
+    }
+  }
+  for (const tab of tabsById.values()) {
+    if (!placed.has(tab.dataset.module)) pushNav(tab);
+  }
+
+  // Pop out — panel only (the button doesn't exist in the pop-out window).
+  const popoutBtn = document.getElementById('popoutBtn');
+  if (popoutBtn) {
+    cmds.push({
+      id: 'open:popout',
+      label: 'Pop out to floating window',
+      group: 'Open',
+      keywords: 'window detach float',
+      icon: GENERIC_ICONS.window,
+      run: () => popoutBtn.click(),
+    });
+  }
+
+  // Quick leaflet search — panel only (the button/host don't exist in the
+  // pop-out window, which reaches the full Leaflets tab from its own nav).
+  if (document.getElementById('quickLeafletBtn')) {
+    cmds.push({
+      id: 'open:quick-leaflet',
+      label: 'NHS leaflet quick search\u2026',
+      group: 'Open',
+      keywords: 'leaflet patient information nhs handout condition medicine share triage',
+      icon: GENERIC_ICONS.doc,
+      run: () => import('../quick-leaflet/quick-leaflet.js').then((m) => m.openQuickLeaflet()),
+    });
+  }
+
+  // Display preferences — applied live everywhere via display-prefs.js.
+  const display = [
+    ['display:light', 'Theme: light', 'day bright', { theme: 'light' }],
+    ['display:dark', 'Theme: dark', 'night', { theme: 'dark' }],
+    ['display:small', 'Text size: small', 'compact zoom', { size: 'small' }],
+    ['display:medium', 'Text size: medium', 'default zoom', { size: 'medium' }],
+    ['display:large', 'Text size: large', 'bigger zoom accessibility', { size: 'large' }],
+  ];
+  for (const [id, label, keywords, patch] of display) {
+    cmds.push({ id, label, group: 'Display', keywords, icon: GENERIC_ICONS.display, run: () => setDisplay(patch) });
+  }
+  cmds.push({
+    id: 'display:colorblind',
+    label: 'Toggle colour-blind palette',
+    group: 'Display',
+    keywords: 'accessibility deuteranopia colorblind',
+    icon: GENERIC_ICONS.display,
+    run: async () => {
+      const r = await chrome.storage.local.get('suite.display');
+      await setDisplay({ colorblind: !(r['suite.display'] || {}).colorblind });
+    },
+  });
+
+  // Tab chooser — role presets + per-tab show/hide (user-owned)
+  cmds.push({
+    id: 'tabs:choose',
+    label: 'Choose tabs…',
+    group: 'Display',
+    keywords: 'customise tabs show hide nav role preset gp reception manager',
+    icon: GENERIC_ICONS.window,
+    run: () => import('../tabs-chooser/tabs-chooser.js').then((m) => m.openTabsChooser()),
+  });
+
+  // Quiet mode / clinic mode commands
+  const quietIcon = GENERIC_ICONS.display; // reuse display icon
+  cmds.push({
+    id: 'quiet:30m',
+    label: 'Clinic mode: 30 minutes',
+    group: 'Quiet',
+    keywords: 'mute silence notifications desktop 30 minutes clinic',
+    icon: quietIcon,
+    run: () => window.QuietMode?.set(Date.now() + 30 * 60 * 1000),
+  });
+  cmds.push({
+    id: 'quiet:1h',
+    label: 'Clinic mode: 1 hour',
+    group: 'Quiet',
+    keywords: 'mute silence notifications desktop hour clinic',
+    icon: quietIcon,
+    run: () => window.QuietMode?.set(Date.now() + 60 * 60 * 1000),
+  });
+  cmds.push({
+    id: 'quiet:off',
+    label: 'Clinic mode: off',
+    group: 'Quiet',
+    keywords: 'unmute resume notifications desktop clinic',
+    icon: quietIcon,
+    run: () => window.QuietMode?.clear(),
+  });
+
+  // Focus (Zen) mode — visual declutter of the chrome. Distinct from Quiet
+  // mode above, which mutes notifications; Zen hides chrome, never signal.
+  cmds.push({
+    id: 'zen:toggle',
+    label: 'Focus mode: toggle',
+    group: 'View',
+    keywords: 'zen focus declutter hide chrome distraction free minimal full screen',
+    icon: GENERIC_ICONS.window,
+    run: () => window.ZenMode?.toggle(),
+  });
+
+  // Keep the alert roll-up pinned open (persists across alert-set changes).
+  // Panel-only — the floating pop-out has no demand strips / roll-up.
+  if (document.getElementById('alertRollup')) {
+    cmds.push({
+      id: 'alerts:keep-expanded',
+      label: 'Alerts: keep roll-up expanded (toggle)',
+      group: 'View',
+      keywords: 'alert rollup pin expand always open detail demand waiting triage',
+      icon: GENERIC_ICONS.window,
+      run: async () => {
+        const r = await chrome.storage.local.get('suite.rollup.alwaysExpanded');
+        await chrome.storage.local.set({ 'suite.rollup.alwaysExpanded': !(r['suite.rollup.alwaysExpanded'] === true) });
+      },
+    });
+  }
+
+  // Edit the numeric alert thresholds (waiting-room minutes + demand counts).
+  // Panel-only — the strips these tune live in the docked panel.
+  if (document.getElementById('wrStrip')) {
+    cmds.push({
+      id: 'alerts:thresholds',
+      label: 'Edit alert thresholds…',
+      group: 'View',
+      keywords: 'alert threshold waiting room minutes demand amber red tune configure level limit',
+      icon: GENERIC_ICONS.settings,
+      run: () => import('../thresholds/thresholds.js').then((m) => m.openThresholds()),
+    });
+  }
+
+  // Options sections — deep links straight to the right settings page.
+  for (const [sect, label, keywords] of OPTIONS_SECTIONS) {
+    cmds.push({
+      id: `settings:${sect}`,
+      label: `Settings: ${label}`,
+      group: 'Settings',
+      keywords: `options preferences configure ${keywords}`,
+      icon: GENERIC_ICONS.settings,
+      run: () => chrome.tabs.create({ url: optionsSectionUrl(sect) }),
+    });
+  }
+
+  // Help
+  cmds.push({
+    id: 'help:tour',
+    label: 'Replay the guided tour',
+    group: 'Help',
+    keywords: 'walkthrough onboarding help whats new',
+    icon: GENERIC_ICONS.help,
+    run: () => startTour(),
+  });
+
+  // Setup checklist — panel-only (setupHost does not exist in the pop-out)
+  if (document.getElementById('setupHost')) {
+    cmds.push({
+      id: 'help:setup',
+      label: 'Suite setup checklist',
+      group: 'Help',
+      keywords: 'first run practice code connection notifications onboarding health',
+      icon: GENERIC_ICONS.help,
+      run: () => import('../setup/setup.js').then((m) => m.openSetup()),
+    });
+  }
+
+  // Patient-scoped actions (item 10 / Dave-council roadmap step 4) — only
+  // added when a patient is open in Medicus (detectPatientContext, resolved
+  // by the caller before this function runs). Descriptor list + gating lives
+  // in palette-core.js (patientScopedCommands) so it's testable without
+  // chrome/DOM; `run` behaviour is attached here since it needs live tabs.
+  if (hasPatient) {
+    const runners = {
+      [PATIENT_COMMAND_IDS.COPY_SUMMARY]: runCopyPatientSummary,
+      [PATIENT_COMMAND_IDS.JUMP_RECORD]: () => clickNavTab('record'),
+      [PATIENT_COMMAND_IDS.JUMP_TRENDS]: () => clickNavTab('trends'),
+    };
+    for (const descriptor of patientScopedCommands(true)) {
+      cmds.push({ ...descriptor, icon: GENERIC_ICONS.person, run: runners[descriptor.id] });
+    }
+  }
+
+  return cmds;
+}
+
+// Click a nav tab by module name, if it exists in this shell (record/trends/
+// sentinel are real modules in both panel and pop-out, so this is normally a
+// no-op guard rather than a real gap).
+function clickNavTab(moduleName) {
+  document.querySelector(`.nav-tab[data-module="${moduleName}"]`)?.click();
+}
+
+// "Copy patient summary" from the palette. Reuses the Record tab's own
+// formatter/flow (buildRecordSummaryText + its Copy button) rather than
+// re-implementing the live Medicus fetch here: jump to Record, then click its
+// Copy button once the module has loaded the patient and enabled it. Record
+// already shows a "Copied" confirmation on its own button — this just gets
+// the user there in one step, which is the whole point of a palette action.
+async function runCopyPatientSummary() {
+  clickNavTab('record');
+  const btn = await waitForEnabled('#recCopySummary', 4000);
+  btn?.click();
+}
+
+// Poll for a selector to appear AND be enabled (Record disables its Copy
+// button until a patient snapshot has loaded — see record.js wireStaticControls).
+function waitForEnabled(selector, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      const el = document.querySelector(selector);
+      if (el && !el.disabled) {
+        resolve(el);
+        return;
+      }
+      if (Date.now() - start >= timeoutMs) {
+        resolve(null);
+        return;
+      }
+      setTimeout(tick, 150);
+    };
+    tick();
+  });
+}
+
+// Wire the global hotkey + launcher button. Call once per page.
+export function initPalette() {
+  const btn = document.getElementById('paletteBtn');
+  btn?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePalette();
+  });
+
+  _hotkeyHandler = (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+      e.stopPropagation();
+      togglePalette();
+    }
+  };
+  document.addEventListener('keydown', _hotkeyHandler, true);
+}
+
+export function togglePalette() {
+  if (_layer) closePalette();
+  else openPalette();
+}
+
+export function openPalette() {
+  if (_layer) return;
+  // Build synchronously (no patient commands yet) so the palette opens
+  // instantly — the live tabs.sendMessage patient-context lookup below is not
+  // worth blocking the whole palette for. If a patient is found, the list is
+  // quietly patched in and re-rendered a beat later (openPalette closure
+  // re-checks _layer so a since-closed palette is a no-op).
+  _commands = buildCommands(false);
+  _selected = 0;
+  detectPatientContext().then((hasPatient) => {
+    if (!hasPatient || !_layer) return;
+    _commands = buildCommands(true);
+    const query = _layer.querySelector('.suite-palette-input')?.value || '';
+    _selected = 0;
+    renderList(query);
+  });
+
+  _layer = document.createElement('div');
+  _layer.className = 'suite-palette-layer';
+  _layer.setAttribute('role', 'dialog');
+  _layer.setAttribute('aria-modal', 'true');
+  _layer.setAttribute('aria-label', 'Command palette');
+  _layer.innerHTML = `
+    <div class="suite-palette">
+      <div class="suite-palette-inputrow">
+        ${SEARCH_ICON}
+        <input class="suite-palette-input" type="text" placeholder="Type a tab, setting or action…"
+               aria-label="Search commands" spellcheck="false" autocomplete="off" />
+        <kbd class="suite-palette-kbd">esc</kbd>
+      </div>
+      <div class="suite-palette-list" role="listbox" aria-label="Commands"></div>
+      <div class="suite-palette-hints">
+        <span><kbd class="suite-palette-kbd">↑↓</kbd> select</span>
+        <span><kbd class="suite-palette-kbd">↵</kbd> run</span>
+        <span><kbd class="suite-palette-kbd">ctrl</kbd>+<kbd class="suite-palette-kbd">k</kbd> toggle</span>
+      </div>
+    </div>`;
+  document.body.appendChild(_layer);
+
+  const input = _layer.querySelector('.suite-palette-input');
+
+  _layer.addEventListener('click', (e) => {
+    if (!e.target.closest('.suite-palette')) {
+      closePalette();
+      return;
+    }
+    const row = e.target.closest('[data-cmd-idx]');
+    if (row) runCommand(_filtered[parseInt(row.dataset.cmdIdx, 10)]);
+  });
+
+  _layer.addEventListener('mousemove', (e) => {
+    const row = e.target.closest('[data-cmd-idx]');
+    if (!row) return;
+    const idx = parseInt(row.dataset.cmdIdx, 10);
+    if (idx !== _selected) {
+      _selected = idx;
+      paintSelection();
+    }
+  });
+
+  input.addEventListener('input', () => {
+    _selected = 0;
+    renderList(input.value);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      closePalette();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      _selected = Math.min(_selected + 1, _filtered.length - 1);
+      paintSelection();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      _selected = Math.max(_selected - 1, 0);
+      paintSelection();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      runCommand(_filtered[_selected]);
+    }
+  });
+
+  renderList('');
+  input.focus();
+}
+
+export function closePalette() {
+  _layer?.remove();
+  _layer = null;
+  _filtered = [];
+  _selected = 0;
+}
+
+function runCommand(cmd) {
+  if (!cmd) return;
+  saveRecents(pushRecent(loadRecents(), cmd.id));
+  closePalette();
+  try {
+    cmd.run();
+  } catch (e) {
+    console.error('[palette]', cmd.id, e);
+  }
+}
+
+function renderList(query) {
+  if (!_layer) return;
+  _filtered = rankCommands(_commands, query, loadRecents());
+  const list = _layer.querySelector('.suite-palette-list');
+  if (_filtered.length === 0) {
+    list.innerHTML = `<div class="suite-palette-empty">No matching commands</div>`;
+    return;
+  }
+  list.innerHTML = _filtered
+    .map(
+      (c, i) => `
+      <div class="suite-palette-row${i === _selected ? ' selected' : ''}" data-cmd-idx="${i}"
+           role="option" aria-selected="${i === _selected}">
+        <span class="suite-palette-icon">${c.icon}</span>
+        <span class="suite-palette-label">${c.label}</span>
+        ${c.group ? `<span class="suite-palette-group">${c.group}</span>` : ''}
+      </div>`
+    )
+    .join('');
+  paintSelection();
+}
+
+function paintSelection() {
+  if (!_layer) return;
+  _layer.querySelectorAll('.suite-palette-row').forEach((row, i) => {
+    row.classList.toggle('selected', i === _selected);
+    row.setAttribute('aria-selected', String(i === _selected));
+  });
+  _layer.querySelector('.suite-palette-row.selected')?.scrollIntoView({ block: 'nearest' });
+}

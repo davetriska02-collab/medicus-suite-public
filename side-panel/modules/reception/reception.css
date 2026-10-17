@@ -1,0 +1,1235 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Medicus Suite — Reception module styles */
+
+.rcp-module {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text-1);
+  font-family: var(--sans);
+}
+
+.rcp-head {
+  margin-bottom: 10px;
+}
+.rcp-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 2px 0;
+  color: var(--text-1);
+}
+.rcp-subtitle {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.rcp-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-1);
+}
+.rcp-card-title {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-4);
+  margin-bottom: 6px;
+}
+.rcp-card-body {
+  line-height: 1.45;
+}
+
+.rcp-muted {
+  color: var(--text-3);
+}
+.rcp-fineprint {
+  font-size: 11px;
+  color: var(--text-4);
+  margin-top: 4px;
+}
+.rcp-error {
+  color: var(--red);
+  background: var(--red-dim);
+  border-radius: var(--r-sm);
+  padding: 4px 7px;
+  margin-bottom: 5px;
+}
+
+/* Buttons */
+.rcp-btn {
+  border: 1px solid var(--border-hi);
+  background: var(--bg-elev);
+  color: var(--text-3);
+  border-radius: var(--r-md);
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+.rcp-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--text-2);
+}
+.rcp-btn:active {
+  background: var(--accent-dim);
+}
+.rcp-btn:disabled,
+.rcp-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rcp-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-deep);
+  font-weight: 600;
+}
+.rcp-btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--bg-deep);
+}
+.rcp-link-btn {
+  border: none;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  transition: color var(--fast) var(--ease);
+}
+.rcp-link-btn:hover {
+  color: var(--accent-hover);
+}
+.rcp-link-btn:active {
+  opacity: 0.7;
+}
+.rcp-link-btn:disabled,
+.rcp-link-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Patient card */
+.rcp-patient-line {
+  margin-bottom: 6px;
+}
+.rcp-nhs {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+}
+
+/* Status pill */
+.rcp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: var(--r-pill);
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  border: 1px solid transparent;
+  margin-top: 2px;
+  transition:
+    box-shadow var(--fast) var(--ease),
+    filter var(--fast) var(--ease);
+}
+.rcp-pill:hover {
+  filter: saturate(1.18);
+  box-shadow: var(--shadow-1);
+}
+.rcp-pill:active {
+  filter: saturate(1.18) brightness(0.97);
+}
+.rcp-pill-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rcp-pill-caret {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.rcp-pill-green {
+  background: var(--green-dim);
+  border-color: var(--green-line);
+  color: var(--green);
+}
+.rcp-pill-amber {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+  color: var(--amber);
+}
+.rcp-pill-red {
+  background: var(--red-dim);
+  border-color: var(--red-line);
+  color: var(--red);
+}
+
+.rcp-pill-detail {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.rcp-detail-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.rcp-detail-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rcp-detail-status {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.rcp-detail-red .rcp-detail-status {
+  color: var(--red);
+  background: var(--red-dim);
+  border-color: var(--red-line);
+}
+.rcp-detail-amber .rcp-detail-status {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+
+/* One-time-setup framing note — calm, informational (not an alarm) */
+.rcp-setup-note {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  color: var(--text-3);
+  line-height: 1.45;
+}
+
+/* Pathways-disabled notice */
+.rcp-disabled-note {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  line-height: 1.45;
+}
+.rcp-disabled-note strong {
+  color: var(--amber);
+}
+
+/* Pathway picker */
+.rcp-picker-note {
+  margin-bottom: 8px;
+  color: var(--text-3);
+}
+.rcp-pathway-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
+}
+
+/* Tile wrapper (holds the launch button + organise affordances) */
+.rcp-pathway-tile {
+  position: relative;
+  display: flex;
+  border-radius: var(--r-md);
+}
+.rcp-pathway-btn {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-radius: var(--r-md);
+  padding: 8px;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: inherit;
+  transition:
+    border-color var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.rcp-pathway-btn:disabled,
+.rcp-pathway-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rcp-pathway-tile:not(.rcp-tile-organising) .rcp-pathway-btn:hover {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-2);
+  background: var(--bg-hover);
+}
+.rcp-pathway-tile:not(.rcp-tile-organising) .rcp-pathway-btn:active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.rcp-pathway-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+.rcp-pathway-applies {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* Colour coding (organising only — NOT a clinical flag).
+   Each key sets --tile-col; tiles show it as a left edge, swatches/dots as a fill.
+   Keep keys in sync with TILE_COLOUR_KEYS in shared/reception-pathway-utils.js. */
+.rcp-tile-c-default {
+  --tile-col: transparent;
+}
+.rcp-tile-c-slate {
+  --tile-col: var(--swatch-slate);
+}
+.rcp-tile-c-red {
+  --tile-col: var(--swatch-red);
+}
+.rcp-tile-c-orange {
+  --tile-col: var(--swatch-orange);
+}
+.rcp-tile-c-amber {
+  --tile-col: var(--swatch-amber);
+}
+.rcp-tile-c-green {
+  --tile-col: var(--swatch-green);
+}
+.rcp-tile-c-teal {
+  --tile-col: var(--swatch-teal);
+}
+.rcp-tile-c-blue {
+  --tile-col: var(--swatch-blue);
+}
+.rcp-tile-c-purple {
+  --tile-col: var(--swatch-purple);
+}
+.rcp-tile-c-pink {
+  --tile-col: var(--swatch-pink);
+}
+
+/* User colour-label shows as a small corner DOT (a tag), never a left-rule —
+   a coloured edge-bar would mimic the clinical-severity language used by the
+   escalation banner and overdue rows. The dot reads as a personal label. */
+.rcp-tile-tag {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--tile-col, transparent);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+.rcp-pathway-tile:not(.rcp-tile-c-default):not(.rcp-tile-organising) > .rcp-pathway-btn {
+  padding-right: 22px;
+}
+
+/* Secondary "Leaflet" suggestion (bottom-right of the tile) — pure signposting
+   to the NHS A-Z leaflet index. Deliberately small/muted so it never competes
+   with the tile's primary capture-launch click; hidden in organise mode along
+   with the draft pill and colour tag. */
+.rcp-tile-leaflet {
+  position: absolute;
+  right: 6px;
+  bottom: 5px;
+  font-size: 10px;
+  color: var(--text-4);
+  text-decoration: none;
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  transition:
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.rcp-tile-leaflet:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+.rcp-pathway-tile:not(.rcp-tile-organising) > .rcp-pathway-btn {
+  padding-bottom: 18px;
+}
+
+/* Organise toolbar */
+.rcp-tile-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.rcp-sort-ctrl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.rcp-sort-label {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-4);
+  margin-right: 2px;
+}
+.rcp-seg {
+  border: 1px solid var(--border-hi);
+  background: var(--bg-elev);
+  color: var(--text-3);
+  font-size: 11px;
+  padding: 3px 9px;
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+.rcp-seg:hover {
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+.rcp-seg:active {
+  background: var(--accent-dim);
+}
+.rcp-seg:first-of-type {
+  border-radius: var(--r-sm) 0 0 var(--r-sm);
+}
+.rcp-seg:last-of-type {
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-left: none;
+}
+.rcp-seg-on {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text-2);
+  font-weight: 600;
+}
+.rcp-seg-on:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text-2);
+}
+.rcp-organise-toggle {
+  font-weight: 600;
+}
+
+/* Organise mode: tile affordances */
+.rcp-tile-organising > .rcp-pathway-btn {
+  cursor: default;
+  padding-right: 26px;
+}
+.rcp-pathway-tile[draggable='true'] {
+  cursor: grab;
+}
+.rcp-pathway-tile[draggable='true'] > .rcp-pathway-btn {
+  padding-left: 20px;
+}
+.rcp-drag-handle {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-4);
+  font-size: 16px;
+  line-height: 1;
+  cursor: grab;
+}
+.rcp-tile-dragging {
+  opacity: 0.4;
+}
+.rcp-tile-over > .rcp-pathway-btn {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+
+/* Colour swatch (top-right of a tile in organise mode) */
+.rcp-tile-swatch {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border-hi);
+  background: var(--tile-col, transparent);
+  cursor: pointer;
+  transition:
+    box-shadow var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.rcp-tile-swatch:hover {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-1);
+}
+.rcp-tile-swatch:active {
+  box-shadow: none;
+}
+.rcp-tile-swatch.rcp-tile-c-default {
+  background: transparent;
+  border-style: dashed;
+}
+
+/* Colour palette popover */
+.rcp-colour-palette {
+  position: absolute;
+  top: 26px;
+  right: 5px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  width: 116px;
+  padding: 8px;
+  border-radius: var(--r-lg);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+}
+.rcp-colour-dot {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--tile-col, transparent);
+  cursor: pointer;
+  transition:
+    box-shadow var(--fast) var(--ease),
+    transform var(--fast) var(--ease);
+}
+.rcp-colour-dot:hover {
+  box-shadow: var(--shadow-1);
+  transform: scale(1.08);
+}
+.rcp-colour-dot:active {
+  transform: scale(1);
+}
+.rcp-colour-dot.rcp-tile-c-default {
+  background: transparent;
+  border-style: dashed;
+}
+.rcp-colour-sel {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Capture form */
+.rcp-form-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.rcp-form-title {
+  font-weight: 700;
+}
+.rcp-initials {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.rcp-initials input {
+  width: 46px;
+  margin-left: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 2px 5px;
+  background: var(--bg-mid);
+  color: var(--text-2);
+  transition:
+    border-color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.rcp-initials input:focus-visible {
+  border-color: var(--accent);
+  background: var(--bg-elev);
+}
+
+.rcp-banner {
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+.rcp-banner-hidden {
+  display: none;
+}
+.rcp-banner-red {
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  border-left: 4px solid var(--red);
+  box-shadow: var(--shadow-2);
+  color: var(--red);
+}
+.rcp-banner-amber {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-left: 4px solid var(--amber);
+  color: var(--amber);
+}
+/* Safeguarding line appended inside the escalation banner when a red flag with
+   safeguarding:true is answered YES. Deliberately reads as an additional,
+   separate instruction rather than a second banner — the escalation and the
+   safeguarding route both apply. */
+.rcp-banner-safeguarding {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid currentcolor;
+  font-weight: 700;
+}
+/* Fixed closing line on sensitive (mental-health) capture forms — the practice's
+   crisis route. Not a clinical instruction, a signposting line. */
+.rcp-crisis-line {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.rcp-section {
+  margin-bottom: 12px;
+}
+.rcp-section-title {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 9px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-4);
+  margin-bottom: 5px;
+}
+.rcp-section-rf {
+  border: 1px solid var(--red-line);
+  border-radius: var(--r-md);
+  padding: 7px 9px;
+  background: var(--red-dim);
+}
+
+.rcp-duration-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 8px;
+}
+.rcp-duration-grid input,
+.rcp-duration-grid select {
+  width: 100%;
+}
+
+.rcp-amalgam {
+  border-radius: var(--r-md);
+  padding: 7px 9px;
+}
+.rcp-amalgam-emergency {
+  border: 1px solid var(--red-line);
+  background: var(--red-dim);
+}
+.rcp-amalgam-duty {
+  border: 1px solid var(--amber-line);
+  background: var(--amber-dim);
+}
+.rcp-amalgam-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border);
+  cursor: pointer;
+}
+.rcp-amalgam-item:first-child {
+  border-top: none;
+}
+.rcp-amalgam-item input {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+.rcp-amalgam-none {
+  font-weight: 600;
+}
+
+.rcp-more {
+  margin: 8px 0 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.rcp-more summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+}
+.rcp-more[open] summary {
+  margin-bottom: 8px;
+}
+
+.rcp-stopped-999 .rcp-after-stop,
+.rcp-stopped-999 .rcp-more {
+  opacity: 0.4;
+}
+
+.rcp-rf-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border);
+}
+.rcp-rf-row:first-of-type {
+  border-top: none;
+}
+.rcp-rf-ask {
+  flex: 1;
+}
+.rcp-rf-missing {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+.rcp-yn {
+  display: inline-flex;
+  gap: 8px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.rcp-yn label {
+  cursor: pointer;
+}
+
+.rcp-q-row {
+  margin-bottom: 7px;
+}
+.rcp-q-ask {
+  display: block;
+  margin-bottom: 2px;
+}
+.rcp-q-row input[type='text'],
+.rcp-q-row select,
+.rcp-q-row textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 4px 7px;
+  font: inherit;
+  background: var(--bg-mid);
+  color: var(--text-2);
+  transition:
+    border-color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.rcp-q-row input[type='text']:focus-visible,
+.rcp-q-row select:focus-visible,
+.rcp-q-row textarea:focus-visible {
+  border-color: var(--accent);
+  background: var(--bg-elev);
+}
+.rcp-multi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rcp-multi label {
+  cursor: pointer;
+}
+
+.rcp-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.rcp-form-msg {
+  font-size: 12px;
+  color: var(--red);
+}
+.rcp-form-msg-ok {
+  color: var(--green);
+}
+
+/* Draft autosave — pill on pathway tile */
+.rcp-draft-pill {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  border-radius: var(--r-pill);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+  margin-top: 3px;
+  align-self: flex-start;
+}
+
+/* Draft restore banner (slim, above escalation banner) */
+.rcp-draft-banner {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 9px;
+  margin-bottom: 6px;
+  border-radius: var(--r-md);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.rcp-draft-banner-hidden {
+  display: none;
+}
+.rcp-draft-restore {
+  font-weight: 600;
+}
+
+/* Output */
+.rcp-output-text {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px;
+  background: var(--bg-mid);
+  color: var(--text-2);
+  margin-top: 6px;
+}
+.rcp-output-head {
+  margin-top: 2px;
+}
+
+/* ── Disposition suggestion card (plan E) ────────────────────────────────────
+   Sits between the escalation banner and "Generate summary", and ONLY when the
+   engine says 'suggest' (all red flags answered, none positive, pathway not
+   clinician-only). Deliberately quieter than the red/amber escalation banner:
+   this is a suggestion a human decides on, not an instruction. */
+.rcp-disposition {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  background: var(--bg-mid);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.rcp-disposition-hidden {
+  display: none;
+}
+.rcp-disp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.rcp-disp-title {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.rcp-disp-age {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.rcp-disp-age input {
+  width: 58px;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--text-1);
+}
+.rcp-disp-age input:focus-visible {
+  border-color: var(--accent);
+}
+.rcp-disp-suggest {
+  font-size: 13px;
+  color: var(--text-1);
+  line-height: 1.5;
+}
+/* The offer-a-clinician fallback. Always rendered with the suggestion — it also
+   goes into the pasted capture text (guardrail 7); never style it as optional. */
+.rcp-disp-fallback {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin-top: 2px;
+}
+.rcp-disp-decided {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--green);
+  margin-top: 5px;
+}
+.rcp-disp-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 7px;
+}
+.rcp-btn-small {
+  font-size: 12px;
+  padding: 3px 10px;
+}
+.rcp-disp-override {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--border);
+}
+.rcp-disp-override-lbl {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.rcp-disp-override select,
+.rcp-disp-override input[type='text'] {
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--text-1);
+}
+.rcp-disp-override input[type='text'] {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* ── Booking card (plan D3) ──────────────────────────────────────────────────
+   Card 3, mounted under the capture form by side-panel/modules/shared/
+   booking-panel.js and destroyed with it. Styled deliberately QUIETER than the
+   red/amber escalation banner and no louder than the disposition card: this is
+   a write the receptionist performs, not something the suite is urging. The
+   blocked states get their own treatment so "you cannot book yet, here is why"
+   never looks like a clinical alert. */
+.rcp-bk {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Blocked states: pop-out note and the open-record hard gate. */
+.rcp-bk-note,
+.rcp-bk-blocked {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border: 1px dashed var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 6px 9px;
+}
+
+.rcp-bk-loading,
+.rcp-bk-empty {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 4px 0;
+}
+
+.rcp-bk-fineprint {
+  font-size: 11px;
+  color: var(--text-4);
+  line-height: 1.45;
+}
+
+.rcp-bk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.rcp-bk-label {
+  font-size: 11px;
+  color: var(--text-3);
+  min-width: 42px;
+}
+.rcp-bk-select,
+.rcp-bk-date,
+.rcp-bk-text {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--text-1);
+}
+.rcp-bk-select:focus-visible,
+.rcp-bk-date:focus-visible,
+.rcp-bk-text:focus-visible {
+  border-color: var(--accent);
+}
+
+/* Typable type picker — filter input stacked over the (filtered) select */
+.rcp-bk-type-picker {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rcp-bk-type-picker .rcp-bk-select,
+.rcp-bk-type-filter {
+  width: 100%;
+  flex: none;
+}
+
+/* Date-mode chips: Specific day · 1 wk · 2 wks · 3 wks · 4 wks */
+.rcp-bk-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.rcp-bk-chip {
+  border: 1px solid var(--border-hi);
+  background: var(--bg-elev);
+  color: var(--text-3);
+  border-radius: var(--r-pill);
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+.rcp-bk-chip:hover {
+  border-color: var(--accent);
+  color: var(--text-2);
+}
+.rcp-bk-chip-on {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.rcp-bk-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Slot list — grouped by day, earliest first, nothing pre-selected. */
+.rcp-bk-days {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.rcp-bk-day-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.rcp-bk-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rcp-bk-slot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 12px;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.rcp-bk-slot:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+.rcp-bk-slot:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rcp-bk-slot-time {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.rcp-bk-slot-meta {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-4);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rcp-bk-slot-dur {
+  color: var(--text-4);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Confirm step: name + DOB read-back and the explicit tick that gates Confirm.
+   Booking is a write — this block is the last human check before it fires, so
+   it is the loudest thing on the card. */
+.rcp-bk-readback {
+  border: 1px solid var(--accent-line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  background: var(--bg-mid);
+  padding: 7px 9px;
+}
+.rcp-bk-readback-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  margin-bottom: 3px;
+}
+.rcp-bk-readback-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+  line-height: 1.3;
+}
+.rcp-bk-readback-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 5px;
+}
+.rcp-bk-tick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.rcp-bk-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.rcp-bk-sum-row {
+  display: flex;
+  gap: 8px;
+}
+.rcp-bk-sum-label {
+  min-width: 42px;
+  color: var(--text-4);
+  font-size: 11px;
+}
+
+/* Confirmation channels — visible and editable (plan D3.5). Both older booking
+   surfaces send every channel silently; here the desk can see and un-tick them
+   before anything reaches the patient. */
+.rcp-bk-recips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 5px 8px 7px;
+  margin: 0;
+}
+.rcp-bk-recips-legend {
+  font-size: 11px;
+  color: var(--text-4);
+  padding: 0 4px;
+}
+.rcp-bk-recip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.rcp-bk-booked {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rcp-bk-booked-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--green);
+}
+.rcp-bk-booked-tick {
+  font-size: 14px;
+}
+.rcp-bk-booked-detail {
+  font-size: 12px;
+  color: var(--text-2);
+}

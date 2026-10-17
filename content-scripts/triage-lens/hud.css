@@ -1,0 +1,1657 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Triage Lens styles
+   Two scopes:
+   1. #medicus-clinical-hud — the floating panel (record + detail pages)
+   2. .ch-queue-chips — chips injected into Medicus DOM (queue page)
+*/
+
+/*
+ * Self-contained token block — mirror of side-panel/panel.css light canon;
+ * see .claude/skills/ui-design/TOKENS.md §Injected surfaces.
+ * Applies to every top-level selector this file styles: the HUD panel,
+ * queue chip containers, and the action-menu which is appended to <body>.
+ * Host page is always light — no dark-theme override block needed.
+ */
+#medicus-clinical-hud,
+.ch-queue-chips,
+.ch-q-result,
+.ch-q-mon,
+.ch-q-pa,
+.ch-q-pending,
+.ch-q-repeat,
+.ch-q-carry,
+.ch-q-status,
+.ch-q-status-flash,
+.ch-oir-flag,
+.ch-oir-bulk,
+.ch-action-menu,
+.ch-rule-menu,
+.ch-oir-toast,
+.ch-row-sev-red,
+.ch-row-sev-amber,
+.ch-kbd-cursor,
+.ch-row-seen,
+.ch-result-popover,
+.ch-detail-verdict,
+.ch-q-pulse,
+.ch-q-why,
+#ms-tp-list,
+.ch-row-pulse-red,
+.ch-row-pulse-amber,
+.ch-row-pulse-on {
+  /* Surfaces */
+  --bg-deep: #f8fafc;
+  --bg-mid: #f1f5f9;
+  --bg-elev: #ffffff;
+  --bg-hover: #e2eaf5;
+  /* Borders */
+  --border: #cbd5e1;
+  --border-hi: #94a3b8;
+  /* Text tiers */
+  --text-1: #0f172a;
+  --text-2: #1e3a5f;
+  --text-3: #475569;
+  --text-4: #556377;
+  --text-5: #5f6f85;
+  /* Accent triad */
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-dim: rgba(37, 99, 235, 0.09);
+  --accent-line: rgba(37, 99, 235, 0.3);
+  /* Status triads: ink / wash / line */
+  --green: #16a34a;
+  --green-dim: rgba(22, 163, 74, 0.09);
+  --green-line: rgba(22, 163, 74, 0.3);
+  --amber: #b45309;
+  --amber-dim: rgba(180, 83, 9, 0.09);
+  --amber-line: rgba(180, 83, 9, 0.32);
+  --red: #dc2626;
+  --red-dim: rgba(220, 38, 38, 0.08);
+  --red-line: rgba(220, 38, 38, 0.3);
+  /* Shape */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-pill: 999px;
+  /* Depth */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-2: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.14);
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --med: 200ms;
+  /* Typography — no @import (host-page CSP); system stacks only */
+  --mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Brand header — deliberate navy matching suite --text-2; intentionally
+     not a neutral surface token so the header reads as branded chrome.
+     Canonical value is #1e3a5f — heals the #1f3a5f vs #1e3a5f drift in hud.css. */
+  --header-bg: #1e3a5f;
+  /* Header bottom edge — darkened border via overlay rather than a new token */
+  --header-border: rgba(0, 0, 0, 0.25);
+}
+
+/* ---- Universal chip — usable inside HUD and inline in Medicus DOM ---- */
+.ch-chip {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  font-family: var(--sans);
+  white-space: nowrap;
+}
+/* Status chip triads — aligned to canon (heals mismatch vs sidebar chips) */
+.ch-chip-red {
+  background: var(--red-dim);
+  color: var(--red);
+  border-color: var(--red-line);
+}
+.ch-chip-amber {
+  background: var(--amber-dim);
+  color: var(--amber);
+  border-color: var(--amber-line);
+}
+.ch-chip-green {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: var(--green-line);
+}
+.ch-chip-info {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+/* "Not fully assessed" headline placeholder (item 1.1 leg B) — grey, never
+   green/info, so an extraction failure can't be mistaken for a genuine
+   "No flags" all-clear. Dashed border echoes .ch-tile.ch-not-assessed. */
+.ch-chip-not-assessed {
+  background: var(--bg-mid);
+  color: var(--text-4);
+  border-color: var(--border);
+  border-style: dashed;
+}
+/* Meta/process chips (misprioritised, unmatched, the "couldn't check" result
+   chip below): outline, not filled — keeps clinical fills reserved for actual
+   result severity. (Previously only shipped in the stale PiP-only EMBEDDED_CSS
+   copy in content.js — never in this, the live-page stylesheet, so meta chips
+   rendered filled/wrong on the real queue. Fixed here.) */
+.ch-chip-meta {
+  background: transparent;
+}
+/* "Couldn't check this result" chip (item 1.1 leg D) — rendered when a per-row
+   result fetch/eval genuinely fails (not merely still-pending). Grey outline,
+   visually distinct from both the clinical red/amber fills and the plain
+   .ch-chip-meta family, so "we don't know" is never mistaken for "normal". */
+.ch-chip-error {
+  background: transparent;
+  color: var(--text-4);
+  border-color: var(--border-hi);
+}
+/* Negation/past-tense demotion (item 3.4, TRIAGE-LENS-2026-07-02.md) —
+   DISPLAY-ONLY: a demoted rule-match chip is NEVER hidden, only shown as an
+   outline/dimmed variant of its OWN kind colour (never flattened to a
+   neutral grey — the severity must still read at a glance; only the
+   confidence is de-emphasised). Declared after .ch-chip-red/amber/info/meta
+   above so its `background: transparent` wins the same-specificity cascade
+   regardless of which kind class it's paired with (e.g.
+   `ch-chip ch-chip-red ch-chip-demoted`). */
+.ch-chip-demoted {
+  background: transparent;
+  opacity: 0.72;
+  border-style: dashed;
+}
+/* "Unit mismatch" chip (item 3.1, TRIAGE-LENS-2026-07-02.md) — shown when one or
+   more result rules were SKIPPED because the reported unit conflicts with the
+   rule's expected unit (engine/result-severity.js unitsCompatible). Never a
+   severity change, so same grey-outline meta family/visual treatment as
+   .ch-chip-error — a skipped rule is a "didn't check it that way" signal, not a
+   clinical fill. */
+.ch-chip-unit-mismatch {
+  background: transparent;
+  color: var(--text-4);
+  border-color: var(--border-hi);
+}
+/* "Unclassified qualitative positive" chip (Part B, item 3.2, TRIAGE-LENS-2026-07-02.md)
+   — AMBER-MAX safety net: a non-numeric result contained a positive-lexicon token that
+   no text rule classified and the lab did not flag (see engine/result-severity.js
+   matchUnclassifiedPositive). Deliberately NOT the same filled .ch-chip-amber
+   treatment as a lab-confirmed abnormal/review chip — amber ink/border, transparent
+   fill + dashed border (same "provisional, go look" visual family as
+   .ch-chip-demoted/.ch-chip-not-assessed) so a GP never mistakes an unreviewed
+   free-text hit for a graded clinical finding. */
+.ch-chip-unclassified {
+  background: transparent;
+  color: var(--amber);
+  border-color: var(--amber-line);
+  border-style: dashed;
+}
+/* "All-normal, fileable" marker (item 4.4, TRIAGE-LENS-2026-07-02.md) — a small
+   green tick, filled (not outline) like .ch-chip-green: unlike the meta/
+   unclassified chips above this is a positive, confident signal (the profile-
+   independent lab-filing gate cleared this report), not a "go look" caution.
+   Always injected INSIDE the existing .ch-q-result host (content.js
+   injectResultChip), which already sits in the hud.css token-block selector
+   list above — var(--green) here resolves via CSS inheritance, so this class
+   deliberately does NOT need its own entry in that list (CLAUDE.md rule 5 only
+   applies to a new TOP-LEVEL injected/marker host). */
+.ch-chip-fileable {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: var(--green-line);
+  font-weight: 700;
+}
+
+/* ---- Queue row chips ---- */
+.ch-queue-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.ch-queue-chips .ch-chip {
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: var(--r-pill);
+}
+/* Ranked/collapsed rule-match chips (item 2.5, TRIAGE-LENS-2026-07-02.md) —
+   top rule + "+N" overflow only, replacing "one chip per matched rule".
+   Width-cap discipline matches .ch-q-result-inline .ch-chip: the label is
+   ellipsised, never dropped, so a shortened chip never implies an all-clear
+   (full text stays on hover via title). */
+.ch-q-rule-chip {
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Severity row tint (item 1.3, TRIAGE-LENS-2026-07-02.md) ----
+   Pre-attentive 2-3px left-edge tint on rows with a KNOWN cached severity, so a GP
+   can scan the shape of the queue without reading a single chip. These classes are
+   added by content.js as a MARKER CLASS on Medicus's own `.ag-row` (and its
+   preview/detail row) — not an injected node — so they must be in the token-block
+   selector list above (CLAUDE.md rule 5) or `var(--red)`/`var(--amber)` resolve to
+   nothing and the tint silently never shows. Inset box-shadow, not border-left: it
+   never changes the row's box model, so it cannot fight AG-Grid's own row width/
+   height math (a border-left would add to the row's rendered width). No tint at all
+   is the deliberate "unknown severity" state — never implies "assessed". */
+.ch-row-sev-red {
+  box-shadow: inset 3px 0 0 0 var(--red);
+}
+.ch-row-sev-amber {
+  box-shadow: inset 3px 0 0 0 var(--amber);
+}
+
+/* ---- Queue pulse (v3.236.4) — compress the chip pile to one named weight ----
+   Marker classes on Medicus's own `.ag-row` (same host-class pattern as
+   `.ch-row-sev-*`). Pulse ON replaces the 3px result tint so two left-edge
+   shadows never fight. Severity lives on ONE axis — the same rail column —
+   distinguished by fill density/shape, not hue: red is a SOLID 4px ink bar;
+   amber is a HOLLOW bar in the same column (a 4px wash band plus a 1px
+   full-strength ink stroke at the row edge), so red vs amber survives
+   colourblind mode by shape, never by hue alone. */
+.ch-row-pulse-red {
+  box-shadow: inset 4px 0 0 0 var(--red);
+}
+.ch-row-pulse-amber {
+  box-shadow:
+    inset 4px 0 0 0 var(--amber-dim),
+    inset 1px 0 0 0 var(--amber);
+}
+/* Hide the per-family chip pile only on escalate (red/amber) rows. Quiet
+   rows never get `.ch-row-pulse-on`, so their chips stay visible — hiding
+   them would read as all-clear. Chips stay in the DOM either way. */
+.ch-row-pulse-on .ch-queue-chips,
+.ch-row-pulse-on .ch-q-mon,
+.ch-row-pulse-on .ch-q-result,
+.ch-row-pulse-on .ch-q-pa,
+.ch-row-pulse-on .ch-q-pending,
+.ch-row-pulse-on .ch-q-repeat,
+.ch-row-pulse-on .ch-q-carry {
+  display: none !important;
+}
+
+.ch-q-pulse {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 8px;
+  vertical-align: middle;
+  margin: 0 6px 4px 0;
+  font-family: var(--sans);
+  max-width: 100%;
+}
+/* Full-width layout restored only where the line needs the row's whole
+   width: an escalate row owns the line (headline/thread/overflow read
+   left to right). Guarded off `.ch-q-pulse-inline` — in flat queues the
+   pulse sits inside the patient-name cell and claiming 100% ate the name.
+   NOTE: `.ch-row-pulse-on .ch-q-pulse` only matches when the marker class
+   is on the preview row too — applyPulseRail already adds it to both; the
+   host lives in the preview row, so this works. Trays no longer need
+   in-row width: they render as floating popovers (positionPulseFloat). */
+.ch-row-pulse-on .ch-q-pulse:not(.ch-q-pulse-inline) {
+  display: flex;
+  flex: 0 0 100%;
+  grid-column: 1 / -1;
+}
+/* No preview row: pulse lives in [col-id=patientName]. Never claim 100% of
+   the cell (that ate the name) and never wrap onto a second line (AG-Grid
+   row height clips anything below the name). Same line, after the name. */
+.ch-q-pulse-inline {
+  flex: 0 1 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  grid-column: auto;
+  width: auto;
+  max-width: 55%;
+  margin: 0;
+  min-width: 1.75rem;
+  min-height: 0;
+}
+.ch-q-pulse-inline .ch-q-pulse-row {
+  flex-wrap: nowrap;
+}
+.ch-q-pulse-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.ch-q-pulse-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.ch-q-pulse-src {
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.75;
+  margin-left: 4px;
+}
+.ch-q-pulse-more {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.ch-q-pulse-thread {
+  font-family: var(--sans);
+  font-size: 10px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  color: var(--text-2);
+  cursor: default;
+}
+/* Interaction states for every pulse control (same pattern as
+   .ch-action-menu-item:hover/:focus-visible above). */
+.ch-q-pulse-head:hover .ch-chip {
+  filter: brightness(0.96);
+}
+.ch-q-pulse-head:focus-visible,
+.ch-q-pulse-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ch-q-pulse-more:hover {
+  background: var(--bg-hover);
+}
+.ch-q-pulse-head[aria-expanded='true'] .ch-chip,
+.ch-q-pulse-more[aria-expanded='true'] {
+  background: var(--accent-dim);
+}
+
+/* Inline in-row tray, not a floating modal — shadow-2 (raised content lift),
+   never shadow-3 (that's reserved for modals/HUD). */
+.ch-q-why {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+  padding: 8px 12px;
+  max-width: 520px;
+}
+/* Expanded why sits on the viewport (same idea as .ch-action-menu), not
+   inside the AG-Grid cell — expanding in-cell grew the row and forced a
+   scroll on tasks/investigations. */
+.ch-q-pulse-float {
+  box-shadow: var(--shadow-3);
+  box-sizing: border-box;
+}
+.ch-q-why h3 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+.ch-q-why-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.ch-q-why-list li {
+  display: grid;
+  grid-template-columns: 10px 1fr;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-1);
+  align-items: start;
+}
+.ch-q-why-mark {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  /* 2px is glyph-internal geometry (a barely-rounded square for unknown
+     kinds), not a component radius from the shape scale. */
+  border-radius: 2px;
+  background: var(--text-4);
+}
+.ch-q-why-mark.red {
+  background: var(--red);
+}
+.ch-q-why-mark.amber {
+  background: transparent;
+  border: 2px solid var(--amber);
+  border-radius: 50%;
+}
+.ch-q-why-mark.info,
+.ch-q-why-mark.green {
+  /* Neutral filled dot, not var(--accent) — a why-tray bullet is not a
+     fourth clinical colour; only red/amber carry meaning here. */
+  background: var(--text-4);
+  border-radius: 50%;
+}
+.ch-q-why-src {
+  display: inline;
+  margin-left: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+.ch-q-why-rec {
+  font-family: var(--sans);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.ch-q-why-foot {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-3);
+  font-style: normal;
+}
+
+/* ---- Keyboard-triage cursor (item 4.6, TRIAGE-LENS-2026-07-02.md) ----
+   Marker CLASS added to Medicus's own `.ag-row` (and its preview/detail row)
+   by content.js's applyQueueKbdCursor — same "class on the host element, not
+   an injected node" pattern as the severity tint above, so it must be in the
+   token-block selector list (CLAUDE.md rule 5). Uses `outline`, deliberately
+   NOT `box-shadow` — the severity tint above already owns box-shadow on the
+   same element, and a row can be both tinted AND cursor-highlighted at once
+   (an amber row the GP is currently scanning with j/k); outline is a
+   separate box entirely so the two never fight for the same property. */
+.ch-kbd-cursor {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---- Seen-session row dimming (item 4.7, TRIAGE-LENS-2026-07-02.md) ----
+   SAFETY-SENSITIVE — see docs/HAZARD-LOG.md. Marker CLASS added by
+   content.js's reapplyQueueSeenDim, ONLY to rows that are NOT currently
+   red/amber tinted (the hard safety gate lives in content.js, not here —
+   this rule is visual only). opacity, not display:none — AG-Grid virtualises
+   rows, so hiding one would desync scroll math; a dimmed row is still fully
+   present and clickable. */
+.ch-row-seen {
+  opacity: 0.55;
+}
+
+/* ---- Detail-page verdict banner (item 2.4, TRIAGE-LENS-2026-07-02.md) ----
+   PREPENDED into the "Task Details" card on a task detail page — echoes the
+   SAME cached queue verdict so a GP doesn't have to re-derive it from the raw
+   report. A genuine injected node (unlike the row tint above), so a real
+   border-left is fine here — there's no AG-Grid row width math to fight. */
+.ch-detail-verdict {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-1);
+}
+.ch-detail-verdict-red {
+  background: var(--red-dim);
+  border-left-color: var(--red);
+}
+.ch-detail-verdict-amber {
+  background: var(--amber-dim);
+  border-left-color: var(--amber);
+}
+/* Grey "couldn't check" variant — same wording family + colour language as
+   the queue's own error chip/popover (.ch-chip-error / .ch-result-popover-error),
+   so a failed check never looks like a graded clinical verdict. */
+.ch-detail-verdict-error {
+  background: var(--bg-mid);
+  border-left-color: var(--border-hi);
+  color: var(--text-4);
+}
+.ch-detail-verdict-headline {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.ch-detail-verdict-line {
+  color: var(--text-2);
+}
+.ch-detail-verdict-more {
+  color: var(--text-4);
+  font-style: italic;
+  font-size: 11px;
+  margin-top: 2px;
+}
+/* Unit-mismatch note (item 3.1, TRIAGE-LENS-2026-07-02.md) — informational only,
+   same grey/italic treatment as -more: never implies a severity change. */
+.ch-detail-verdict-unit-note {
+  color: var(--text-4);
+  font-style: italic;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+/* ---- Result / monitoring chips injected into Medicus queue rows ----
+   These now sit inside the token scope above (selector list), so their
+   .ch-chip-red/amber resolve correctly instead of rendering as unstyled
+   "white rectangles". */
+.ch-q-result,
+.ch-q-mon,
+.ch-q-pending,
+.ch-q-repeat,
+.ch-q-carry {
+  display: inline-flex;
+  gap: 4px;
+  vertical-align: middle;
+}
+/* B3 repeat-contact + B5 carry-over chips. Severity COLOUR comes from the inner
+   .ch-chip-red/amber renderChipHtml emits (resolved via the token block above);
+   these wrappers only position + width-cap the flat-queue fallback, exactly like
+   .ch-q-pending-inline. Same host/prepend/dedupe rules as .ch-q-mon. */
+.ch-q-repeat-inline,
+.ch-q-carry-inline {
+  margin-right: 6px;
+  flex-wrap: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+}
+.ch-q-repeat-inline .ch-chip,
+.ch-q-carry-inline .ch-chip {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18ch;
+}
+/* B2 pending-abnormal-lab cross-link chip. The severity COLOUR comes from the
+   inner .ch-chip-red/amber renderChipHtml emits (resolved via the token block
+   above); this wrapper only positions it. Same host/prepend/dedupe rules as
+   .ch-q-mon. */
+.ch-q-pending-inline {
+  margin-right: 6px;
+  flex-wrap: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+}
+.ch-q-pending-inline .ch-chip {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18ch;
+}
+/* Patient-flag chip (Pt Alerts, H-042) — practice-recorded per-patient flags
+   on queue rows. Same host/prepend/dedupe rules as .ch-q-mon. Colour: red when
+   any red flag, otherwise amber — including info-only flags, deliberately: the
+   queue chip exists to be noticed before contact, and a grey tier would vanish
+   into the row. Full severity detail lives in the panel/banner surfaces. */
+.ch-q-pa {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 600;
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ch-q-pa-red {
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  color: var(--red);
+}
+.ch-q-pa-amber {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  color: var(--amber);
+}
+.ch-q-pa-flag {
+  flex-shrink: 0;
+}
+.ch-q-pa-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Flat-queue fallback (prepended into the patient-name cell): same width cap
+   rationale as .ch-q-mon-inline — truncate text, never drop the chip. */
+.ch-q-pa-inline {
+  margin-right: 6px;
+  max-width: 40%;
+}
+/* Flat-queue fallback: chips PREPENDED into the narrow patient-name cell, BEFORE
+   the name (prepend is mandatory — see content.js; appended nodes get reconciled
+   away by Medicus's Vue renderer). Because they sit before the name they must be
+   hard-bounded or they push the name out of view entirely. Cap the container to a
+   small fixed fraction of the cell and keep it to a SINGLE line (nowrap) so no
+   stack of chips can ever crowd or wrap over the name. The full chip text stays
+   available on hover via each chip's title attribute, and the severity COLOUR is
+   never hidden — only surplus label text is ellipsised. (Clinician-UX fix: a
+   shortened chip must never imply an all-clear, so we truncate text, never drop
+   the chip or its colour.) */
+.ch-q-result-inline,
+.ch-q-mon-inline {
+  margin-right: 6px;
+  flex-wrap: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+}
+.ch-q-result-inline .ch-chip,
+.ch-q-mon-inline .ch-chip {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* A single long label (e.g. a builtin rule "…(red ≥6.5 mmol/L)") can't run the
+     row wide: cap it and ellipsise. Full text remains on hover (title). */
+  max-width: 18ch;
+}
+/* Flat queues (tasks / investigations): chips still PREPEND (Vue strips
+   trailing nodes) but CSS ORDER puts them AFTER the name on the SAME line.
+   A column stack under the name is clipped by AG-Grid's fixed row height. */
+[col-id='patientName']:has(> .ch-q-result-inline),
+[col-id='patientName']:has(> .ch-q-mon-inline),
+[col-id='patientName']:has(> .ch-q-pending-inline),
+[col-id='patientName']:has(> .ch-q-pa-inline),
+[col-id='patientName']:has(> .ch-q-repeat-inline),
+[col-id='patientName']:has(> .ch-q-carry-inline),
+[col-id='patientName']:has(> .ch-queue-chips),
+[col-id='patientName']:has(> .ch-q-pulse) {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  column-gap: 6px;
+  /* Quiet rows keep the full chip pile — without a hard clip the next
+     AG-Grid column paints over them. */
+  overflow: hidden !important;
+  min-width: 0;
+  isolation: isolate;
+}
+[col-id='patientName'] > .ch-queue-chips,
+[col-id='patientName'] > .ch-q-pulse,
+[col-id='patientName'] > .ch-q-result-inline,
+[col-id='patientName'] > .ch-q-mon-inline,
+[col-id='patientName'] > .ch-q-pending-inline,
+[col-id='patientName'] > .ch-q-pa-inline,
+[col-id='patientName'] > .ch-q-repeat-inline,
+[col-id='patientName'] > .ch-q-carry-inline {
+  order: 2;
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  /* Floor, not 0 (same as .ch-q-pulse-inline above): a long patient name
+     must never crush a red/amber chip to nothing — a squeezed chip keeps a
+     visible colour stub instead of vanishing. */
+  min-width: 1.75rem;
+  max-width: 46%;
+  margin: 0;
+  overflow: hidden;
+}
+[col-id='patientName'] > .ch-q-pulse {
+  flex: 0 1 auto;
+  grid-column: auto;
+  width: auto;
+  min-height: 0;
+}
+
+/* ---- Queue triage status bar (item 1.2, TRIAGE-LENS-2026-07-02.md) ---- */
+/* Replaces the old passive legend. Same quiet fixed-position slot, but now    */
+/* interactive: live counts + jump-to-alert + focus toggle. Mirror of the      */
+/* EMBEDDED_CSS copy (content.js) used for the detached PiP window — this is   */
+/* the live-page copy, so it must be styled here too or it renders as         */
+/* unstyled browser-default text/buttons. */
+.ch-q-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-mid);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 4px 6px 4px 8px;
+  font-size: 11px;
+  font-family: var(--sans);
+  line-height: 1.3;
+  max-width: 420px;
+  position: fixed;
+  top: 56px;
+  right: 16px;
+  z-index: 99990;
+  /* Unlike the old legend (pointer-events: none), this bar hosts real
+     buttons — do NOT set pointer-events: none here (CLAUDE.md wiring note:
+     the bar must not intercept grid clicks except its own controls, which
+     "not setting a blanket none" plus normal fixed-position sizing already
+     satisfies — it only covers its own small footprint). */
+}
+.ch-q-status-counts {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ch-q-status-spinner {
+  display: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+/* Subtle "still working" indicator — only shown while checking > 0. */
+.ch-q-status--checking .ch-q-status-spinner {
+  display: inline-block;
+  animation: ch-q-status-pulse 1.1s ease-in-out infinite;
+}
+@keyframes ch-q-status-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.ch-q-status-btn {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.ch-q-status-btn:hover:not(:disabled) {
+  background: var(--accent-line);
+}
+.ch-q-status-btn:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+.ch-q-status-btn-active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Jump-to-alert flash — pulses the row scrolled to (same visual language as
+   ch-oir-flash's review pulse), own class per CLAUDE.md rule 5. */
+.ch-q-status-flash {
+  animation: ch-q-status-flash-pulse 1.3s ease-in-out 2;
+}
+@keyframes ch-q-status-flash-pulse {
+  0%,
+  100% {
+    box-shadow: none;
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--accent-line);
+  }
+}
+
+/* ---- Focus alerts toggle (item 1.2) ---- */
+/* Toggled on document.body (the one element guaranteed to survive every
+   AG-Grid re-render — see applyQueueFocusClass in content.js), scoped to
+   `.ag-row` so it can never affect anything outside the grid. Dims rows that
+   carry NEITHER severity tint class — never display:none (AG-Grid
+   virtualises rows; hiding them would desync scroll math). Preview/detail
+   rows of a red/amber master already carry the same tint class (item 1.3
+   applies it to both), so they are excluded from dimming by the same
+   :not() clauses with no extra selector needed. Pulse rails (v3.236.4)
+   are the request-queue's red/amber mark — a focus-dim that faded a
+   pulse-red row would contradict its own rail, so they are excluded too. */
+.ch-q-focus-alerts .ag-row:not(.ch-row-sev-red):not(.ch-row-sev-amber):not(.ch-row-pulse-red):not(.ch-row-pulse-amber) {
+  opacity: 0.35;
+}
+
+/* ---- Outstanding Investigation Requests — verdict badges ---- */
+/* Injected after each request row's label on the Review Investigation Report
+   detail page (content.js runOutstandingMatch). Read-only annotation: green =
+   this report covers it (auto-tickable), amber = tentative match, slate =
+   genuinely still outstanding. Inline-block, small, never wraps the row. */
+.ch-oir-flag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.ch-oir-flag.ch-oir-resulted {
+  color: var(--green);
+  background: var(--green-dim);
+  border: 1px solid var(--green-line);
+}
+.ch-oir-flag.ch-oir-tentative {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+}
+/* Resulted ELSEWHERE in the record (not by this report): blue/accent, never
+   auto-ticked — clinician confirms via the adjacent "Tick off" button. */
+.ch-oir-flag.ch-oir-elsewhere {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.ch-oir-flag.ch-oir-elsewhere-tentative {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px dashed var(--accent-line);
+}
+.ch-oir-flag.ch-oir-outstanding {
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+}
+
+/* Elsewhere badge is clickable — underline signals the link affordance.
+   cursor is also set inline in content.js (belt-and-braces). */
+.ch-oir-clickable {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* Bulk "Tick off results found in record" action bar — appended to the card, sits
+   under the request list. One gated button (confirmBulkTickOff) ticks every
+   confident found-in-record result at once after the clinician reviews the list. */
+.ch-oir-bulk {
+  display: block;
+  margin: 8px 0 2px;
+  padding-left: 2px;
+}
+.ch-oir-bulk-btn {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  vertical-align: middle;
+  cursor: pointer;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+.ch-oir-bulk-btn:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* Auto-tick toast — informs of a machine-initiated OIR tick (content.js
+   performOirAutoTick). Fixed bottom-right, ~15s auto-fade. The action is
+   labelled "Review" (NOT "Undo") because ticking writes to Medicus
+   immediately and can't be reversed from here — see the "never fake an
+   undo" note on performOirAutoReview. */
+.ch-oir-toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483000;
+  max-width: 340px;
+  padding: 12px 14px;
+  border-radius: var(--r-lg);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-3);
+  font-family: var(--sans);
+  color: var(--text-1);
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity var(--med) var(--ease),
+    transform var(--med) var(--ease);
+}
+.ch-oir-toast.ch-oir-toast-show {
+  opacity: 1;
+  transform: none;
+}
+.ch-oir-toast-msg {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+.ch-oir-toast-note {
+  font-size: 11px;
+  color: var(--text-4);
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+.ch-oir-toast-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.ch-oir-toast-btn {
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.ch-oir-toast-btn:hover {
+  background: var(--accent-line);
+}
+
+/* Review flash — pulses the auto-ticked row(s) when the toast's Review
+   action is used (performOirAutoReview). Not a state change, purely visual. */
+.ch-oir-flash {
+  animation: ch-oir-flash-pulse 1.3s ease-in-out 2;
+}
+@keyframes ch-oir-flash-pulse {
+  0%,
+  100% {
+    box-shadow: none;
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--accent-line);
+  }
+}
+
+/* ---- HUD panel ---- */
+#medicus-clinical-hud {
+  position: fixed;
+  top: 88px;
+  right: 16px;
+  width: 340px;
+  max-height: calc(100vh - 110px);
+  z-index: 99999;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-1);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+#medicus-clinical-hud * {
+  box-sizing: border-box;
+}
+
+#medicus-clinical-hud .ch-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--header-bg);
+  color: #fff;
+  border-bottom: 1px solid var(--header-border);
+}
+#medicus-clinical-hud .ch-title {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+#medicus-clinical-hud .ch-ver {
+  font-weight: 400;
+  opacity: 0.7;
+  font-size: 10px;
+  margin-left: 4px;
+}
+#medicus-clinical-hud .ch-actions {
+  display: flex;
+  gap: 4px;
+}
+#medicus-clinical-hud .ch-btn {
+  background: transparent;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--fast) var(--ease);
+}
+#medicus-clinical-hud .ch-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+#medicus-clinical-hud .ch-btn:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 1px;
+}
+#medicus-clinical-hud .ch-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#medicus-clinical-hud .ch-body {
+  padding: 10px;
+  overflow-y: auto;
+}
+#medicus-clinical-hud.ch-min .ch-body {
+  display: none;
+}
+
+#medicus-clinical-hud .ch-patient {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-mid);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+#medicus-clinical-hud .ch-patient:hover {
+  background: var(--header-bg);
+  color: #fff;
+  border-color: var(--header-bg);
+}
+#medicus-clinical-hud .ch-patient:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#medicus-clinical-hud .ch-request {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-mid);
+  padding: 7px 8px;
+  margin-bottom: 10px;
+}
+#medicus-clinical-hud .ch-request-head {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-4);
+  margin-bottom: 5px;
+  font-family: var(--mono);
+}
+#medicus-clinical-hud .ch-request-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+#medicus-clinical-hud .ch-request-row:last-child {
+  margin-bottom: 0;
+}
+#medicus-clinical-hud .ch-request-snippet {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+  font-style: italic;
+  max-height: 70px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+
+#medicus-clinical-hud .ch-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+#medicus-clinical-hud .ch-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+#medicus-clinical-hud .ch-tile {
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 6px 8px;
+  cursor: pointer;
+  transition:
+    transform var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#medicus-clinical-hud .ch-tile:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-2);
+}
+#medicus-clinical-hud .ch-tile:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Selected tile — accent triad; border reserved at rest to avoid layout shift */
+#medicus-clinical-hud .ch-tile.ch-tile-sel {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-line);
+}
+#medicus-clinical-hud .ch-tile-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  font-family: var(--mono);
+}
+#medicus-clinical-hud .ch-tile-status {
+  font-size: 13px;
+  font-weight: 700;
+}
+#medicus-clinical-hud .ch-tile-count {
+  font-size: 10px;
+  color: var(--text-4);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Status tiles — canon triads (heals HUD-vs-sidebar color mismatch) */
+#medicus-clinical-hud .ch-tile.ch-red {
+  background: var(--red-dim);
+  border-color: var(--red-line);
+}
+#medicus-clinical-hud .ch-tile.ch-red .ch-tile-status {
+  color: var(--red);
+}
+#medicus-clinical-hud .ch-tile.ch-amber {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+#medicus-clinical-hud .ch-tile.ch-amber .ch-tile-status {
+  color: var(--amber);
+}
+#medicus-clinical-hud .ch-tile.ch-green {
+  background: var(--green-dim);
+  border-color: var(--green-line);
+}
+#medicus-clinical-hud .ch-tile.ch-green .ch-tile-status {
+  color: var(--green);
+}
+
+/* ---- "Not assessed" state (item 1.1 leg B, TRIAGE-LENS-2026-07-02.md) ----
+   A tile whose only data source is a card findCardByTitle could not find must
+   never look like ch-green (genuinely clear) — grey, dashed border, distinct
+   from every real severity so a GP never reads "could not read" as "normal". */
+#medicus-clinical-hud .ch-tile.ch-not-assessed {
+  background: var(--bg-mid);
+  border-color: var(--border);
+  border-style: dashed;
+}
+#medicus-clinical-hud .ch-tile.ch-not-assessed .ch-tile-status,
+#medicus-clinical-hud .ch-tile.ch-not-assessed .ch-tile-count {
+  color: var(--text-5);
+}
+
+#medicus-clinical-hud .ch-detail {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-mid);
+  padding: 8px;
+  margin-bottom: 8px;
+  min-height: 60px;
+}
+#medicus-clinical-hud .ch-detail-head {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-2);
+  margin-bottom: 6px;
+  font-family: var(--mono);
+}
+#medicus-clinical-hud .ch-detail-row {
+  border-left: 3px solid var(--border);
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  background: var(--bg-elev);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+/* Detail row severity indicators — canon ink values */
+#medicus-clinical-hud .ch-detail-row.ch-red {
+  border-left-color: var(--red);
+}
+#medicus-clinical-hud .ch-detail-row.ch-amber {
+  border-left-color: var(--amber);
+}
+#medicus-clinical-hud .ch-detail-row.ch-green {
+  border-left-color: var(--green);
+}
+#medicus-clinical-hud .ch-detail-text {
+  font-weight: 500;
+  font-size: 12px;
+}
+#medicus-clinical-hud .ch-detail-sub {
+  font-size: 11px;
+  color: var(--text-4);
+  margin-top: 2px;
+}
+#medicus-clinical-hud .ch-detail-empty {
+  color: var(--text-5);
+  font-style: italic;
+  font-size: 11px;
+}
+
+#medicus-clinical-hud .ch-foot {
+  font-size: 10px;
+  color: var(--text-5);
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  text-align: center;
+}
+
+/* "Could not read: ..." footer (item 1.1 leg B) — grey, quiet, factual list of
+   the cards findCardByTitle missed this pass. Sits below the chips row so a
+   scanning GP sees it without it competing with real chip colour. */
+#medicus-clinical-hud .ch-missing-footer {
+  font-size: 10px;
+  color: var(--text-5);
+  padding: 4px 2px;
+  margin-bottom: 4px;
+  border-bottom: 1px dashed var(--border);
+}
+
+/* ---- Action menu popover (works for HUD chips and queue chips) ---- */
+.ch-action-menu {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-3);
+  min-width: 220px;
+  max-width: 320px;
+  max-height: min(70vh, calc(100vh - 16px));
+  overflow-y: auto;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-1);
+}
+.ch-action-menu * {
+  box-sizing: border-box;
+}
+.ch-action-menu-head {
+  padding: 8px 10px;
+  background: var(--bg-mid);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ch-action-note-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-family: var(--mono);
+}
+.ch-action-back {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-2);
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.ch-action-back:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hi);
+}
+.ch-action-menu-empty {
+  padding: 10px;
+  color: var(--text-5);
+  font-style: italic;
+  font-size: 11px;
+}
+.ch-action-menu-item {
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--bg-hover);
+  transition: background var(--fast) var(--ease);
+}
+.ch-action-menu-item:last-child {
+  border-bottom: none;
+}
+.ch-action-menu-item:hover {
+  background: var(--bg-hover);
+}
+.ch-action-menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.ch-action-icon {
+  font-size: 13px;
+  opacity: 0.8;
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+}
+.ch-action-label {
+  flex: 1;
+}
+
+.ch-action-menu-note {
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  font-size: 12px;
+  max-height: 360px;
+  overflow-y: auto;
+  color: var(--text-1);
+}
+
+/* Actionable chip cursor + chevron */
+.ch-chip-actionable {
+  cursor: pointer;
+}
+.ch-chip-actionable:hover {
+  filter: brightness(0.96);
+}
+.ch-chev {
+  opacity: 0.55;
+  font-size: 9px;
+  margin-left: 2px;
+}
+
+/* ---- Rule-match menu (items 2.1/2.3/2.5, TRIAGE-LENS-2026-07-02.md) ----
+   Detail view's evidence line (matched sentence/window, trigger term
+   <strong>-highlighted) sits above the rule's actions inside the same
+   .ch-action-menu shell; list view (the "+N" overflow chip) lists every
+   matched rule, each row drilling into its own detail view. */
+.ch-rule-menu-evidence {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--bg-hover);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.ch-rule-menu-evidence-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  margin-bottom: 3px;
+}
+.ch-rule-menu-evidence-text {
+  margin: 0;
+  line-height: 1.4;
+}
+.ch-rule-menu-evidence-text strong {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.ch-rule-menu-evidence-empty {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--bg-hover);
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-5);
+}
+/* Item 3.4 — "negation detected: '…'" / "past-reference detected: '…'" line,
+   appended below the highlighted evidence sentence when the match was
+   demoted. Same italic/muted treatment as the "no matching text" empty
+   state above — clearly annotation, not clinical content. */
+.ch-rule-menu-evidence-qualifier {
+  margin: 6px 0 0;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-4);
+}
+.ch-rule-menu-list {
+  max-height: 260px;
+  overflow-y: auto;
+}
+.ch-rule-menu-list-item {
+  padding: 7px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--bg-hover);
+  transition: background var(--fast) var(--ease);
+}
+.ch-rule-menu-list-item:last-child {
+  border-bottom: none;
+}
+.ch-rule-menu-list-item:hover {
+  background: var(--bg-hover);
+}
+.ch-rule-menu-list-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.ch-rule-menu-list-label {
+  flex: 1;
+  font-size: 12px;
+}
+/* Item 3.4 — small qualifier badge in the "+N" list view, sitting between the
+   kind badge and the label. Neutral/outline, not a severity colour — the
+   kind badge already carries severity; this only flags "demoted". */
+.ch-rule-menu-list-qualifier {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  border: 1px dashed var(--border-hi);
+  color: var(--text-4);
+  white-space: nowrap;
+}
+
+/* ---- Pathway menu — Pharmacy First divert + missing-info ask-back (items
+   4.1/4.2, TRIAGE-LENS-2026-07-02.md) ----
+   Rendered INSIDE the existing .ch-action-menu shell (see showPathwayMenu,
+   content.js), which already sits in the hud.css token-block selector list
+   above — these classes resolve their var(--…) tokens via CSS inheritance and
+   deliberately do NOT need their own top-level entry there (CLAUDE.md rule 5
+   only applies to a new TOP-LEVEL injected/marker host; same reasoning as
+   .ch-chip-fileable further up this file). */
+.ch-pathway-disclaimer {
+  padding: 6px 12px;
+  font-size: 10.5px;
+  font-style: italic;
+  color: var(--text-4);
+  border-bottom: 1px solid var(--bg-hover);
+}
+.ch-pathway-section {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--bg-hover);
+}
+.ch-pathway-section:last-child {
+  border-bottom: none;
+}
+.ch-pathway-section-head {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  margin-bottom: 4px;
+}
+.ch-pathway-note {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.4;
+}
+/* The prepare-only draft text shown inline (same content the copy button
+   copies) — monospace-ish, boxed, so it visually reads as "text you could
+   paste" rather than prose commentary. */
+.ch-pathway-draft {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-1);
+  white-space: pre-wrap;
+}
+.ch-pathway-gap-list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.ch-pathway-gap-list li {
+  margin-bottom: 2px;
+}
+/* The PROMINENT "patient may have already mentioned a red flag" banner (item
+   4.2) — amber fill, rendered FIRST in the menu, ahead of every other
+   section, so a safety signal the keyword rule chips might have missed is
+   never buried below the Pharmacy First/ask-back drafts. */
+.ch-pathway-escalation {
+  padding: 8px 12px;
+  background: var(--amber-dim);
+  border-bottom: 1px solid var(--amber-line);
+}
+.ch-pathway-escalation-head {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--amber);
+  margin-bottom: 3px;
+}
+.ch-pathway-escalation-line {
+  font-size: 11.5px;
+  color: var(--text-1);
+  line-height: 1.4;
+  margin-top: 2px;
+}
+
+/* ---- Result-chip detail popover (item 2.2, TRIAGE-LENS-2026-07-02.md) ----
+   Appended to document.body, same anchoring convention as .ch-action-menu above. */
+.ch-result-popover {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-3);
+  min-width: 220px;
+  max-width: 340px;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-1);
+  padding: 8px 10px;
+}
+.ch-result-popover-line {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--bg-hover);
+}
+.ch-result-popover-line:last-child {
+  border-bottom: none;
+}
+.ch-result-popover-line-urgent {
+  color: var(--red);
+  font-weight: 600;
+}
+.ch-result-popover-line-above,
+.ch-result-popover-line-below {
+  color: var(--amber);
+}
+/* Error variant — the grey "?" chip's explanation (fetch/eval failed, retries
+   automatically). Grey like the .ch-chip-error family: informational, never
+   mistaken for a graded clinical line. */
+.ch-result-popover-error {
+  color: var(--text-4);
+}
+/* Unit-mismatch explanation line (item 3.1, TRIAGE-LENS-2026-07-02.md) — same grey
+   "informational, not a graded clinical line" treatment as the error variant: a
+   skipped rule never carries a severity colour. */
+.ch-result-popover-line-unit-mismatch {
+  color: var(--text-4);
+  font-style: italic;
+}
+.ch-result-popover-empty {
+  color: var(--text-5);
+  font-style: italic;
+  font-size: 11px;
+}
+/* ---- Result-rule guidance actions (item 2.7, TRIAGE-LENS-2026-07-02.md) ----
+   Click-to-fire link/snippet/note shortcuts a result rule can carry (same schema as
+   an alert rule's actions), rendered under the detail line for the result whose
+   severity that rule drove. */
+.ch-result-popover-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 0 8px;
+}
+.ch-result-popover-action {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent);
+  cursor: pointer;
+}
+.ch-result-popover-action:hover {
+  background: var(--accent-hover);
+  color: #fff;
+}
+.ch-result-popover-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ch-result-popover-action-notebody {
+  width: 100%;
+  white-space: pre-wrap;
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 4px 0 0;
+}

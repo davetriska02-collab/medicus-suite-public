@@ -1,0 +1,105 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — per-tab "?" help content (single source, consumed by both shells)
+//
+// Plain-English, UK English, two-line summary per module: what the tab is, and
+// what to do first. Reference aid only — these descriptions are orientation
+// help, NOT clinical decision support. Keep copy concise and clinically careful.
+//
+// Every tab id in side-panel/tab-catalog.js's TAB_CATALOG must have an entry
+// here, including the off-strip launchers (duplicate-checker, rota-app, availability) — see
+// CLAUDE.md "Off-strip launchers". test-tab-help-coverage.js enforces this
+// against both panel.html and pop-out.html's data-module set.
+//
+// Consumed as a plain ES module (`import { TAB_HELP } from '../shared/tab-help.js'`)
+// by side-panel/panel.js and pop-out/pop-out.js — same pattern as
+// shared/medicus-api.js / shared/task-api.js (see eslint.config.mjs's ESM
+// file allowlist), so no dual-mode IIFE wrapper is needed here.
+
+'use strict';
+
+export const TAB_HELP = {
+  slots: {
+    title: 'Slots',
+    what: 'Counts of free appointment slots by type for any chosen date.',
+    firstStep: 'Pick a date to see how many slots of each type are still free.',
+  },
+  capacity: {
+    title: 'Forecast',
+    what: 'Free appointment slots against your practice minimums, with a look-ahead for days at risk — including post–bank-holiday uplift estimates.',
+    firstStep: 'Check the look-ahead banner, then print a pack or open Settings to tune the horizon and uplifts.',
+  },
+  record: {
+    title: 'Record',
+    what: 'A live snapshot of the patient open in Medicus: problems, current medicines and recent results. It does not include allergies, immunisations or the full consultation history.',
+    firstStep: 'Open a patient in Medicus, then read the summary here.',
+  },
+  activity: {
+    title: 'Activity',
+    what: 'Workload per staff member over a date range, broken down by task type.',
+    firstStep: 'Choose a date range to see each person’s totals.',
+  },
+  referrals: {
+    title: 'Referrals',
+    what: 'A summary of referrals over a date range by priority, status, clinician and specialty.',
+    firstStep: 'Set a date range to see referral counts and breakdowns.',
+  },
+  trends: {
+    title: 'Trends',
+    what: 'Charts of the open patient’s recorded blood pressure, kidney results, HbA1c, cholesterol and weight.',
+    firstStep: 'Open a patient in Medicus, then pick a measure to see the trend.',
+  },
+  reception: {
+    title: 'Reception',
+    what: 'Front-desk tools: guided call capture, patient status, and gated appointment booking.',
+    firstStep: 'Open a patient, or search a request type for the call script.',
+  },
+  signing: {
+    title: 'Signing',
+    what: 'The open repeat-prescription requests Medicus already holds. This list does not score them.',
+    firstStep: 'Open the record in Medicus before you authorise a request.',
+  },
+  knowledge: {
+    title: 'Knowledge',
+    what: 'A searchable store of the practice’s own notes, contacts and how-to information.',
+    firstStep: 'Type a keyword to find the relevant practice note.',
+  },
+  submissions: {
+    title: 'Submissions',
+    what: 'Daily inbound task counts across medical, admin, investigation and prescription categories.',
+    firstStep: 'Check today’s counts, or set a date range to compare days.',
+  },
+  leaflets: {
+    title: 'Leaflets',
+    what: 'Find the right NHS patient information leaflet for a condition or medicine, ready to open or copy a link to share.',
+    firstStep: 'Type a condition or medicine name — every search also offers a direct nhs.uk search as a fallback.',
+  },
+  'patient-alerts': {
+    title: 'Patient Alerts',
+    what: 'Your practice’s own per-patient flags — interpreter required, safeguarding concern, medication-seeking behaviour, or anything you define. Flags appear here and on the alert strip whenever that patient is open in Medicus. Stored in this browser profile; share practice-wide via Options → Backup.',
+    firstStep:
+      'Open a patient in Medicus, then add an alert — pick a preset or write your own. Keep wording professional and factual: flags are visible to every practice user and disclosable to the patient.',
+  },
+  rota: {
+    title: 'Rota',
+    what: 'Today’s duty cover, who is on leave, sessions still needing cover and this week’s high-priority staffing warnings.',
+    firstStep: 'Glance at duty cover for AM and PM, then open the Rota manager (new tab) to fix any gap.',
+  },
+  'rota-app': {
+    title: 'Rota manager',
+    what: 'Opens the full rota application in a new browser tab: working patterns, leave (April–March, session-accounted), registrar supervision, duty fairness pro-rata to contracted sessions and a cover worklist.',
+    firstStep:
+      'Add your staff and their contracted sessions first — everything else (leave, duty fairness, safe-staffing warnings) is calculated from them.',
+  },
+  availability: {
+    title: 'Availability wall',
+    what: 'Opens a full-screen view of free appointment slots for the triage room: today’s lists and a 7-day routine GP count. It shows times and counts only.',
+    firstStep:
+      'Open it on the room screen. Press and hold Set up tiles, then drag each slot type, session and diary onto one tile and save. Pin the tab, press F11, and set Chrome to continue where you left off. Copy TV link on the wall if the address is needed after a restart.',
+  },
+  'duplicate-checker': {
+    title: 'Duplicates',
+    what: 'Practice-wide scan for GP2GP duplicate-record reimport errors — flags candidate duplicate entries per patient by confidence tier for bulk-removal or merge.',
+    firstStep:
+      'Run a full or incremental practice scan, then click on a flagged patient in the results list to analyse their record.',
+  },
+};

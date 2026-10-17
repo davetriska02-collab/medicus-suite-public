@@ -1,0 +1,208 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — Suite-level IO helpers
+// Owns the cross-cutting `suite.*` preference keys that don't belong to any one
+// module: display preferences (theme / text size / colourblind mode), the
+// practice code, and the feedback email. Captured by suite-wide backup so these
+// survive an export/restore. (Before this file existed, doFullExport/applyEnvelope
+// read & wrote these keys raw — the convention violation CLAUDE.md warns against,
+// and suite.display was dropped from backups entirely.)
+
+'use strict';
+
+const SUITE_KEYS = [
+  'suite.display',
+  'suite.practiceCode',
+  'suite.feedbackEmail',
+  'suite.tabOrder',
+  'suite.hiddenTabs',
+  'suite.practiceAcceptedAt',
+  'suite.rollup.alwaysExpanded',
+  'suite.waitingRoom.thresholds',
+  'suite.letterhead',
+  'suite.practiceProfile.attestations',
+  'suite.signing.softFlags',
+  'suite.ui.allocateCanvases',
+  'suite.ui.contactsCanvas',
+  'suite.ui.routineRxButton',
+  'suite.ui.quickActionsWidget',
+  'suite.ui.focusAlerts',
+  // Template organiser canvas. Default on — missing key stays on at runtime.
+  'suite.ui.templateOrganiser',
+  // Task Presence. Default on — missing key stays on at runtime.
+  'suite.ui.taskPresence',
+  // Workload tracker. Default on — missing key stays on at runtime.
+  'suite.ui.workloadTracker',
+  // Availability wall. Default on — missing key stays on at runtime.
+  'suite.ui.availabilityWall',
+];
+
+// Tab/module ids are short lowercase slugs (e.g. "slots", "sentinel").
+const TAB_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/i;
+const SUITE_ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+// keep in sync with SITE_CODE_RE in shared/practice-code.js
+const PRACTICE_CODE_RE = /^[a-f0-9]{4,8}$/i;
+
+async function suiteExport() {
+  const r = await chrome.storage.local.get(SUITE_KEYS);
+  return {
+    display: r['suite.display'] ?? null,
+    practiceCode: r['suite.practiceCode'] ?? null,
+    feedbackEmail: r['suite.feedbackEmail'] ?? null,
+    tabOrder: r['suite.tabOrder'] ?? null,
+    hiddenTabs: r['suite.hiddenTabs'] ?? null,
+    // Practice-level clinical acceptance (single "Accept for practice" switch).
+    // Unlike the per-install module attestations (reception disclaimer, knowledge
+    // notice) this one DOES travel in a backup, so the practice's acceptance
+    // propagates on restore. Honoured by the reception + knowledge gates.
+    practiceAcceptedAt: r['suite.practiceAcceptedAt'] ?? null,
+    // UI pref: keep the alert roll-up pinned open. Boolean; absent == default (false).
+    rollupAlwaysExpanded: r['suite.rollup.alwaysExpanded'] ?? null,
+    // Waiting-room alert thresholds in minutes ({ amber, red }); absent == defaults.
+    waitingRoomThresholds: r['suite.waitingRoom.thresholds'] ?? null,
+    // Practice letterhead ({ practiceName, clinicianName }) auto-filling the
+    // sign-off in Sentinel/Sweep recall letters and SMS; absent == placeholders.
+    letterhead: r['suite.letterhead'] ?? null,
+    // Central-attestation provenance ({ <gateName>: { by, at, via } }) recording
+    // which per-install clinical gates were satisfied via a signed practice
+    // profile rather than a local click. Written by practice-profile.js. Must
+    // travel in a backup so a restore doesn't lose the "accepted centrally by
+    // <admin>" provenance shown by options.js and knowledge.js.
+    attestations: r['suite.practiceProfile.attestations'] ?? null,
+    // Signing Queue soft-flag pack (QOF-review badges + Flagged filter).
+    // Default OFF — absent/null exports as null; only explicit true enables.
+    signingSoftFlags: r['suite.signing.softFlags'] ?? null,
+    // Practice feature packs (same keys as Options → Practice features).
+    // Absent/null exports as null. Runtime grandfather for the four chrome
+    // packs is NOT an export default — only an explicit boolean travels.
+    allocateCanvases: r['suite.ui.allocateCanvases'] ?? null,
+    contactsCanvas: r['suite.ui.contactsCanvas'] ?? null,
+    routineRxButton: r['suite.ui.routineRxButton'] ?? null,
+    quickActionsWidget: r['suite.ui.quickActionsWidget'] ?? null,
+    focusAlerts: r['suite.ui.focusAlerts'] ?? null,
+    templateOrganiser: r['suite.ui.templateOrganiser'] ?? null,
+    taskPresence: r['suite.ui.taskPresence'] ?? null,
+    workloadTracker: r['suite.ui.workloadTracker'] ?? null,
+    availabilityWall: r['suite.ui.availabilityWall'] ?? null,
+  };
+}
+
+async function suiteImport(data) {
+  if (!data || typeof data !== 'object') throw new Error('Suite data must be an object.');
+  const toSet = {};
+  if (data.display != null) {
+    if (typeof data.display !== 'object' || Array.isArray(data.display)) {
+      throw new Error('suite.display must be an object.');
+    }
+    toSet['suite.display'] = data.display;
+  }
+  if (data.practiceCode != null) {
+    if (typeof data.practiceCode !== 'string') throw new Error('suite.practiceCode must be a string.');
+    const code = data.practiceCode.trim();
+    if (!PRACTICE_CODE_RE.test(code)) {
+      throw new Error('suite.practiceCode must be 4–8 hex characters.');
+    }
+    toSet['suite.practiceCode'] = code;
+  }
+  if (data.feedbackEmail != null) {
+    if (typeof data.feedbackEmail !== 'string') throw new Error('suite.feedbackEmail must be a string.');
+    toSet['suite.feedbackEmail'] = data.feedbackEmail;
+  }
+  if (data.tabOrder != null) {
+    if (!Array.isArray(data.tabOrder)) throw new Error('suite.tabOrder must be an array.');
+    if (!data.tabOrder.every((id) => typeof id === 'string' && TAB_ID_RE.test(id))) {
+      throw new Error('suite.tabOrder must be an array of tab-id strings.');
+    }
+    toSet['suite.tabOrder'] = data.tabOrder;
+  }
+  if (data.hiddenTabs != null) {
+    if (!Array.isArray(data.hiddenTabs)) throw new Error('suite.hiddenTabs must be an array.');
+    if (!data.hiddenTabs.every((id) => typeof id === 'string' && TAB_ID_RE.test(id))) {
+      throw new Error('suite.hiddenTabs must be an array of tab-id strings.');
+    }
+    toSet['suite.hiddenTabs'] = data.hiddenTabs;
+  }
+  if (data.practiceAcceptedAt != null) {
+    if (typeof data.practiceAcceptedAt !== 'string' || !SUITE_ISO_DATETIME_RE.test(data.practiceAcceptedAt)) {
+      throw new Error('suite.practiceAcceptedAt must be null or an ISO datetime string.');
+    }
+    toSet['suite.practiceAcceptedAt'] = data.practiceAcceptedAt;
+  }
+  if (data.rollupAlwaysExpanded != null) {
+    if (typeof data.rollupAlwaysExpanded !== 'boolean') {
+      throw new Error('suite.rollup.alwaysExpanded must be a boolean.');
+    }
+    toSet['suite.rollup.alwaysExpanded'] = data.rollupAlwaysExpanded;
+  }
+  if (data.waitingRoomThresholds != null) {
+    const w = data.waitingRoomThresholds;
+    if (typeof w !== 'object' || Array.isArray(w) || !Number.isFinite(w.amber) || !Number.isFinite(w.red)) {
+      throw new Error('suite.waitingRoom.thresholds must be an object with numeric amber and red.');
+    }
+    toSet['suite.waitingRoom.thresholds'] = { amber: w.amber, red: w.red };
+  }
+  if (data.letterhead != null) {
+    const lh = data.letterhead;
+    if (typeof lh !== 'object' || Array.isArray(lh)) {
+      throw new Error('suite.letterhead must be an object.');
+    }
+    if (lh.practiceName != null && typeof lh.practiceName !== 'string') {
+      throw new Error('suite.letterhead.practiceName must be a string.');
+    }
+    if (lh.clinicianName != null && typeof lh.clinicianName !== 'string') {
+      throw new Error('suite.letterhead.clinicianName must be a string.');
+    }
+    toSet['suite.letterhead'] = {
+      practiceName: typeof lh.practiceName === 'string' ? lh.practiceName : '',
+      clinicianName: typeof lh.clinicianName === 'string' ? lh.clinicianName : '',
+    };
+  }
+  if (data.attestations != null) {
+    const at = data.attestations;
+    if (typeof at !== 'object' || Array.isArray(at)) {
+      throw new Error('suite.practiceProfile.attestations must be an object.');
+    }
+    const cleanAtt = {};
+    for (const [gate, prov] of Object.entries(at)) {
+      if (!prov || typeof prov !== 'object' || Array.isArray(prov)) {
+        throw new Error('suite.practiceProfile.attestations entries must be objects.');
+      }
+      cleanAtt[gate] = {
+        by: typeof prov.by === 'string' ? prov.by : '',
+        at: typeof prov.at === 'string' ? prov.at : '',
+        via: typeof prov.via === 'string' ? prov.via : '',
+      };
+    }
+    toSet['suite.practiceProfile.attestations'] = cleanAtt;
+  }
+  if (data.signingSoftFlags != null) {
+    if (typeof data.signingSoftFlags !== 'boolean') {
+      throw new Error('suite.signing.softFlags must be a boolean.');
+    }
+    toSet['suite.signing.softFlags'] = data.signingSoftFlags;
+  }
+  const packAliases = [
+    ['allocateCanvases', 'suite.ui.allocateCanvases'],
+    ['contactsCanvas', 'suite.ui.contactsCanvas'],
+    ['routineRxButton', 'suite.ui.routineRxButton'],
+    ['quickActionsWidget', 'suite.ui.quickActionsWidget'],
+    ['focusAlerts', 'suite.ui.focusAlerts'],
+    ['templateOrganiser', 'suite.ui.templateOrganiser'],
+    ['taskPresence', 'suite.ui.taskPresence'],
+    ['workloadTracker', 'suite.ui.workloadTracker'],
+    ['availabilityWall', 'suite.ui.availabilityWall'],
+  ];
+  for (const [alias, storageKey] of packAliases) {
+    if (data[alias] == null) continue;
+    if (typeof data[alias] !== 'boolean') {
+      throw new Error(`${storageKey} must be a boolean.`);
+    }
+    toSet[storageKey] = data[alias];
+  }
+  if (Object.keys(toSet).length > 0) {
+    await chrome.storage.local.set(toSet);
+  }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { suiteExport, suiteImport };
+}

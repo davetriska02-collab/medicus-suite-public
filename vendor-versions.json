@@ -1,0 +1,15 @@
+{
+  "generated": "2026-08-31",
+  "note": "Vendored library provenance record. SHA-256 checksums computed over the files as shipped. Update this file whenever a vendor library is upgraded. PDF.js, Chart.js and D3.js were removed with the Visualiser in v3.255.0.",
+  "libraries": [
+    {
+      "filename": "vendor/fonts/jetbrains-mono-latin-var.woff2",
+      "library": "JetBrains Mono (font)",
+      "version": "v24 (Google Fonts build), latin subset, variable wght 100-800",
+      "version_source": "fonts.googleapis.com css2 API for JetBrains Mono v24, latin unicode-range block. Vendored 2026-07-18 (audit M16) to remove the runtime Google Fonts @import from the privileged side panel — IG/data-minimisation + offline typography. A font asset, not executable code: no script surface.",
+      "upstream_url": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbv2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKwBNntkaToggR7BYRbKPxDcwg.woff2",
+      "license": "OFL-1.1",
+      "sha256": "83c005d49d8a6a50474c73a5a36ac0468076e9c4a29da7bdb14995d80560a5be"
+    }
+  ]
+}

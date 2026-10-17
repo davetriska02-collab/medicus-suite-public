@@ -1,0 +1,1273 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — Practice Profile (v2)
+//
+// Reads practice-profile.json from the extension folder (when the practice admin
+// has created one), compares its profileVersion against the last-applied version
+// in chrome.storage.local, and merges or replaces settings accordingly.
+//
+// Designed to run in both the service worker (importScripts) and the options page
+// (<script>). Exposes itself as self.PracticeProfile in both contexts, and as
+// module.exports in Node tests.
+//
+// v2 apply config schema (BACKWARDS COMPATIBLE with v1):
+//   apply.modules  — object: { <moduleName>: 'merge' | 'replace' }
+//                    OR array (v1 shape — inferred from apply.mode)
+//                    OR absent (v1 default set: sentinel, triage, submissions, slots, capacity)
+//   apply.mode             — v1 legacy scalar ('mergeMissing' | 'forceOverride' | 'firstRunOnly')
+//   apply.autoApplyOnStartup    — boolean, default true
+//   apply.checkEveryMinutes     — number, clamp 5..1440, default 15
+//   apply.autoReloadOnNewVersion — boolean, default true
+//   apply.notifyUserOnApply     — boolean, default false
+//
+// "merge" must NEVER overwrite anything the local user has already set.
+// "replace" enforces the profile's data for that module (like a backup restore).
+//
+// Per-module try/catch: a malformed section records an error and other modules
+// continue. Returns { modulesApplied, errors } from applyProfile.
+//
+// Delegate to per-module *Import() functions wherever possible so their validation
+// and whitelist-sanitisation runs. In merge mode, pre-filter the payload to the
+// safe-to-write subset before calling *Import().
+//
+// IO functions (capacityImport etc.) must already be in scope:
+//   — service worker: loaded via importScripts before this file
+//   — options page: loaded via <script> tags before this file
+//   — node tests: required explicitly and injected into global before loading this
+
+'use strict';
+
+// Defence-in-depth: strip keys that could trigger prototype-pollution when
+// merging IMPORTED/untrusted profile data via Object.assign. Mirrors
+// engine/ruleset-io.js safeCopy — applied to the untrusted operand only.
+const _PP_DANGEROUS_KEYS = ['__proto__', 'constructor', 'prototype'];
+function _stripDangerousKeys(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = {};
+  Object.keys(obj).forEach((k) => {
+    if (!_PP_DANGEROUS_KEYS.includes(k)) out[k] = obj[k];
+  });
+  return out;
+}
+
+// OIR test-dictionary content comparison. Deliberately a PRIVATE copy of
+// shared/io/oir-key-rotation.js's testContentEqual: this file is importScripts'd
+// into the service worker, which does not (and must not have to) load the
+// publish-side rotation module. test-practice-profile.js pins the two
+// implementations in step so they can't silently diverge.
+function _ppStableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(_ppStableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${_ppStableStringify(value[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+function _oirTestContentEqual(a, b) {
+  const { key: _ak, ...aRest } = a || {};
+  const { key: _bk, ...bRest } = b || {};
+  return _ppStableStringify(aRest) === _ppStableStringify(bRest);
+}
+
+// profileVersion is 'YYYY-MM-DD.N' (see nextProfileVersion in options.js).
+// Returns null for anything else — an unorderable version must never be
+// treated as older, or a legacy/hand-written profile would stop applying.
+function _parseProfileVersion(v) {
+  const m = /^(\d{4}-\d{2}-\d{2})\.(\d+)$/.exec(String(v || ''));
+  if (!m) return null;
+  return { date: m[1], seq: parseInt(m[2], 10) };
+}
+function _isOlderProfileVersion(incoming, lastApplied) {
+  const a = _parseProfileVersion(incoming);
+  const b = _parseProfileVersion(lastApplied);
+  if (!a || !b) return false; // not comparable — behave exactly as before
+  if (a.date !== b.date) return a.date < b.date;
+  return a.seq < b.seq;
+}
+
+const PracticeProfile = (() => {
+  const META_KEY = 'suite.practiceProfile';
+  const NOTIFIED_KEY = 'suite.practiceProfile.notifiedVersions';
+
+  // Default v1 module set, applied when apply.modules is absent.
+  const V1_DEFAULT_MODULES = ['sentinel', 'triage', 'submissions', 'slots', 'capacity'];
+
+  // Modules that apply in merge mode whenever the envelope carries them, even
+  // if a v2 apply.modules object omits them entirely (an admin never ticked
+  // the picker, or an older profile predates the module). Deliberately a
+  // SHORT list, not a general escape hatch: Cleanup Code Preferences is the
+  // one module whose merge is provably non-destructive regardless of a
+  // profile's own config — tallies only ever combine via max() and a local
+  // override always wins (see applyProfile's pdc branch below) — so a
+  // forgotten checkbox can never again silently stop new machines from
+  // receiving the practice's accumulated learning. This is a deliberate,
+  // narrow exception to "the profile declares what it applies": every other
+  // module stays strictly opt-in because replace-mode or admin-curated data
+  // could otherwise be pushed onto a machine nobody asked to receive it.
+  const ALWAYS_MERGE_MODULES = ['problemDescriptionCleanup'];
+
+  // ── IO function resolution ────────────────────────────────────────────────────
+  // In a service worker these are on `self`; in the options page also on `self`
+  // (which equals `window`); in Node tests they are globals injected by the test.
+
+  function _io(name) {
+    // Prefer explicit globals (node tests), then self.<name> (browser/SW).
+    // Check for both function and object (e.g. KnowledgeUtils is an object, not a function).
+    const fromGlobal = typeof global !== 'undefined' ? global[name] : undefined;
+    if (fromGlobal != null) return fromGlobal;
+    const fromSelf = typeof self !== 'undefined' ? self[name] : undefined;
+    if (fromSelf != null) return fromSelf;
+    return null;
+  }
+
+  // ── Fetch ─────────────────────────────────────────────────────────────────────
+
+  async function fetchProfile() {
+    try {
+      const url = chrome.runtime.getURL('practice-profile.json');
+      // cache: 'no-store' ensures a changed file on the shared network drive is
+      // always re-read rather than served from the browser HTTP cache.
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) return null; // 404 means no profile file — silent no-op
+      const profile = await resp.json();
+      if (profile.format !== 'medicus-suite-practice-profile') return null;
+      if (!profile.profileVersion || !profile.envelope) return null;
+      return profile;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ── Status ────────────────────────────────────────────────────────────────────
+
+  async function getStatus() {
+    const r = await chrome.storage.local.get(META_KEY);
+    return r[META_KEY] || null;
+  }
+
+  // ── Module map resolution ─────────────────────────────────────────────────────
+  // Returns a Map<moduleName, 'merge'|'replace'> for the effective v2 config,
+  // normalised from either the v2 object, v1 array, or absent (v1 default).
+
+  function _resolveModuleMap(applyCfg) {
+    const mods = applyCfg.modules;
+    const mode = applyCfg.mode || 'mergeMissing';
+    let map;
+
+    // v2: modules is a plain object { <name>: 'merge'|'replace' }
+    if (mods && !Array.isArray(mods) && typeof mods === 'object') {
+      map = new Map();
+      for (const [k, v] of Object.entries(mods)) {
+        // Guard: only accept the known per-module strings
+        if (v === 'merge' || v === 'replace') map.set(k, v);
+      }
+    } else {
+      // v1: modules is an array (explicit module list) or absent (default list)
+      const list = Array.isArray(mods) ? mods : V1_DEFAULT_MODULES;
+      const derived = mode === 'forceOverride' ? 'replace' : 'merge';
+      map = new Map();
+      for (const name of list) map.set(name, derived);
+    }
+
+    // ALWAYS_MERGE_MODULES: fill in only if the config left them unmentioned —
+    // an explicit entry (either mode) always wins, so a profile can still
+    // apply pdc in 'replace' mode deliberately if ever needed.
+    for (const name of ALWAYS_MERGE_MODULES) {
+      if (!map.has(name)) map.set(name, 'merge');
+    }
+    return map;
+  }
+
+  // ── Apply ─────────────────────────────────────────────────────────────────────
+
+  async function applyProfile(profile, { force = false } = {}) {
+    if (!profile || !profile.envelope || !profile.profileVersion) {
+      throw new Error('Invalid practice profile: missing envelope or profileVersion.');
+    }
+
+    const cfg = profile.apply || {};
+    const mode = cfg.mode || 'mergeMissing';
+    const modMap = _resolveModuleMap(cfg);
+
+    // ── Central practice attestation (SAFETY-CRITICAL) ──────────────────────────
+    // A published profile MAY carry a `practiceAttestation` block recording that
+    // the practice admin has themselves accepted one or more per-install clinical
+    // gates (reception disclaimer, alert-library ack, knowledge notice). When a
+    // gate is explicitly set true here, this install treats it as satisfied so
+    // managed users don't each have to re-accept locally.
+    //
+    // FAIL-SAFE: with NO `practiceAttestation` (or a gate not === true) behaviour
+    // is EXACTLY as before — the per-install attestation is stripped/omitted and
+    // never written. The bypass only ever happens with an explicit signed gate.
+    // A genuine local acceptance always wins and is never overwritten/downgraded.
+    const att = profile.practiceAttestation || null;
+    const gate = (name) => !!(att && att.gates && att.gates[name] === true);
+    // Provenance markers to merge into suite.practiceProfile.attestations for any
+    // gate actually satisfied during this apply. Written once at the end.
+    const attestationProvenance = {};
+    function _markAttestation(name) {
+      if (!att) return;
+      attestationProvenance[name] = {
+        by: att.attestedBy || '',
+        at: att.attestedAt || '',
+        via: 'practice-profile',
+      };
+    }
+
+    if (!force) {
+      const status = await getStatus();
+      if (mode === 'firstRunOnly' && status?.lastAppliedVersion) {
+        return { skipped: true, reason: 'firstRunOnly — already applied on this install' };
+      }
+      if (mode !== 'forceOverride' && status?.lastAppliedVersion === profile.profileVersion) {
+        return { skipped: true, reason: 'already on this version' };
+      }
+      // ORDERING, not just equality (2026-08-01). The old gate skipped only an
+      // EQUAL version, so any DIFFERENT version applied — including an OLDER
+      // one, which is exactly what a restored/rolled-back copy of the shared
+      // file looks like. That was tolerable when apply only ever added things;
+      // it is not now that retirement can remove a test dictionary entry. An
+      // explicit re-apply (the Apply-now button's { force: true }, or a
+      // forceOverride profile) still bypasses this, unchanged.
+      if (mode !== 'forceOverride' && _isOlderProfileVersion(profile.profileVersion, status?.lastAppliedVersion)) {
+        const reason = `older than the applied version (${profile.profileVersion} < ${status.lastAppliedVersion}) — not re-applying a rolled-back shared file`;
+        console.warn('[Practice Profile] Skipping:', reason);
+        return { skipped: true, reason };
+      }
+    }
+
+    const mods = profile.envelope.modules || {};
+    const applied = [];
+    const errors = [];
+
+    // Monitoring, lab filing and the lab catalogue were withdrawn in v4.0.0.
+    // An older practice profile may still name those modules. They are not
+    // applied and they are not an error — the rest of the profile still lands.
+
+    // ── Triage Lens ────────────────────────────────────────────────────────────
+    // FIELD-LEVEL MERGE for oirTests (2026-07-29 — fixed a real bug, confirmed
+    // live: a practice published custom Outstanding Investigation Requests
+    // test-dictionary entries via the shared profile, confirmed the publish
+    // itself worked, but NONE of them ever reached ANY install, fresh or not).
+    // Root cause: the OLD merge logic below only ever applied the whole
+    // triagelens.config blob when the local copy was COMPLETELY EMPTY — but
+    // it never actually is, on any machine: service-worker.js's
+    // initialiseTriage() seeds triagelens.config from the bundled
+    // defaults.json on EVERY chrome.runtime.onInstalled, and that local write
+    // always wins the race against this profile check's own network fetch of
+    // practice-profile.json. So the whole-config "only if empty" gate could
+    // never actually fire for practice-authored profile content, on any
+    // install. oirTests is now merged by its own `key`, appending only
+    // entries not already present locally — same by-id merge discipline as
+    // sentinel.customRules/knowledge.items/triageAlerts.rules elsewhere in
+    // this file. rules/thresholds/systemChips/resultRules are deliberately
+    // NOT merged here — those are the suite's own shipped clinical logic
+    // (updated via defaults.json releases, not practice-authored), so pushing
+    // them wholesale even once local config exists would risk silently
+    // clobbering a clinician's own local rule tweaks; left exactly as before
+    // (local values always win, untouched) until there's a real reported need
+    // to push those fields too, same "don't fix what isn't broken yet"
+    // discipline as everywhere else in this file.
+    if (modMap.has('triage') && mods.triage && typeof mods.triage.config === 'object') {
+      try {
+        const merge = modMap.get('triage') === 'merge';
+        const config = mods.triage.config;
+        if (Object.keys(config).length > 0) {
+          if (merge) {
+            const ex = await chrome.storage.local.get('triagelens.config');
+            const local =
+              ex['triagelens.config'] && typeof ex['triagelens.config'] === 'object' ? ex['triagelens.config'] : {};
+            if (Object.keys(local).length === 0) {
+              // Genuinely no local config at all yet — apply the whole
+              // thing, same as before this fix.
+              await chrome.storage.local.set({ 'triagelens.config': config });
+              applied.push('triage');
+            } else {
+              const localTests = Array.isArray(local.oirTests) ? local.oirTests : [];
+              // Engine choice for the Outstanding Requests matcher is practice-published (Phase D, decision 5): the
+              // profile carries it and it is applied whenever the profile is applied — a practice chooses the engine
+              // once, not per PC. Whitelisted values only; anything else (or an absent key from an older publisher)
+              // leaves the local choice alone. Every failure mode of the catalogue engine falls back to the legacy one.
+              const publishedEngine =
+                config.prefs && typeof config.prefs === 'object' ? config.prefs.oirEngine : undefined;
+              const applyEngine = publishedEngine === 'legacy' || publishedEngine === 'catalogue';
+              const engineChanged = applyEngine && !(local.prefs && local.prefs.oirEngine === publishedEngine);
+              // Same practice-published discipline for the Lab Filing engine choice (Phase E, stage E2): one choice
+              // for the whole practice, not per PC, whitelisted values only, absent/unrecognised leaves the local
+              // choice alone. UNION-ONLY when catalogue: it can only add filing blockers, never remove one.
+              const publishedFilingEngine =
+                config.prefs && typeof config.prefs === 'object' ? config.prefs.filingEngine : undefined;
+              const applyFilingEngine = publishedFilingEngine === 'legacy' || publishedFilingEngine === 'catalogue';
+              const filingEngineChanged =
+                applyFilingEngine && !(local.prefs && local.prefs.filingEngine === publishedFilingEngine);
+              // ── Retirement: CONTENT-AWARE, never a blind key filter ───────
+              // An edited test is never merged in-place over an existing key
+              // (that would risk silently clobbering a clinician's own local
+              // edit made under that same key via the options-page test
+              // editor). Instead a republished edit arrives under a NEW key
+              // (shared/io/oir-key-rotation.js) and the SUPERSEDED PUBLISHED
+              // content travels with it in `retiredOirTests: [{key, test}]`.
+              // A local test under a retired key is dropped ONLY if its
+              // content still equals that superseded copy — i.e. it is
+              // provably a stale copy of what was published, not somebody's
+              // own edit. Anything else survives; the rotated replacement
+              // still appends below, so both stay visible for a human to
+              // reconcile. (A blind key filter deleted the edit outright, and
+              // could destroy the publisher's own newest edit via its
+              // self-apply.)
+              //
+              // `retiredOirKeys` (the bare key list) is still READ for
+              // backwards compatibility, but on its own it carries no
+              // superseded content, so nothing can be proven stale and
+              // nothing is removed — fail toward preserving local clinical
+              // intent. It is still PUBLISHED (see oir-key-rotation.js) so
+              // installs running the older apply side keep working.
+              const retiredByKey = new Map();
+              (Array.isArray(config.retiredOirTests) ? config.retiredOirTests : []).forEach((rec) => {
+                if (!rec || typeof rec !== 'object' || !rec.key) return;
+                const list = retiredByKey.get(rec.key) || [];
+                list.push(rec.test);
+                retiredByKey.set(rec.key, list);
+              });
+              const survivingTests =
+                retiredByKey.size > 0
+                  ? localTests.filter((t) => {
+                      if (!t || !t.key) return true;
+                      const supersededCopies = retiredByKey.get(t.key);
+                      if (!supersededCopies) return true;
+                      return !supersededCopies.some((copy) => _oirTestContentEqual(copy, t));
+                    })
+                  : localTests;
+              const retiredSomething = survivingTests.length !== localTests.length;
+
+              // ── Built-in-key overrides: update IN PLACE, never rotated ────
+              // An entry keyed by a built-in test key (engine/outstanding-match.js
+              // TEST_DEFS) is a disable/extend OVERRIDE — mergeTestDefs applies
+              // it by key, so the key IS the semantics and rotating it would
+              // silently re-enable the built-in everywhere. Such an entry can
+              // only propagate as an in-place update, and only when the local
+              // copy is provably the PREVIOUSLY PUBLISHED one (shipped as
+              // `supersededOirTests: [{key, test}]`). A local copy that differs
+              // from the previously published one was edited on this machine:
+              // keep it and skip, failing toward local clinical intent. This
+              // side does not need the built-in key list itself — only the
+              // publisher emits these records, and the content check is what
+              // makes them safe.
+              const supersededByKey = new Map();
+              (Array.isArray(config.supersededOirTests) ? config.supersededOirTests : []).forEach((rec) => {
+                if (!rec || typeof rec !== 'object' || !rec.key) return;
+                const list = supersededByKey.get(rec.key) || [];
+                list.push(rec.test);
+                supersededByKey.set(rec.key, list);
+              });
+              const incomingByKey = new Map(
+                (Array.isArray(config.oirTests) ? config.oirTests : []).filter((t) => t && t.key).map((t) => [t.key, t])
+              );
+              let updatedSomething = false;
+              let nextTests = survivingTests;
+              if (supersededByKey.size > 0) {
+                nextTests = survivingTests.map((t) => {
+                  if (!t || !t.key) return t;
+                  const previousCopies = supersededByKey.get(t.key);
+                  const incoming = incomingByKey.get(t.key);
+                  if (!previousCopies || !incoming) return t;
+                  if (_oirTestContentEqual(incoming, t)) return t; // already up to date
+                  if (!previousCopies.some((copy) => _oirTestContentEqual(copy, t))) return t; // local edit — keep
+                  updatedSomething = true;
+                  return _stripDangerousKeys(incoming);
+                });
+              }
+
+              let addedSomething = false;
+              if (Array.isArray(config.oirTests) && config.oirTests.length > 0) {
+                const localKeys = new Set(nextTests.map((t) => t && t.key));
+                // Strip dangerous keys from each untrusted incoming test entry
+                // before merging, same defence as every other untrusted-object
+                // merge in this file.
+                const incoming = config.oirTests
+                  .filter((t) => t && t.key && !localKeys.has(t.key))
+                  .map((t) => _stripDangerousKeys(t));
+                if (incoming.length > 0) {
+                  nextTests = [...nextTests, ...incoming];
+                  addedSomething = true;
+                }
+              }
+
+              if (retiredSomething || addedSomething || updatedSomething || engineChanged || filingEngineChanged) {
+                const next = Object.assign({}, local, { oirTests: nextTests });
+                if (engineChanged || filingEngineChanged) {
+                  next.prefs = Object.assign({}, local.prefs || {});
+                  if (engineChanged) next.prefs.oirEngine = publishedEngine;
+                  if (filingEngineChanged) next.prefs.filingEngine = publishedFilingEngine;
+                }
+                await chrome.storage.local.set({ 'triagelens.config': next });
+                applied.push('triage');
+              }
+            }
+          } else {
+            await chrome.storage.local.set({ 'triagelens.config': config });
+            applied.push('triage');
+          }
+        }
+      } catch (e) {
+        errors.push(`triage: ${e.message}`);
+      }
+    }
+
+    // ── Submissions ────────────────────────────────────────────────────────────
+    // v1 profiles carried practiceCode under mods.submissions; v2 moves it to
+    // mods.suite. Accept it in both places so v1 profiles still work.
+    if (modMap.has('submissions') && mods.submissions) {
+      try {
+        const merge = modMap.get('submissions') === 'merge';
+        const sub = mods.submissions;
+
+        const submissionsImport = _io('submissionsImport');
+        if (submissionsImport) {
+          if (merge) {
+            const safe = {};
+            if (sub.config && !Array.isArray(sub.config)) {
+              const ex = await chrome.storage.local.get('submissions.config');
+              if (!ex['submissions.config']) safe.config = sub.config;
+            }
+            if (sub.thresholds && !Array.isArray(sub.thresholds)) {
+              const ex = await chrome.storage.local.get('submissions.thresholds');
+              if (!ex['submissions.thresholds']) safe.thresholds = sub.thresholds;
+            }
+            // v1 practiceCode in submissions.practiceCode → forward to suite module
+            if (sub.practiceCode) {
+              const ex = await chrome.storage.local.get('suite.practiceCode');
+              if (!ex['suite.practiceCode']) safe.practiceCode = sub.practiceCode;
+            }
+            if (Object.keys(safe).length > 0) {
+              await submissionsImport(safe);
+              applied.push('submissions');
+            }
+          } else {
+            const payload = {};
+            if (sub.config) payload.config = sub.config;
+            if (sub.thresholds) payload.thresholds = sub.thresholds;
+            if (sub.practiceCode) payload.practiceCode = sub.practiceCode;
+            if (Object.keys(payload).length > 0) {
+              await submissionsImport(payload);
+              applied.push('submissions');
+            }
+          }
+        } else {
+          // Fallback raw writes
+          const toSet = {};
+          if (sub.practiceCode) {
+            if (merge) {
+              const ex = await chrome.storage.local.get('suite.practiceCode');
+              if (!ex['suite.practiceCode']) toSet['suite.practiceCode'] = sub.practiceCode;
+            } else {
+              toSet['suite.practiceCode'] = sub.practiceCode;
+            }
+          }
+          if (sub.config && !Array.isArray(sub.config)) {
+            if (merge) {
+              const ex = await chrome.storage.local.get('submissions.config');
+              if (!ex['submissions.config']) toSet['submissions.config'] = sub.config;
+            } else {
+              toSet['submissions.config'] = sub.config;
+            }
+          }
+          if (sub.thresholds && !Array.isArray(sub.thresholds)) {
+            if (merge) {
+              const ex = await chrome.storage.local.get('submissions.thresholds');
+              if (!ex['submissions.thresholds']) toSet['submissions.thresholds'] = sub.thresholds;
+            } else {
+              toSet['submissions.thresholds'] = sub.thresholds;
+            }
+          }
+          if (Object.keys(toSet).length > 0) {
+            await chrome.storage.local.set(toSet);
+            applied.push('submissions');
+          }
+        }
+      } catch (e) {
+        errors.push(`submissions: ${e.message}`);
+      }
+    }
+
+    // ── Slot Counter ───────────────────────────────────────────────────────────
+    if (modMap.has('slots') && mods.slots) {
+      try {
+        const merge = modMap.get('slots') === 'merge';
+        const sl = mods.slots;
+
+        const slotCounterImport = _io('slotCounterImport');
+        if (slotCounterImport) {
+          if (merge) {
+            const safe = {};
+            if (Array.isArray(sl.hiddenTypes)) {
+              const ex = await chrome.storage.local.get('slots.hiddenTypes');
+              if (!ex['slots.hiddenTypes']) safe.hiddenTypes = sl.hiddenTypes;
+            }
+            if (Array.isArray(sl.alertRules)) {
+              const ex = await chrome.storage.local.get('slots.alertRules');
+              if (!ex['slots.alertRules'] || ex['slots.alertRules'].length === 0) safe.alertRules = sl.alertRules;
+            }
+            if (Object.keys(safe).length > 0) {
+              await slotCounterImport(safe);
+              applied.push('slots');
+            }
+          } else {
+            const payload = {};
+            if (sl.hiddenTypes !== undefined) payload.hiddenTypes = sl.hiddenTypes;
+            if (sl.alertRules !== undefined) payload.alertRules = sl.alertRules;
+            if (Object.keys(payload).length > 0) {
+              await slotCounterImport(payload);
+              applied.push('slots');
+            }
+          }
+        } else {
+          // Fallback raw writes
+          const toSet = {};
+          if (Array.isArray(sl.hiddenTypes)) {
+            if (merge) {
+              const ex = await chrome.storage.local.get('slots.hiddenTypes');
+              if (!ex['slots.hiddenTypes']) toSet['slots.hiddenTypes'] = sl.hiddenTypes;
+            } else {
+              toSet['slots.hiddenTypes'] = sl.hiddenTypes;
+            }
+          }
+          if (Array.isArray(sl.alertRules)) {
+            if (merge) {
+              const ex = await chrome.storage.local.get('slots.alertRules');
+              if (!ex['slots.alertRules'] || ex['slots.alertRules'].length === 0) {
+                toSet['slots.alertRules'] = sl.alertRules;
+              }
+            } else {
+              toSet['slots.alertRules'] = sl.alertRules;
+            }
+          }
+          if (Object.keys(toSet).length > 0) {
+            await chrome.storage.local.set(toSet);
+            applied.push('slots');
+          }
+        }
+      } catch (e) {
+        errors.push(`slots: ${e.message}`);
+      }
+    }
+
+    // ── Capacity ───────────────────────────────────────────────────────────────
+    if (
+      modMap.has('capacity') &&
+      mods.capacity &&
+      Array.isArray(mods.capacity.presets) &&
+      mods.capacity.presets.length > 0
+    ) {
+      try {
+        const merge = modMap.get('capacity') === 'merge';
+        const capacityImport = _io('capacityImport');
+        if (capacityImport) {
+          // capacityImport already supports { merge: true }
+          await capacityImport({ presets: mods.capacity.presets }, { merge });
+          applied.push('capacity');
+        } else {
+          if (merge) {
+            const ex = await chrome.storage.local.get('capacity.presets');
+            if (!ex['capacity.presets'] || ex['capacity.presets'].length === 0) {
+              await chrome.storage.local.set({ 'capacity.presets': mods.capacity.presets });
+              applied.push('capacity');
+            }
+          } else {
+            await chrome.storage.local.set({ 'capacity.presets': mods.capacity.presets });
+            applied.push('capacity');
+          }
+        }
+      } catch (e) {
+        errors.push(`capacity: ${e.message}`);
+      }
+    }
+
+    // ── Knowledge (v2 new) ─────────────────────────────────────────────────────
+    if (modMap.has('knowledge') && mods.knowledge && typeof mods.knowledge === 'object') {
+      try {
+        const merge = modMap.get('knowledge') === 'merge';
+        const km = mods.knowledge;
+
+        // SAFETY: knowledge.config contains noticeAcknowledgedAt, a per-install
+        // attestation. Strip config entirely — the profile must never push it.
+        // knowledgeImport also blanks it, but double-defence is warranted here.
+        const payload = Object.assign({}, km);
+        delete payload.config;
+
+        const knowledgeImport = _io('knowledgeImport');
+        if (!knowledgeImport) throw new Error('knowledgeImport not available in this context.');
+
+        if (merge) {
+          // Merge items: append items whose id is absent locally AND whose
+          // title has no near-duplicate among local items.
+          const safe = {};
+
+          if (payload.items !== undefined) {
+            if (!Array.isArray(payload.items)) throw new Error('knowledge.items must be an array.');
+            const ex = await chrome.storage.local.get('knowledge.items');
+            const local = ex['knowledge.items'] || [];
+            const localIds = new Set(local.map((i) => i.id));
+
+            // KnowledgeUtils.findSimilar is used for near-duplicate title detection.
+            const KU = _io('KnowledgeUtils') || (typeof self !== 'undefined' && self.KnowledgeUtils) || null;
+            const incoming = [];
+            for (const item of payload.items) {
+              if (!item || typeof item !== 'object') continue;
+              if (localIds.has(item.id)) continue; // id collision — local wins
+              if (KU) {
+                const similar = KU.findSimilar(item.title, local, { threshold: 0.6 });
+                if (similar.length > 0) continue; // near-duplicate title — local wins
+              }
+              incoming.push(item);
+            }
+            if (incoming.length > 0) safe.items = [...local, ...incoming];
+          }
+
+          if (Array.isArray(payload.categories)) {
+            // Append categories with missing ids
+            const ex = await chrome.storage.local.get('knowledge.categories');
+            const localCats = ex['knowledge.categories'] || [];
+            const localCatIds = new Set(localCats.map((c) => c.id));
+            const newCats = payload.categories.filter((c) => c && c.id && !localCatIds.has(c.id));
+            if (newCats.length > 0) safe.categories = [...localCats, ...newCats];
+          }
+
+          if (Object.keys(safe).length > 0) {
+            await knowledgeImport(safe);
+            applied.push('knowledge');
+          }
+        } else {
+          // Replace: push items and categories wholesale via knowledgeImport.
+          // Categories omitted → [] (sanitiseCategories supplies defaults).
+          // Never leave a peer with a stale category list after a replace.
+          if (Object.keys(payload).length > 0 || payload.items !== undefined) {
+            if (payload.categories === undefined) payload.categories = [];
+            if (payload.items === undefined) payload.items = [];
+            await knowledgeImport(payload);
+            applied.push('knowledge');
+          }
+        }
+        // Knowledge-notice central attestation is written module-independently in
+        // the central-attestation pass at the end of applyProfile.
+      } catch (e) {
+        errors.push(`knowledge: ${e.message}`);
+      }
+    }
+
+    // ── Reception (v2 new) ─────────────────────────────────────────────────────
+    if (modMap.has('reception') && mods.reception && typeof mods.reception === 'object') {
+      try {
+        const merge = modMap.get('reception') === 'merge';
+        const rc = mods.reception;
+
+        // SAFETY: disclaimerAcceptedAt is a per-install attestation — never push
+        // it. receptionImport already refuses it; strip it here too for clarity.
+        const receptionImport = _io('receptionImport');
+        if (!receptionImport) throw new Error('receptionImport not available in this context.');
+
+        if (merge) {
+          const safe = {};
+
+          // Append customPathways with missing ids
+          if (Array.isArray(rc.customPathways)) {
+            const ex = await chrome.storage.local.get('reception.customPathways');
+            const local = ex['reception.customPathways'] || [];
+            const localIds = new Set(local.map((p) => p.id));
+            const incoming = rc.customPathways.filter((p) => p && p.id && !localIds.has(p.id));
+            if (incoming.length > 0) safe.customPathways = incoming; // receptionImport appends?
+            // receptionImport replaces the whole array, so merge manually:
+            if (incoming.length > 0) safe.customPathways = [...local, ...incoming];
+          }
+
+          // pathwayOverrides: add only for pathway ids with no local override
+          if (rc.pathwayOverrides && typeof rc.pathwayOverrides === 'object' && !Array.isArray(rc.pathwayOverrides)) {
+            const ex = await chrome.storage.local.get('reception.pathwayOverrides');
+            const local = ex['reception.pathwayOverrides'] || {};
+            const incoming = {};
+            // Strip dangerous keys from the untrusted incoming override map.
+            for (const [id, ov] of Object.entries(_stripDangerousKeys(rc.pathwayOverrides))) {
+              if (!local[id]) incoming[id] = ov;
+            }
+            if (Object.keys(incoming).length > 0) {
+              safe.pathwayOverrides = Object.assign({}, local, incoming);
+            }
+          }
+
+          // config: merge enabledPathways (only new ids), hiddenChipRules (only new ids)
+          if (rc.config && typeof rc.config === 'object' && !Array.isArray(rc.config)) {
+            const ex = await chrome.storage.local.get('reception.config');
+            const localCfg = ex['reception.config'] || {};
+            const safeConfig = {};
+
+            if (rc.config.enabledPathways && typeof rc.config.enabledPathways === 'object') {
+              const localFlags = localCfg.enabledPathways || {};
+              const incoming = {};
+              // Strip dangerous keys from the untrusted incoming enabledPathways map.
+              for (const [id, val] of Object.entries(_stripDangerousKeys(rc.config.enabledPathways))) {
+                // Only add ids not already present locally — never overwrite a local flag
+                if (!(id in localFlags)) incoming[id] = val;
+              }
+              if (Object.keys(incoming).length > 0) {
+                safeConfig.enabledPathways = Object.assign({}, localFlags, incoming);
+              }
+            }
+
+            if (rc.config.hiddenChipRules && typeof rc.config.hiddenChipRules === 'object') {
+              const localRules = localCfg.hiddenChipRules || {};
+              const incoming = {};
+              // Strip dangerous keys from the untrusted incoming hiddenChipRules map.
+              for (const [id, val] of Object.entries(_stripDangerousKeys(rc.config.hiddenChipRules))) {
+                if (!(id in localRules)) incoming[id] = val;
+              }
+              if (Object.keys(incoming).length > 0) {
+                safeConfig.hiddenChipRules = Object.assign({}, localRules, incoming);
+              }
+            }
+            // disclaimerAcceptedAt: intentionally never written in either mode
+            if (Object.keys(safeConfig).length > 0) safe.config = safeConfig;
+          }
+
+          // tilePrefs: merge — only set keys absent locally
+          if (rc.tilePrefs && typeof rc.tilePrefs === 'object' && !Array.isArray(rc.tilePrefs)) {
+            const ex = await chrome.storage.local.get('reception.tilePrefs');
+            if (!ex['reception.tilePrefs']) safe.tilePrefs = rc.tilePrefs;
+          }
+
+          if (Object.keys(safe).length > 0) {
+            await receptionImport(safe);
+            applied.push('reception');
+          }
+        } else {
+          // Replace: strip disclaimerAcceptedAt from config then push wholesale
+          const payload = Object.assign({}, rc);
+          if (payload.config && typeof payload.config === 'object') {
+            const cleanConfig = Object.assign({}, payload.config);
+            delete cleanConfig.disclaimerAcceptedAt;
+            payload.config = cleanConfig;
+          }
+          await receptionImport(payload);
+          applied.push('reception');
+        }
+        // Reception-disclaimer central attestation is written module-independently
+        // in the central-attestation pass at the end of applyProfile.
+      } catch (e) {
+        errors.push(`reception: ${e.message}`);
+      }
+    }
+
+    // ── Triage Alerts (v2 new) ─────────────────────────────────────────────────
+    if (modMap.has('triageAlerts') && mods.triageAlerts && typeof mods.triageAlerts === 'object') {
+      try {
+        const merge = modMap.get('triageAlerts') === 'merge';
+        const ta = mods.triageAlerts;
+
+        const TriageAlertIO = _io('TriageAlertIO');
+        if (!TriageAlertIO) throw new Error('TriageAlertIO not available in this context.');
+
+        if (Array.isArray(ta.rules)) {
+          if (merge) {
+            // Merge by rule key: existing local rules win; add absent keys from profile
+            const existingRules = await TriageAlertIO.getRules();
+            const existingKeys = new Set(existingRules.map((r) => r.key));
+            const incoming = ta.rules.filter((r) => r && r.key && !existingKeys.has(r.key));
+            if (incoming.length > 0) {
+              await TriageAlertIO.importData({ rules: [...existingRules, ...incoming] });
+              applied.push('triageAlerts');
+            }
+          } else {
+            await TriageAlertIO.importData({ rules: ta.rules });
+            applied.push('triageAlerts');
+          }
+        }
+      } catch (e) {
+        errors.push(`triageAlerts: ${e.message}`);
+      }
+    }
+
+    // ── Referrals (v2 new) ─────────────────────────────────────────────────────
+    if (modMap.has('referrals') && mods.referrals && typeof mods.referrals === 'object') {
+      try {
+        const merge = modMap.get('referrals') === 'merge';
+        const rf = mods.referrals;
+
+        const referralsImport = _io('referralsImport');
+        if (!referralsImport) throw new Error('referralsImport not available in this context.');
+
+        // SAFETY: referrals.discovery is locally-discovered data, not config — never push it.
+        if (rf.config !== undefined && rf.config !== null) {
+          if (merge) {
+            const ex = await chrome.storage.local.get('referrals.config');
+            if (!ex['referrals.config']) {
+              await referralsImport({ config: rf.config });
+              applied.push('referrals');
+            }
+          } else {
+            await referralsImport({ config: rf.config });
+            applied.push('referrals');
+          }
+        }
+      } catch (e) {
+        errors.push(`referrals: ${e.message}`);
+      }
+    }
+
+    // ── Request Monitor (v2 new) ───────────────────────────────────────────────
+    if (modMap.has('requestMonitor') && mods.requestMonitor && typeof mods.requestMonitor === 'object') {
+      try {
+        const merge = modMap.get('requestMonitor') === 'merge';
+        const rm = mods.requestMonitor;
+
+        const requestMonitorImport = _io('requestMonitorImport');
+        if (!requestMonitorImport) throw new Error('requestMonitorImport not available in this context.');
+
+        if (merge) {
+          // Merge: only write keys absent locally
+          const RM_KEYS = [
+            'suite.requestMonitor.enabled',
+            'suite.requestMonitor.assigneeId',
+            'suite.requestMonitor.pollSeconds',
+            'suite.requestMonitor.notifyEnabled',
+            'suite.requestMonitor.notifySound',
+          ];
+          const ex = await chrome.storage.local.get(RM_KEYS);
+          const safe = {};
+          if (rm.enabled !== undefined && ex['suite.requestMonitor.enabled'] == null) safe.enabled = rm.enabled;
+          if (rm.assigneeId !== undefined && ex['suite.requestMonitor.assigneeId'] == null)
+            safe.assigneeId = rm.assigneeId;
+          if (rm.pollSeconds !== undefined && ex['suite.requestMonitor.pollSeconds'] == null)
+            safe.pollSeconds = rm.pollSeconds;
+          if (rm.notifyEnabled !== undefined && ex['suite.requestMonitor.notifyEnabled'] == null)
+            safe.notifyEnabled = rm.notifyEnabled;
+          if (rm.notifySound !== undefined && ex['suite.requestMonitor.notifySound'] == null)
+            safe.notifySound = rm.notifySound;
+          if (Object.keys(safe).length > 0) {
+            await requestMonitorImport(safe);
+            applied.push('requestMonitor');
+          }
+        } else {
+          await requestMonitorImport(rm);
+          applied.push('requestMonitor');
+        }
+      } catch (e) {
+        errors.push(`requestMonitor: ${e.message}`);
+      }
+    }
+
+    // ── Cleanup Code Preferences (v2 new) ──────────────────────────────────────
+    // Tally counts ALWAYS reconcile via max(), never add — unlike this module's
+    // existing manual one-off export/import card (problem-description-cleanup-io.js's
+    // default 'add' semantics, correct there because a manual restore happens once,
+    // deliberately), a practice-profile publish gets re-checked and potentially
+    // re-applied on every version bump. Adding the same published snapshot on every
+    // cycle would double/triple-count it; max() adopts the larger of "what this
+    // machine already has" vs "what's published" without ever inflating, and without
+    // discarding growth this machine made locally since the last sync.
+    // Override resolution DOES follow the module's merge/replace mode: merge keeps
+    // today's "local pin always wins" behaviour; replace treats the published
+    // override as the practice's authoritative decision — same trust model as
+    // Knowledge's replace mode (a deliberately curated push, not a passive learned
+    // signal).
+    if (
+      modMap.has('problemDescriptionCleanup') &&
+      mods.problemDescriptionCleanup &&
+      typeof mods.problemDescriptionCleanup === 'object'
+    ) {
+      try {
+        const merge = modMap.get('problemDescriptionCleanup') === 'merge';
+        const pdc = mods.problemDescriptionCleanup;
+        const hasContent =
+          (pdc.preferredDescriptions && Object.keys(pdc.preferredDescriptions).length > 0) ||
+          (pdc.conceptRemap && Object.keys(pdc.conceptRemap).length > 0);
+
+        if (hasContent) {
+          const problemDescriptionCleanupImport = _io('problemDescriptionCleanupImport');
+          if (!problemDescriptionCleanupImport) {
+            throw new Error('problemDescriptionCleanupImport not available in this context.');
+          }
+          await problemDescriptionCleanupImport(pdc, {
+            overrideWins: merge ? 'local' : 'incoming',
+            tallyMode: 'max',
+          });
+          applied.push('problemDescriptionCleanup');
+        }
+      } catch (e) {
+        errors.push(`problemDescriptionCleanup: ${e.message}`);
+      }
+    }
+
+    // ── Suite: practiceCode + feedbackEmail + practice feature packs ──────────
+    // NEVER push display, tabOrder, hiddenTabs, letterhead, practiceAcceptedAt,
+    // attestations, waitingRoomThresholds, rollupAlwaysExpanded, txn.*, or
+    // request-monitor from this allow-list (the user's tab choice is theirs
+    // alone — see side-panel/tab-catalog.js). Those are personal preferences
+    // or a separate clinical gate, not optional-pack config.
+    //
+    // Pack keys are dotted allow-list suffixes so `suite.${key}` writes the
+    // one real storage key (e.g. signing.softFlags → suite.signing.softFlags).
+    // Today's published envelopes emit suiteExport camelCase aliases — dual-read
+    // them so apply does not no-op on current profiles. Do NOT call suiteImport()
+    // here (it would also write display / practiceAcceptedAt / etc.).
+    const suiteModData =
+      mods.suite ||
+      // v1 fallback: practiceCode may have lived under mods.submissions (already
+      // handled above). mods.suite is new in v2; accept it if present.
+      null;
+
+    if (modMap.has('allocationGroups') && mods.allocationGroups && typeof mods.allocationGroups === 'object') {
+      try {
+        const merge = modMap.get('allocationGroups') === 'merge';
+        const allocationGroupsImport = _io('allocationGroupsImport');
+        if (!allocationGroupsImport) throw new Error('allocationGroupsImport not available in this context.');
+        if (merge) {
+          const Core =
+            (typeof global !== 'undefined' && global.AllocationGroupsCore) ||
+            (typeof self !== 'undefined' && self.AllocationGroupsCore) ||
+            (typeof require === 'function' ? require('../allocation-groups-core.js') : null);
+          const ex = await chrome.storage.local.get('allocationGroups.presets');
+          const local = Array.isArray(ex['allocationGroups.presets']) ? ex['allocationGroups.presets'] : [];
+          const incoming = Array.isArray(mods.allocationGroups.presets) ? mods.allocationGroups.presets : [];
+          const merged =
+            Core && typeof Core.mergePresetsById === 'function' ? Core.mergePresetsById(local, incoming) : incoming;
+          await allocationGroupsImport({ presets: merged });
+          applied.push('allocationGroups');
+        } else {
+          await allocationGroupsImport(mods.allocationGroups);
+          applied.push('allocationGroups');
+        }
+      } catch (e) {
+        errors.push(`allocationGroups: ${e.message}`);
+      }
+    }
+
+    // Document and Template Organiser layout. config is the practice default
+    // that ships in practice-profile.json. personal is this person's overlay
+    // and is never written from a profile, even if the envelope carries it.
+    if (modMap.has('templateOrganiser') && mods.templateOrganiser && typeof mods.templateOrganiser === 'object') {
+      try {
+        const merge = modMap.get('templateOrganiser') === 'merge';
+        const templateOrganiserImport = _io('templateOrganiserImport');
+        if (!templateOrganiserImport) throw new Error('templateOrganiserImport not available in this context.');
+        const incoming = mods.templateOrganiser.config;
+        if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+          if (merge) {
+            const ex = await chrome.storage.local.get('templateOrganiser.config');
+            if (ex['templateOrganiser.config'] == null) {
+              await templateOrganiserImport({ config: incoming });
+              applied.push('templateOrganiser');
+            }
+          } else {
+            await templateOrganiserImport({ config: incoming });
+            applied.push('templateOrganiser');
+          }
+        }
+      } catch (e) {
+        errors.push(`templateOrganiser: ${e.message}`);
+      }
+    }
+
+    // Availability wall tile mapping. Merge only when this PC has never saved one.
+    if (modMap.has('availability') && mods.availability && typeof mods.availability === 'object') {
+      try {
+        const merge = modMap.get('availability') === 'merge';
+        const availabilityImport = _io('availabilityImport');
+        if (!availabilityImport) throw new Error('availabilityImport not available in this context.');
+        const incoming = mods.availability.config;
+        if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+          if (merge) {
+            const ex = await chrome.storage.local.get('availability.config');
+            if (ex['availability.config'] == null) {
+              await availabilityImport({ config: incoming });
+              applied.push('availability');
+            }
+          } else {
+            await availabilityImport({ config: incoming });
+            applied.push('availability');
+          }
+        }
+      } catch (e) {
+        errors.push(`availability: ${e.message}`);
+      }
+    }
+
+    if (modMap.has('suite') && suiteModData && typeof suiteModData === 'object') {
+      try {
+        const merge = modMap.get('suite') === 'merge';
+        const toSet = {};
+        // Literal dotted suffixes so suite.${key} → the one real storage key.
+        // Never add practiceAcceptedAt here — Accept-for-practice stays a
+        // separate clinical gate (reception + alert library), not a pack.
+        const ALLOWED_SUITE_KEYS = [
+          'practiceCode',
+          'feedbackEmail',
+          'signing.softFlags',
+          'ui.allocateCanvases',
+          'ui.contactsCanvas',
+          'ui.routineRxButton',
+          'ui.quickActionsWidget',
+          'ui.focusAlerts',
+          'ui.templateOrganiser',
+          'ui.taskPresence',
+          'ui.workloadTracker',
+          'ui.availabilityWall',
+        ];
+        const BOOLEAN_PACK_KEYS = [
+          'signing.softFlags',
+          'ui.allocateCanvases',
+          'ui.contactsCanvas',
+          'ui.routineRxButton',
+          'ui.quickActionsWidget',
+          'ui.focusAlerts',
+          'ui.templateOrganiser',
+          'ui.taskPresence',
+          'ui.workloadTracker',
+          'ui.availabilityWall',
+        ];
+        const GRANDFATHER_PACK_KEYS = [
+          'ui.allocateCanvases',
+          'ui.contactsCanvas',
+          'ui.routineRxButton',
+          'ui.quickActionsWidget',
+          'ui.focusAlerts',
+          'ui.templateOrganiser',
+          'ui.taskPresence',
+          'ui.workloadTracker',
+          'ui.availabilityWall',
+        ];
+        const ENVELOPE_ALIASES = {
+          'signing.softFlags': 'signingSoftFlags',
+          'ui.allocateCanvases': 'allocateCanvases',
+          'ui.contactsCanvas': 'contactsCanvas',
+          'ui.routineRxButton': 'routineRxButton',
+          'ui.quickActionsWidget': 'quickActionsWidget',
+          'ui.focusAlerts': 'focusAlerts',
+          'ui.templateOrganiser': 'templateOrganiser',
+          'ui.taskPresence': 'taskPresence',
+          'ui.workloadTracker': 'workloadTracker',
+          'ui.availabilityWall': 'availabilityWall',
+        };
+
+        for (const key of ALLOWED_SUITE_KEYS) {
+          let val = suiteModData[key];
+          // Dual-read the envelope alias suiteExport() / Publish already emits.
+          const alias = ENVELOPE_ALIASES[key];
+          if (val == null && alias && typeof suiteModData[alias] === 'boolean') {
+            val = suiteModData[alias];
+          }
+          if (val == null) continue;
+          const storageKey = `suite.${key}`;
+          if (merge) {
+            // Sticky-on for boolean packs: incoming true turns a clinician OFF
+            // back ON (intentional pack-push). Merge never writes false.
+            // Grandfather chrome treats a missing key as already-on, so merge
+            // of false does not mute buttons that were always visible.
+            // practiceCode / feedbackEmail stay empty-local-takes-incoming.
+            // Replace may write false. Do NOT switch pack keys to nullish
+            // (`== null`) — that would block practice ON over local OFF.
+            const ex = await chrome.storage.local.get(storageKey);
+            if (BOOLEAN_PACK_KEYS.includes(key)) {
+              if (val !== true) continue;
+              const local = ex[storageKey];
+              const localOn = local === true || (GRANDFATHER_PACK_KEYS.includes(key) && local !== false);
+              if (!localOn) toSet[storageKey] = true;
+            } else if (!ex[storageKey]) {
+              toSet[storageKey] = val;
+            }
+          } else {
+            toSet[storageKey] = val;
+          }
+        }
+        // Explicitly block any other keys even if accidentally present in the profile
+        // (display, tabOrder, hiddenTabs, letterhead, practiceAcceptedAt,
+        // attestations, waitingRoomThresholds, rollupAlwaysExpanded, txn.*,
+        // request-monitor — personal prefs or a separate gate, never pushed).
+
+        if (Object.keys(toSet).length > 0) {
+          await chrome.storage.local.set(toSet);
+          applied.push('suite');
+        }
+      } catch (e) {
+        errors.push(`suite: ${e.message}`);
+      }
+    }
+
+    // Silently ignore: condor, popout (unsupported, see task spec).
+
+    // ── Central practice attestation (module-independent) ───────────────────────
+    // Satisfy each per-install clinical gate the signed profile explicitly opens,
+    // REGARDLESS of whether that module's config was part of this push — the
+    // acceptance is about the gate, not the content (which an earlier profile
+    // version may have pushed). Each write is guarded: a genuine local acceptance
+    // ALWAYS wins and is never overwritten or downgraded. With no practiceAttestation
+    // block (or a gate not === true), `att` is null / gate() is false and nothing
+    // here runs — the key is never touched (fail-safe, byte-for-byte old behaviour).
+    if (att) {
+      // Alert-library acknowledgement is withdrawn with monitoring (v4.0.0).
+      // A signed gate must not write sentinel.alertLibrary.acknowledged.
+      // Reception disclaimer (ISO) — only if not already locally accepted.
+      if (gate('reception') && att.attestedAt) {
+        try {
+          const ex = await chrome.storage.local.get('reception.config');
+          const localCfg = ex['reception.config'] || {};
+          if (localCfg.disclaimerAcceptedAt == null) {
+            await chrome.storage.local.set({
+              'reception.config': Object.assign({}, localCfg, { disclaimerAcceptedAt: att.attestedAt }),
+            });
+          }
+          _markAttestation('reception');
+        } catch (e) {
+          errors.push(`attest.reception: ${e.message}`);
+        }
+      }
+      // Knowledge notice (ISO) — only if not already locally acknowledged.
+      if (gate('knowledge') && att.attestedAt) {
+        try {
+          const ex = await chrome.storage.local.get('knowledge.config');
+          const localCfg = ex['knowledge.config'] || {};
+          if (localCfg.noticeAcknowledgedAt == null) {
+            await chrome.storage.local.set({
+              'knowledge.config': Object.assign({}, localCfg, { noticeAcknowledgedAt: att.attestedAt }),
+            });
+          }
+          _markAttestation('knowledge');
+        } catch (e) {
+          errors.push(`attest.knowledge: ${e.message}`);
+        }
+      }
+    }
+
+    // ── Central attestation provenance ──────────────────────────────────────────
+    // For each gate actually satisfied above, merge a provenance marker into
+    // suite.practiceProfile.attestations recording WHO attested centrally and WHEN,
+    // so the UI can show "Accepted centrally by <by>" rather than presenting a
+    // central acceptance as a local one. Merged (never wiped) so an existing
+    // local/other-gate marker survives.
+    if (Object.keys(attestationProvenance).length > 0) {
+      try {
+        const PROV_KEY = 'suite.practiceProfile.attestations';
+        const exProv = await chrome.storage.local.get(PROV_KEY);
+        const existing =
+          exProv[PROV_KEY] && typeof exProv[PROV_KEY] === 'object' && !Array.isArray(exProv[PROV_KEY])
+            ? exProv[PROV_KEY]
+            : {};
+        const merged = Object.assign({}, existing, attestationProvenance);
+        await chrome.storage.local.set({ [PROV_KEY]: merged });
+      } catch (e) {
+        errors.push(`attestationProvenance: ${e.message}`);
+      }
+    }
+
+    await _recordApplication({
+      profileVersion: profile.profileVersion,
+      profileLabel: profile.profileLabel || '',
+      modeSummary: _buildModeSummary(modMap),
+      appliedAt: new Date().toISOString(),
+      modulesApplied: applied,
+      attestationsApplied: Object.keys(attestationProvenance),
+      errors,
+    });
+
+    return { skipped: false, modulesApplied: applied, errors };
+  }
+
+  // Build a human-readable summary of the module→mode map for history entries.
+  function _buildModeSummary(modMap) {
+    const parts = [];
+    for (const [name, mode] of modMap) parts.push(`${name}:${mode}`);
+    return parts.join(', ') || 'none';
+  }
+
+  async function _recordApplication(entry) {
+    const r = await chrome.storage.local.get(META_KEY);
+    const meta = r[META_KEY] || {};
+    meta.lastAppliedVersion = entry.profileVersion;
+    meta.lastAppliedAt = entry.appliedAt;
+    meta.lastAppliedLabel = entry.profileLabel;
+    meta.lastAppliedMode = entry.modeSummary;
+    meta.lastCheckedAt = entry.appliedAt; // also set on every check — see checkAndApply
+    const history = meta.history || [];
+    history.unshift(entry);
+    meta.history = history.slice(0, 10);
+    await chrome.storage.local.set({ [META_KEY]: meta });
+  }
+
+  async function _updateLastChecked() {
+    const r = await chrome.storage.local.get(META_KEY);
+    const meta = r[META_KEY] || {};
+    meta.lastCheckedAt = new Date().toISOString();
+    await chrome.storage.local.set({ [META_KEY]: meta });
+  }
+
+  async function _maybeNotify(profile) {
+    try {
+      const r = await chrome.storage.local.get(NOTIFIED_KEY);
+      const notified = r[NOTIFIED_KEY] || [];
+      if (notified.includes(profile.profileVersion)) return;
+      if (typeof chrome !== 'undefined' && chrome.notifications?.create) {
+        chrome.notifications.create(`pp_${Date.now()}`, {
+          type: 'basic',
+          iconUrl: 'icons/icon-128.png',
+          title: 'Practice settings updated',
+          message: profile.profileLabel || `Profile ${profile.profileVersion} applied`,
+          priority: 0,
+          silent: true,
+        });
+      }
+      const updated = [...notified, profile.profileVersion].slice(-20);
+      await chrome.storage.local.set({ [NOTIFIED_KEY]: updated });
+    } catch (_) {}
+  }
+
+  // Main entry point for the service worker: fetch, compare, auto-apply if needed.
+  // Also updates lastCheckedAt on every call regardless of whether anything was applied.
+  async function checkAndApply() {
+    try {
+      const profile = await fetchProfile();
+      await _updateLastChecked();
+      if (!profile) return { present: false };
+
+      const status = await getStatus();
+      const current = status?.lastAppliedVersion;
+      const incoming = profile.profileVersion;
+      const autoApply = profile.apply?.autoApplyOnStartup !== false;
+
+      if (current === incoming) return { present: true, current: true };
+      // Ordering guard, mirrored from applyProfile so the reason is logged
+      // once at the check (rather than looking like a silent no-op).
+      if (_isOlderProfileVersion(incoming, current)) {
+        console.log('[Practice Profile] Shared file is OLDER than the applied version —', incoming, '<', current);
+        return { present: true, current: false, older: true };
+      }
+      if (!autoApply) return { present: true, current: false, pendingVersion: incoming };
+
+      const result = await applyProfile(profile);
+      if (!result.skipped && profile.apply?.notifyUserOnApply) {
+        await _maybeNotify(profile);
+      }
+      console.log(
+        '[Practice Profile] Applied version',
+        incoming,
+        '— modules:',
+        result.modulesApplied,
+        result.errors?.length ? `— errors: ${result.errors.join('; ')}` : ''
+      );
+      return { present: true, applied: !result.skipped, result };
+    } catch (e) {
+      console.warn('[Practice Profile] checkAndApply failed:', e.message);
+      return { present: false, error: e.message };
+    }
+  }
+
+  // oirTestContentEqual is exported for the cross-implementation parity test in
+  // test-practice-profile.js (see its definition above for why it is private).
+  const api = { fetchProfile, getStatus, applyProfile, checkAndApply, oirTestContentEqual: _oirTestContentEqual };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  } else if (typeof self !== 'undefined') {
+    self.PracticeProfile = api;
+  }
+
+  return api;
+})();

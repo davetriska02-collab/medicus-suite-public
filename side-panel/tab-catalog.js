@@ -1,0 +1,150 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — tab catalog (DATA + pure helpers, no DOM/chrome at import)
+//
+// Single source of truth for what each side-panel tab is, in words a brand-new
+// user understands, plus the role presets offered by the tab chooser.
+// test-tab-catalog.js guards parity with panel.html's data-module set — adding
+// a nav tab without a catalog entry (or vice versa) fails CI.
+//
+// Tab visibility itself is stored in chrome.storage.local 'suite.hiddenTabs'
+// (an array of ids). It is USER-OWNED: included in the user's own suite backup
+// (shared/io/suite-io.js) but deliberately NOT writable by the practice-profile
+// central-deployment mechanism (see shared/io/practice-profile.js — profiles
+// never push suite.* preference keys).
+
+'use strict';
+
+export const TAB_CATALOG = [
+  { id: 'slots', name: 'Slots', blurb: 'Taken and free appointment counts by type for any date.' },
+  {
+    id: 'trends',
+    name: 'Trends',
+    blurb: 'Charts of the open patient’s recorded BP, renal results, HbA1c, cholesterol and weight.',
+  },
+  { id: 'capacity', name: 'Forecast', blurb: 'Calendar of future appointment capacity against your minimums.' },
+  { id: 'submissions', name: 'Submissions', blurb: 'Incoming task volumes by type, with demand thresholds.' },
+  { id: 'activity', name: 'Activity', blurb: 'Staff activity report over a date range.' },
+  { id: 'referrals', name: 'Referrals', blurb: 'Referral audit — counts, priorities, specialties, clinicians.' },
+  { id: 'reception', name: 'Reception', blurb: 'Front-desk tools: guided call capture and patient status.' },
+  {
+    id: 'signing',
+    name: 'Signing',
+    blurb: 'Open repeat-prescription requests from Medicus. The list does not score them.',
+  },
+  { id: 'knowledge', name: 'Knowledge', blurb: 'Your practice’s reference base — criteria, contacts, pathways.' },
+  { id: 'leaflets', name: 'Leaflets', blurb: 'Find and share the right NHS patient information leaflet, fast.' },
+  {
+    id: 'record',
+    name: 'Record',
+    blurb: 'Live snapshot of the open patient — problems, medicines and recent results. No PDF needed.',
+  },
+  {
+    id: 'rota',
+    name: 'Rota',
+    blurb: 'Today’s duty cover, leave, uncovered sessions and staffing warnings.',
+  },
+  {
+    // Off the strip. Still in this catalog and the Practice manager preset;
+    // opened from All tabs and the command palette.
+    id: 'rota-app',
+    name: 'Rota manager',
+    blurb: 'Opens the full rota in a new tab — patterns, leave, duty fairness and cover.',
+  },
+  {
+    id: 'patient-alerts',
+    name: 'Pt Alerts',
+    blurb: 'Your own per-patient flags — interpreter, safeguarding, behaviour — shown when that patient is open.',
+  },
+  {
+    // Off the strip. Opens the triage-room availability wall in its own tab.
+    id: 'availability',
+    name: 'Availability',
+    blurb: 'Full-screen free-slot wall for the triage room. Times and counts only.',
+  },
+  {
+    // Off the strip, same as Rota manager. The Everything preset still shows it.
+    id: 'duplicate-checker',
+    name: 'Duplicates',
+    blurb: 'Practice-wide scan for GP2GP duplicate-record import errors, with per-patient drill-down.',
+  },
+];
+
+// One-tap starting points; users fine-tune afterwards. Every preset keeps
+// Slots (the default home tab) and Knowledge/About-level basics reachable.
+export const ROLE_PRESETS = [
+  {
+    id: 'gp',
+    label: 'GP / clinician',
+    show: [
+      'slots',
+      'availability',
+      'record',
+      'patient-alerts',
+      'trends',
+      'signing',
+      'knowledge',
+      'leaflets',
+    ],
+  },
+  {
+    id: 'reception',
+    label: 'Reception',
+    show: ['slots', 'availability', 'reception', 'patient-alerts', 'submissions', 'knowledge', 'leaflets'],
+  },
+  {
+    id: 'manager',
+    label: 'Practice manager',
+    show: [
+      'slots',
+      'capacity',
+      'submissions',
+      'activity',
+      'referrals',
+      'rota',
+      'rota-app',
+      'availability',
+      'knowledge',
+    ],
+  },
+  {
+    id: 'all',
+    label: 'Everything',
+    show: TAB_CATALOG.map((t) => t.id),
+  },
+];
+
+const ALL_IDS = new Set(TAB_CATALOG.map((t) => t.id));
+
+// hidden set for a preset = catalog minus the preset's shown tabs.
+export function hiddenFromPreset(presetId) {
+  const preset = ROLE_PRESETS.find((p) => p.id === presetId);
+  if (!preset) return [];
+  const show = new Set(preset.show);
+  return TAB_CATALOG.map((t) => t.id).filter((id) => !show.has(id));
+}
+
+// Defensive load: strings only, known ids only, and never every tab — if a
+// corrupt value would hide the whole nav, fall back to hiding nothing.
+export function sanitiseHiddenTabs(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [...new Set(raw.filter((id) => typeof id === 'string' && ALL_IDS.has(id)))];
+  return out.length >= ALL_IDS.size ? [] : out;
+}
+
+// Pure toggle used by both the side-panel chooser overlay and the options-page
+// tab section. Given the current hidden set and a tab id, returns the new hidden
+// array. Turning a tab ON is always allowed; turning one OFF is BLOCKED when it
+// would hide the last visible tab — hiding is de-cluttering, never lock-out.
+// Returns { hidden, blocked }: when blocked, `hidden` is unchanged.
+export function toggleTabVisibility(hiddenIds, id) {
+  const set = new Set(sanitiseHiddenTabs(hiddenIds));
+  if (!ALL_IDS.has(id)) return { hidden: [...set], blocked: false };
+  if (set.has(id)) {
+    set.delete(id); // turning ON — always allowed
+    return { hidden: [...set], blocked: false };
+  }
+  // turning OFF — block if it would leave nothing visible
+  if (ALL_IDS.size - set.size <= 1) return { hidden: [...set], blocked: true };
+  set.add(id);
+  return { hidden: [...set], blocked: false };
+}

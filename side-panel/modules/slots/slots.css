@@ -1,0 +1,1404 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Medicus Suite — Slot Counter module styles */
+
+.slots-module {
+  font-family: var(--sans);
+}
+
+/* Date zone: presets + date input + refresh all on one row (Decision C) */
+.date-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.date-input {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  border-radius: var(--r-md);
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: border-color var(--fast) var(--ease);
+}
+
+.date-input:focus-visible {
+  border-color: var(--accent);
+}
+
+/* Refresh button in date zone — matches date-input height */
+.date-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  height: 28px;
+  border-radius: var(--r-md);
+}
+
+.preset-btn {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-4);
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  border-radius: var(--r-md);
+  padding: 4px 10px;
+  transition:
+    border-color var(--fast) var(--ease),
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+
+.preset-btn:hover {
+  border-color: var(--border-hi);
+  color: var(--text-3);
+}
+.preset-btn.active {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--text-2);
+}
+.preset-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.slots-section {
+  margin-bottom: 16px;
+}
+
+.section-label {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-2);
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-hint {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+
+.slot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.slot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  transition: background var(--fast) var(--ease);
+  position: relative;
+  overflow: hidden;
+}
+
+.slot-row:hover {
+  background: var(--bg-hover);
+}
+
+/* Share-of-visible-total micro-bar behind the row content — relative volume
+   scans without reading numbers. Content sits above it. */
+.slot-share {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--accent-dim);
+  pointer-events: none;
+}
+.slot-row > label,
+.slot-row > .slot-count-group {
+  position: relative;
+}
+.slot-row.row-hidden {
+  opacity: 0.4;
+}
+
+.slot-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+}
+
+.slot-label input[type='checkbox'] {
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.slot-type {
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* By-type collapsible panel (Decision D) */
+.slot-types-details {
+  /* no extra styling — inherits from section */
+}
+.slot-types-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+  border-radius: var(--r-sm);
+  transition: background var(--fast) var(--ease);
+}
+.slot-types-summary:hover {
+  background: var(--bg-hover);
+}
+.slot-types-summary:active {
+  opacity: 0.8;
+}
+.slot-types-summary::-webkit-details-marker {
+  display: none;
+}
+/* Chevron via CSS ::after — toggled by open state */
+.slot-types-summary::after {
+  content: '▸';
+  font-size: 9px;
+  color: var(--text-5);
+  transition: transform var(--fast) var(--ease);
+}
+details[open] > .slot-types-summary::after {
+  content: '▾';
+}
+.slot-types-details > .slot-list,
+.slot-types-details > .section-hint {
+  margin-top: 6px;
+}
+
+.staff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.staff-row {
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+/* Single merged .staff-toggle rule (Decision H — fold duplicates) */
+.staff-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  color: var(--text-3);
+  font-size: 11px;
+  text-align: left;
+  position: relative;
+  overflow: hidden;
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+.staff-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+.staff-toggle:active {
+  background: var(--bg-hover);
+}
+
+/* Per-clinician layers: share-of-total wash + AM|PM split strip along the
+   bottom edge. Content spans sit above both. */
+.staff-share {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--accent-dim);
+  pointer-events: none;
+}
+.staff-split {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  display: flex;
+  pointer-events: none;
+}
+
+/* Desaturated AM/PM bars in clinician rows (Decision E) */
+.staff-split .split-am {
+  background: var(--text-5);
+  opacity: 0.55;
+}
+.staff-split .split-pm {
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+/* Dark theme: raise AM/PM bar opacity so time-of-day encoding stays perceptible
+   on dark backgrounds (--text-5 and --accent are both dark-lifted already). */
+html[data-theme='dark'] .staff-split .split-am {
+  background: var(--border-hi);
+  opacity: 0.7;
+}
+html[data-theme='dark'] .staff-split .split-pm {
+  background: var(--accent);
+  opacity: 0.6;
+}
+.staff-toggle > .staff-chevron,
+.staff-toggle > .staff-name,
+.staff-toggle > .staff-count-mini {
+  position: relative;
+}
+
+.staff-chevron {
+  font-size: 9px;
+  color: var(--text-5);
+  flex-shrink: 0;
+}
+.staff-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* staff-count — scoped to mini context (Decision H) */
+/* Phase 3 (Vogue map): the clinician row reads as a scannable micro-grid, not a
+   sentence — am / pm / total in fixed mono tabular columns so digits align down
+   the list and the eye scans a column. */
+.staff-count-mini {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.staff-count-mini > span[title] {
+  font-family: var(--mono);
+  display: inline-block;
+  min-width: 27px;
+  text-align: right;
+  color: var(--text-4);
+}
+.staff-count-mini .staff-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--green);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  min-width: 18px;
+  text-align: right;
+}
+
+.staff-detail {
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--r-md) var(--r-md);
+  padding: 4px 8px 6px 22px;
+}
+
+.staff-type-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-4);
+  padding: 2px 0;
+}
+
+.staff-type-row span:last-child {
+  font-family: var(--mono);
+  color: var(--text-3);
+}
+
+.skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.skel-row {
+  height: 30px;
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  animation: pulse var(--med) var(--ease) infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skel-row {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+/* Empty state — designed (Decision F) */
+.slots-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 16px;
+  text-align: center;
+}
+.slots-empty-icon {
+  color: var(--text-5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.slots-empty-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-4);
+}
+.slots-empty-sub {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+.foot {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-4);
+  letter-spacing: 0.06em;
+  text-align: right;
+  margin-top: 12px;
+}
+
+/* excluded-toggle as <button> (Decision H) — full width, UA reset, keyboard-reachable */
+.excluded-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  cursor: pointer;
+  border-radius: var(--r-md);
+  margin-top: 2px;
+  background: transparent;
+  border: none;
+  font: inherit;
+  text-align: left;
+  transition:
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+
+.excluded-toggle:hover {
+  color: var(--text-3);
+  background: var(--bg-elev);
+}
+
+.excluded-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.excluded-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 2px;
+}
+
+/* ── Hero card ────────────────────────────────────────────────────────────────
+   Headline total + AM/PM chips. Alert wash states (Decision A). */
+.slots-hero-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  padding: 12px 14px 10px;
+  margin-bottom: 10px;
+}
+
+/* Amber / red wash when overall alert level triggers (Decision A) */
+.slots-hero-card--amber {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+.slots-hero-card--red {
+  background: var(--red-dim);
+  border-color: var(--red-line);
+}
+
+.slots-hero-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.slots-hero-right {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.slots-count-hero {
+  font-size: 40px;
+  font-weight: 700;
+  color: var(--text-1);
+  line-height: 1;
+  font-family: var(--mono);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* slots-count-label: mono, uppercase, letterspaced, machine-voice label (Decision H) */
+.slots-count-label {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--green);
+}
+.slots-count-label.zero {
+  color: var(--text-4);
+}
+.slots-taken-line {
+  margin-top: 2px;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+/* Practice-wide scope + defensible cut-off clock — a manager quoting free
+   capacity to partners needs to know it is the whole practice and "as at when".
+   (Practice appraisal, Slots re-run 2026-06-21.) */
+.slots-hero-asat {
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+/* Label inherits the highest triggered slot-alert level — signal, not décor */
+.slots-count-label.amber {
+  color: var(--amber);
+}
+.slots-count-label.red {
+  color: var(--red);
+}
+
+/* Per-type pills — dot is slate when calm, amber/red at/below alert threshold */
+.slots-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.slot-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 7px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  max-width: 100%;
+}
+.slot-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-5);
+  flex-shrink: 0;
+}
+.slot-pill-name {
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.slot-pill-num {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.slot-pill.pill-amber {
+  border-color: var(--amber-line);
+  background: var(--amber-dim);
+}
+.slot-pill.pill-amber .slot-pill-dot {
+  background: var(--amber);
+}
+.slot-pill.pill-amber .slot-pill-num {
+  color: var(--amber);
+}
+.slot-pill.pill-red {
+  border-color: var(--red-line);
+  background: var(--red-dim);
+}
+.slot-pill.pill-red .slot-pill-dot {
+  background: var(--red);
+}
+.slot-pill.pill-red .slot-pill-num {
+  color: var(--red);
+}
+.slot-pill.pill-zero .slot-pill-num {
+  color: var(--text-5);
+}
+
+/* User colour-coding (organising only — NOT a clinical flag; alert amber/red
+   classes are never combined with these). Keys mirror Reception's palette;
+   keep in sync with PILL_COLOUR_KEYS in slots.js. */
+.pill-c-default {
+  --pill-col: transparent;
+}
+.pill-c-slate {
+  --pill-col: var(--swatch-slate);
+}
+.pill-c-red {
+  --pill-col: var(--swatch-red);
+}
+.pill-c-orange {
+  --pill-col: var(--swatch-orange);
+}
+.pill-c-amber {
+  --pill-col: var(--swatch-amber);
+}
+.pill-c-green {
+  --pill-col: var(--swatch-green);
+}
+.pill-c-teal {
+  --pill-col: var(--swatch-teal);
+}
+.pill-c-blue {
+  --pill-col: var(--swatch-blue);
+}
+.pill-c-purple {
+  --pill-col: var(--swatch-purple);
+}
+.pill-c-pink {
+  --pill-col: var(--swatch-pink);
+}
+.slot-pill[class*='pill-c-']:not(.pill-c-default) {
+  border-color: var(--pill-col);
+}
+.slot-pill[class*='pill-c-']:not(.pill-c-default) .slot-pill-dot {
+  background: var(--pill-col);
+}
+
+/* Organise mode */
+.pill-organise-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  color: var(--text-4);
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+  transition:
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.pill-organise-btn:hover {
+  color: var(--text-2);
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+/* Active (Done) state: ghost button — cannot be mistaken for a data pill (Decision G) */
+.pill-organise-btn.active {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 9px;
+  font-weight: 600;
+}
+.pill-organise-btn:active {
+  background: var(--accent-dim);
+}
+.slot-pill.pill-organising {
+  cursor: grab;
+  border-style: dashed;
+}
+.slot-pill.pill-organising:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+.slot-pill.pill-dragging {
+  opacity: 0.4;
+}
+
+.pill-palette {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding: 7px 9px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+}
+.pill-palette-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.pill-swatches {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.pill-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-elev);
+  box-shadow: 0 0 0 1px var(--border);
+  background: var(--pill-col);
+  cursor: pointer;
+  padding: 0;
+  transition: transform var(--fast) var(--ease);
+}
+.pill-swatch:hover {
+  transform: scale(1.15);
+}
+.pill-swatch.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.pill-swatch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.pill-swatch.pill-c-default {
+  background: var(--bg-elev);
+}
+
+.pill-organise-hint {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 6px;
+}
+
+/* AM/PM split below the hero number */
+.slots-ampm-split {
+  display: flex;
+  gap: 8px;
+}
+/* G4 (design-house 2026-06-21): converge on the canonical pill family — the
+   AM/PM chips sit beside the r-pill slot pills, so they take the pill radius too
+   (was the squared --r-sm). Radius only; no box-size change. */
+.ampm-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: var(--r-pill);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+.ampm-tag {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+.ampm-num {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+/* AM/PM number colours — panel.css colorblind block overrides .ampm-am/.ampm-pm;
+   these tokens must stay as the base values so the colorblind override wins. */
+.ampm-am .ampm-num {
+  color: var(--amber);
+}
+.ampm-pm .ampm-num {
+  color: var(--accent);
+}
+
+/* Per-row AM · PM · Total breakdown */
+.slot-count-group {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-3);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.slot-count-group.zero {
+  color: var(--text-5);
+}
+.slot-count-ampm {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+  min-width: 24px;
+  justify-content: flex-end;
+}
+
+/* ampm-tag-inline (Decision H) */
+.ampm-tag-inline {
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--text-4);
+  margin-left: 1px;
+}
+.slot-count-sep {
+  color: var(--text-5);
+  font-size: 10px;
+  padding: 0 1px;
+}
+.slot-count-total {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--green);
+  font-size: 13px;
+  min-width: 28px;
+  margin-left: 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.slot-count-group.zero .slot-count-total {
+  color: var(--text-5);
+}
+
+/* Per-clinician AM · PM · Total mini badge */
+.staff-count-mini {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-4);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.staff-count-mini > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+}
+
+.staff-type-counts {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.staff-type-counts > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+}
+.staff-type-total {
+  font-family: var(--mono);
+  color: var(--text-3);
+  font-weight: 600;
+  min-width: 24px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Slot alert ribbon */
+.slots-alert-ribbon {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--r-lg);
+  margin-bottom: 12px;
+  font-size: 11px;
+  font-family: var(--mono);
+  line-height: 1.45;
+  border: 1px solid;
+}
+.slots-alert-ribbon-amber {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+  color: var(--amber);
+}
+.slots-alert-ribbon-red {
+  background: var(--red-dim);
+  border-color: var(--red-line);
+  color: var(--red);
+}
+.slots-alert-icon {
+  flex-shrink: 0;
+  font-style: normal;
+  display: inline-flex;
+  align-items: center;
+}
+.slots-alert-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+.slots-alert-item {
+  white-space: nowrap;
+}
+.slots-alert-count {
+  font-weight: 700;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  padding: 0 1px;
+}
+
+/* Edit thresholds deep-link button inside the alert ribbon (Decision B) */
+.slots-ribbon-link {
+  align-self: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  text-decoration: underline;
+  transition: opacity var(--fast) var(--ease);
+}
+.slots-ribbon-link:hover {
+  opacity: 1;
+}
+.slots-ribbon-link:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* ── Alert threshold editor (item 9) ─────────────────────────────────────────
+   Cog button in the date-presets row + the minimal in-module editor panel it
+   toggles. .has-alert-rules gives the cog a quiet accent tint so a practice
+   with rules configured can tell at a glance without opening the panel. */
+#slotsAlertToggle.has-alert-rules {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+#slotsAlertToggle.active {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--text-2);
+}
+
+.slots-alert-editor {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.slots-alert-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.slots-alert-editor-title {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-1);
+}
+
+.slots-alert-editor-close {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.slots-alert-editor-note {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.5;
+  margin: 0 0 10px;
+}
+
+.slots-alert-editor-empty {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  padding: 8px 0;
+}
+
+.slots-alert-rule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.slots-alert-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.slots-alert-rule-row .sar-type {
+  flex: 1 1 140px;
+  min-width: 120px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  padding: 4px 6px;
+  font-family: var(--sans);
+  font-size: 11px;
+  border-radius: var(--r-sm);
+}
+.slots-alert-rule-row .sar-type:focus {
+  border-color: var(--accent);
+  background: var(--bg-deep);
+}
+
+.slots-alert-rule-row .sar-lte,
+.slots-alert-rule-row .sar-unit {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+
+.slots-alert-rule-row .sar-threshold {
+  width: 56px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  border-radius: var(--r-sm);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.slots-alert-rule-row .sar-threshold:focus {
+  border-color: var(--accent);
+  background: var(--bg-deep);
+}
+
+.slots-alert-rule-row .sar-delete {
+  padding: 2px 8px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* ── Booking section ─────────────────────────────────────────────────────────
+   Collapsible panel at the bottom of the Slots tab.
+   bk-toggle-row acts as both the section-label and the open/close trigger. */
+
+.bk-section {
+  margin-top: 8px;
+}
+
+/* A button-shaped bar (matches the first-available opener) — the entry point
+   to a booking must look pressable, not like a text heading. */
+.bk-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  transition:
+    border-color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+
+.bk-toggle-row:hover {
+  border-color: var(--accent-line);
+  background: var(--bg-hover);
+}
+
+.bk-toggle-row[aria-expanded='true'] {
+  border-color: var(--accent-line);
+}
+
+.bk-toggle-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bk-toggle-chevron {
+  font-size: 9px;
+  color: var(--text-5);
+  flex-shrink: 0;
+}
+
+.bk-toggle-text {
+  flex: 1;
+}
+
+.bk-pt-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--text-4);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 1px 6px;
+  flex-shrink: 0;
+}
+
+/* Browse / confirm / success views all stack as a column */
+.bk-browse,
+.bk-confirm,
+.bk-success {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 4px;
+}
+
+.bk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bk-label {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-3);
+  min-width: 36px;
+  flex-shrink: 0;
+}
+
+.bk-optional {
+  font-weight: 400;
+  color: var(--text-5);
+}
+
+.bk-select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 11px;
+  border-radius: var(--r-md);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.bk-select:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.bk-date-input {
+  flex: 1;
+}
+
+.bk-text-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 11px;
+  border-radius: var(--r-md);
+  padding: 4px 8px;
+}
+
+.bk-text-input:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* Typable type picker — filter input stacked over the (filtered) select */
+.bk-type-picker {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bk-type-picker .bk-select,
+.bk-type-filter {
+  width: 100%;
+  flex: none;
+}
+
+/* Primary action button — Find slots / Confirm */
+.bk-action-btn {
+  align-self: flex-end;
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 16px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: opacity var(--fast) var(--ease);
+}
+
+.bk-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bk-action-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.bk-confirm-btn {
+  flex: 1;
+  text-align: center;
+}
+
+.bk-loading,
+.bk-no-slots {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--text-4);
+  padding: 8px 0;
+  text-align: center;
+}
+
+.bk-error {
+  font-size: 11px;
+  color: var(--red);
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  border-radius: var(--r-md);
+  padding: 6px 10px;
+}
+
+.bk-warn {
+  font-size: 11px;
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-md);
+  padding: 6px 10px;
+}
+
+/* Slot list */
+.bk-slot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bk-slot-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font-family: var(--sans);
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.bk-slot-row:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-line);
+}
+
+.bk-slot-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.bk-slot-time {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  min-width: 84px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.bk-slot-meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.bk-slot-site {
+  font-size: 10px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bk-slot-type {
+  font-size: 10px;
+  color: var(--text-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bk-slot-dur {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+
+/* Confirm step summary card */
+.bk-confirm-summary {
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bk-confirm-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.bk-confirm-label {
+  font-size: 10px;
+  color: var(--text-4);
+  min-width: 32px;
+  flex-shrink: 0;
+}
+
+.bk-confirm-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 2px;
+}
+
+/* Success step */
+.bk-success {
+  text-align: center;
+  padding: 12px 0;
+  align-items: center;
+}
+
+.bk-success-icon {
+  font-size: 22px;
+  color: var(--green);
+  line-height: 1;
+}
+
+.bk-success-msg {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.bk-success-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.bk-again-btn {
+  margin-top: 2px;
+}

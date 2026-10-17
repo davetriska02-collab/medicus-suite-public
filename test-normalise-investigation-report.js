@@ -1,0 +1,547 @@
+// test-normalise-investigation-report.js — unit tests for normaliseInvestigationReport
+// Run with: node test-normalise-investigation-report.js
+'use strict';
+
+const { normaliseInvestigationReport } = require('./engine/normalisers.js');
+
+let passed = 0;
+let failed = 0;
+
+function assert(cond, msg) {
+  if (cond) {
+    console.log(`  OK  ${msg}`);
+    passed++;
+  } else {
+    console.error(`  FAIL  ${msg}`);
+    failed++;
+  }
+}
+
+// ── Fixtures ─────────────────────────────────────────────────────────────────
+
+// Normal WBC: value 4.6, range 4–11
+const wbcResult = {
+  description: 'WBC',
+  resultValue: '4.6',
+  resultUnit: '× 10⁹/L',
+  resultComparator: null,
+  referenceRanges: [{ lowerReferenceLimit: '4', upperReferenceLimit: '11', description: null }],
+  isAboveReferenceRange: false,
+  isBelowReferenceRange: false,
+  requiresUrgentReview: false,
+  interpretation: null,
+  formattedSpecimenCollectionDate: '09 Jan 26, 08:26',
+  specimenCollectionDate: '2026-01-09 08:26:00',
+  issuedDateTime: null,
+  previousResults: [],
+};
+
+// Above RDW (urgent): 16.7, range 11–15
+const rdwResult = {
+  description: 'RDW',
+  resultValue: '16.7',
+  resultUnit: '%',
+  resultComparator: null,
+  referenceRanges: [{ lowerReferenceLimit: '11', upperReferenceLimit: '15', description: null }],
+  isAboveReferenceRange: true,
+  isBelowReferenceRange: false,
+  requiresUrgentReview: true,
+  interpretation: 'Above reference range',
+  formattedSpecimenCollectionDate: '09 Jan 26, 08:26',
+  specimenCollectionDate: '2026-01-09 08:26:00',
+  issuedDateTime: null,
+  previousResults: [],
+};
+
+// A result with a previousResult above its parent range (range 4–11; prev value 12.3)
+const wbcWithHistory = {
+  description: 'WBC',
+  resultValue: '4.6',
+  resultUnit: '× 10⁹/L',
+  resultComparator: null,
+  referenceRanges: [{ lowerReferenceLimit: '4', upperReferenceLimit: '11', description: null }],
+  isAboveReferenceRange: false,
+  isBelowReferenceRange: false,
+  requiresUrgentReview: false,
+  interpretation: null,
+  formattedSpecimenCollectionDate: '09 Jan 26, 08:26',
+  specimenCollectionDate: '2026-01-09 08:26:00',
+  issuedDateTime: null,
+  previousResults: [
+    {
+      result: '12.3',
+      specimenCollectionDate: '2026-01-02 10:00:00',
+      formattedSpecimenCollectionDate: '02 Jan 26, 10:00',
+      id: 'prev-1',
+      resultType: null,
+      resultStatus: null,
+    },
+    {
+      result: '4.8',
+      specimenCollectionDate: '2025-12-15 09:00:00',
+      formattedSpecimenCollectionDate: '15 Dec 25, 09:00',
+      id: 'prev-2',
+      resultType: null,
+      resultStatus: null,
+    },
+  ],
+};
+
+// A result with a <-prefixed comparator value
+const comparatorResult = {
+  description: 'PSA',
+  resultValue: '<0.1',
+  resultUnit: 'ng/mL',
+  resultComparator: '<',
+  referenceRanges: [{ lowerReferenceLimit: '0', upperReferenceLimit: '4', description: null }],
+  isAboveReferenceRange: false,
+  isBelowReferenceRange: false,
+  requiresUrgentReview: false,
+  interpretation: null,
+  formattedSpecimenCollectionDate: null,
+  specimenCollectionDate: null,
+  issuedDateTime: '2026-03-15T10:00:00Z',
+  previousResults: [],
+};
+
+function makePayload(groups, ungrouped, isMatchedToPatient, patientId) {
+  return {
+    data: {
+      patient: { id: patientId || 'patient-uuid-123' },
+      investigationReport: {
+        isMatchedToPatient: isMatchedToPatient !== false,
+        investigationGroups: groups || [],
+        ungroupedResults: ungrouped || [],
+      },
+    },
+  };
+}
+
+// ── Basic shape and patientUuid ───────────────────────────────────────────────
+console.log('\n--- Basic shape and patientUuid ---');
+{
+  const payload = makePayload([{ results: [wbcResult] }], [], true, 'uuid-abc');
+  const out = normaliseInvestigationReport(payload);
+  assert(out.patientUuid === 'uuid-abc', 'patientUuid extracted from data.patient.id');
+  assert(out.unmatched === false, 'matched patient → unmatched false');
+  assert(Array.isArray(out.results), 'results is an array');
+  assert(out.results.length === 1, 'one result from one group');
+}
+
+// ── Unmatched flag passthrough ────────────────────────────────────────────────
+console.log('\n--- Unmatched flag ---');
+{
+  const payload = makePayload([], [], false);
+  const out = normaliseInvestigationReport(payload);
+  assert(out.unmatched === true, 'isMatchedToPatient false → unmatched true');
+}
+
+// ── Normal WBC result shape ───────────────────────────────────────────────────
+console.log('\n--- Normal WBC result fields ---');
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [wbcResult] }], []));
+  const r = out.results[0];
+  assert(r.name === 'WBC', 'name is WBC');
+  assert(r.value === 4.6, 'value is numeric 4.6');
+  assert(r.rawValue === '4.6', 'rawValue preserved as string');
+  assert(r.unit === '× 10⁹/L', 'unit correct');
+  assert(r.comparator === null, 'comparator null');
+  assert(r.low === 4, 'low ref limit parsed to 4');
+  assert(r.high === 11, 'high ref limit parsed to 11');
+  assert(r.isAbove === false, 'isAbove false');
+  assert(r.isBelow === false, 'isBelow false');
+  assert(r.urgent === false, 'urgent false');
+  assert(r.interpretation === null, 'interpretation null');
+  assert(r.date === '2026-01-09', 'date normalised to YYYY-MM-DD');
+  assert(Array.isArray(r.history), 'history is array');
+  assert(r.history.length === 0, 'history empty when previousResults is []');
+}
+
+// ── Urgent / above RDW ────────────────────────────────────────────────────────
+console.log('\n--- Urgent above RDW result ---');
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [rdwResult] }], []));
+  const r = out.results[0];
+  assert(r.name === 'RDW', 'name is RDW');
+  assert(r.value === 16.7, 'value is 16.7');
+  assert(r.isAbove === true, 'isAbove true');
+  assert(r.urgent === true, 'urgent true');
+  assert(r.interpretation === 'Above reference range', 'interpretation preserved');
+  assert(r.low === 11, 'low ref 11');
+  assert(r.high === 15, 'high ref 15');
+}
+
+// ── ungroupedResults included ─────────────────────────────────────────────────
+console.log('\n--- ungroupedResults included ---');
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [wbcResult] }], [rdwResult]));
+  assert(out.results.length === 2, 'grouped + ungrouped = 2 results total');
+  const names = out.results.map((r) => r.name);
+  assert(names.includes('WBC'), 'WBC from group present');
+  assert(names.includes('RDW'), 'RDW from ungroupedResults present');
+}
+
+// ── Empty groups and arrays ───────────────────────────────────────────────────
+console.log('\n--- Empty groups and arrays ---');
+{
+  const out = normaliseInvestigationReport(makePayload([], []));
+  assert(out.results.length === 0, 'empty groups → empty results');
+}
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [] }], []));
+  assert(out.results.length === 0, 'group with empty results → empty results');
+}
+{
+  const out = normaliseInvestigationReport(null);
+  assert(out.patientUuid === null, 'null payload → safe shape, patientUuid null');
+  assert(out.results.length === 0, 'null payload → empty results');
+}
+{
+  const out = normaliseInvestigationReport({});
+  assert(out.results.length === 0, 'empty object → empty results');
+}
+
+// ── resultComparator present and <-prefixed value parses ─────────────────────
+console.log('\n--- resultComparator and <-prefixed value ---');
+{
+  const out = normaliseInvestigationReport(makePayload([], [comparatorResult]));
+  const r = out.results[0];
+  assert(r.comparator === '<', 'comparator is <');
+  assert(r.rawValue === '<0.1', 'rawValue keeps < prefix');
+  assert(r.value === 0.1, 'numeric value strips < → 0.1');
+  assert(r.date === '2026-03-15', 'issuedDateTime fallback date parsed');
+}
+
+// ── History flag derivation ───────────────────────────────────────────────────
+console.log('\n--- History flag derivation ---');
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [wbcWithHistory] }], []));
+  const r = out.results[0];
+  assert(r.history.length === 2, 'two history entries');
+  // Newest-first: 2026-01-02 before 2025-12-15
+  assert(r.history[0].date === '2026-01-02', 'newest history entry first');
+  assert(r.history[0].value === 12.3, 'history value 12.3 parsed');
+  assert(r.history[0].flag === 'above', 'prev value 12.3 > high 11 → flag above');
+  assert(r.history[1].date === '2025-12-15', 'older history entry second');
+  assert(r.history[1].value === 4.8, 'history value 4.8 parsed');
+  assert(r.history[1].flag === 'normal', 'prev value 4.8 within 4–11 → flag normal');
+}
+
+// ── History unit field (item 2.6, TRIAGE-LENS-2026-07-02.md trend arrows) ──────
+// ADDITIVE: previousResults entries have never been observed to carry their own
+// unit on real Medicus payloads (same analyte/test code as the parent, reported
+// over time) — history.unit inherits the parent result's unit unless the raw
+// entry explicitly states a different one, so extractPrior's unit guard
+// (engine/result-severity.js) passes in the ordinary case instead of always
+// failing closed for lack of data.
+console.log('\n--- History unit field (additive, item 2.6) ---');
+{
+  const out = normaliseInvestigationReport(makePayload([{ results: [wbcWithHistory] }], []));
+  const r = out.results[0];
+  assert(
+    r.history[0].unit === '× 10⁹/L' && r.history[1].unit === '× 10⁹/L',
+    'previousResults entries with no unit of their own inherit the parent result.unit'
+  );
+
+  const explicitUnitResult = {
+    ...wbcWithHistory,
+    previousResults: [
+      {
+        result: '12.3',
+        specimenCollectionDate: '2026-01-02 10:00:00',
+        formattedSpecimenCollectionDate: '02 Jan 26, 10:00',
+        id: 'prev-1',
+        resultUnit: 'mmol/L', // explicitly different from the parent's '× 10⁹/L'
+      },
+    ],
+  };
+  const out2 = normaliseInvestigationReport(makePayload([{ results: [explicitUnitResult] }], []));
+  assert(
+    out2.results[0].history[0].unit === 'mmol/L',
+    'an explicit resultUnit on a previousResults entry overrides the inherited parent unit'
+  );
+}
+
+// ── patientId fallback (data.patientId) ──────────────────────────────────────
+console.log('\n--- patientId fallback ---');
+{
+  const payload = {
+    data: {
+      patientId: 'fallback-id',
+      investigationReport: {
+        isMatchedToPatient: true,
+        investigationGroups: [],
+        ungroupedResults: [],
+      },
+    },
+  };
+  const out = normaliseInvestigationReport(payload);
+  assert(out.patientUuid === 'fallback-id', 'data.patientId used when data.patient absent');
+}
+
+// ── Date format: "DD Mon YY, HH:MM" ──────────────────────────────────────────
+console.log('\n--- Date format DD Mon YY HH:MM ---');
+{
+  const result = {
+    ...wbcResult,
+    formattedSpecimenCollectionDate: '11 Jun 26, 14:30',
+    specimenCollectionDate: null,
+  };
+  const out = normaliseInvestigationReport(makePayload([{ results: [result] }], []));
+  assert(out.results[0].date === '2026-06-11', 'DD Mon YY format → 2026-06-11');
+}
+
+// ── Microbiology text-result (resultText, no resultValue) ─────────────────────
+// Mirrors the real Medicus "Urine M,C&S" shape: text-result type carries its
+// content in resultText; resultValue is absent entirely.
+console.log('\n--- Microbiology text-result (resultText) ---');
+{
+  const negative = {
+    description: 'Urine culture',
+    resultType: 'text-result',
+    resultText: 'No growth',
+    interpretation: null,
+    performerComments: null,
+    resultPerformerComments: [],
+    filingComments: [],
+    referenceRanges: [],
+    previousResults: [],
+  };
+  const out = normaliseInvestigationReport(makePayload([{ results: [negative] }], []));
+  const r = out.results[0];
+  assert(r.name === 'Urine culture', 'name is Urine culture');
+  assert(r.rawValue === 'No growth', 'rawValue falls back to resultText when resultValue absent');
+  assert(/no growth/i.test(r.text), 'searchable text contains the resultText "No growth"');
+}
+{
+  const positive = {
+    description: 'Urine culture',
+    resultType: 'text-result',
+    resultText: '>10*8 cfu/L of\n  Escherichia coli\n       Trimethoprim (Sensitive)',
+    interpretation: null,
+    performerComments: null,
+    resultPerformerComments: ['Mid-stream urine - REQUESTED TEST SETS COMPLETE'],
+    filingComments: [],
+    referenceRanges: [],
+    previousResults: [],
+  };
+  const out = normaliseInvestigationReport(makePayload([{ results: [positive] }], []));
+  const r = out.results[0];
+  assert(/escherichia coli/i.test(r.text), 'searchable text contains the organism from resultText');
+  assert(!/no growth/i.test(r.text), 'positive culture text has no normal phrase');
+}
+
+// ── specimen field: named investigationGroup → header attached to each result ──
+// This guards the Step 1 normaliser feature: each result from a named group carries
+// the group's human-readable header as `specimen`; an untitled GROUP → null (no single result's name could stand
+// in for a multi-result group's heading); an UNGROUPED result falls back to its own description instead.
+console.log('\n--- specimen field: named group → header on each result ---');
+{
+  // A single group with groupName "THROAT SWAB" and two culture results.
+  const cultureA = {
+    description: 'Culture',
+    resultType: 'text-result',
+    resultText: 'Beta haemolytic Streptococcus NOT isolated',
+    interpretation: null,
+    performerComments: null,
+    resultPerformerComments: [],
+    filingComments: [],
+    referenceRanges: [],
+    previousResults: [],
+  };
+  const cultureB = {
+    description: 'Anaerobes',
+    resultType: 'text-result',
+    resultText: 'Anaerobes NOT isolated',
+    interpretation: null,
+    performerComments: null,
+    resultPerformerComments: [],
+    filingComments: [],
+    referenceRanges: [],
+    previousResults: [],
+  };
+  const payload = makePayload([{ groupName: 'THROAT SWAB', results: [cultureA, cultureB] }], []);
+  const out = normaliseInvestigationReport(payload);
+  assert(out.results.length === 2, 'two results from named group');
+  assert(out.results[0].specimen === 'THROAT SWAB', 'first result gets specimen: "THROAT SWAB" from groupName');
+  assert(out.results[1].specimen === 'THROAT SWAB', 'second result in same group also gets specimen: "THROAT SWAB"');
+}
+
+// Candidate-key fallback order: groupName → name → title → heading → description
+console.log('\n--- specimen field: candidate-key fallback order ---');
+{
+  // Only the `name` key is populated (groupName absent)
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ name: 'URINE', results: [r] }], []));
+  assert(out.results[0].specimen === 'URINE', 'falls back to g.name when g.groupName absent');
+}
+{
+  // Only `title` present
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ title: 'BLOOD CULTURE', results: [r] }], []));
+  assert(out.results[0].specimen === 'BLOOD CULTURE', 'falls back to g.title when g.groupName and g.name absent');
+}
+{
+  // Only `heading` present
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ heading: 'HVS', results: [r] }], []));
+  assert(out.results[0].specimen === 'HVS', 'falls back to g.heading');
+}
+{
+  // Only `description` present
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ description: 'SPUTUM', results: [r] }], []));
+  assert(out.results[0].specimen === 'SPUTUM', 'falls back to g.description');
+}
+{
+  // groupName takes priority over other keys
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ groupName: 'FIRST', name: 'SECOND', results: [r] }], []));
+  assert(out.results[0].specimen === 'FIRST', 'groupName takes priority over name');
+}
+
+// Groups with no title → specimen: null
+console.log('\n--- specimen field: untitled group → null ---');
+{
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ results: [r] }], []));
+  assert(out.results[0].specimen === null, 'group with no title keys → specimen null');
+}
+{
+  // All candidate keys are empty strings → null
+  const r = { ...wbcResult };
+  const out = normaliseInvestigationReport(makePayload([{ groupName: '', name: '  ', results: [r] }], []));
+  assert(out.results[0].specimen === null, 'all-empty/whitespace title keys → specimen null');
+}
+
+// Ungrouped results → specimen: null. This is deliberately UNCHANGED — many consumers (result-combo's specimen-scope
+// gate, result-rules, result-severity, outstanding-match…) treat null here as "unknown specimen type, never block",
+// and a result's own NAME is not a specimen-type keyword. See groupHeading below for the actual fix.
+console.log('\n--- specimen field: ungrouped results → null ---');
+{
+  const out = normaliseInvestigationReport(makePayload([], [wbcResult]));
+  assert(out.results[0].specimen === null, 'ungrouped result → specimen null');
+}
+
+// Mixed: named group + ungrouped in same report
+console.log('\n--- specimen field: named group + ungrouped in same report ---');
+{
+  const r1 = { ...wbcResult };
+  const r2 = { ...rdwResult };
+  const out = normaliseInvestigationReport(makePayload([{ groupName: 'HAEMATOLOGY', results: [r1] }], [r2]));
+  assert(out.results.length === 2, 'one from group, one ungrouped = 2 total');
+  const byName = {};
+  out.results.forEach((r) => {
+    byName[r.name] = r;
+  });
+  assert(byName['WBC'].specimen === 'HAEMATOLOGY', 'WBC from named group has specimen header');
+  assert(byName['RDW'].specimen === null, 'RDW from ungrouped has specimen null');
+}
+
+// groupHeading (Phase E, lab-filing-catalogue.js) — a DIFFERENT field from specimen, added 2026-09-26 (a colleague,
+// live-caught via console capture): Medicus sends AST as a lone ungroupedResults entry, description "AST", and
+// renders it as its own titled block — but `specimen: null` meant it could never be matched to an approved
+// assisted-filing group no matter what a person registered for it. groupHeading falls back to the result's own
+// description for an ungrouped result, without touching `specimen`'s existing fail-open-to-null semantics.
+console.log('\n--- groupHeading: same as specimen for a named group, falls back to own description when ungrouped ---');
+{
+  const out = normaliseInvestigationReport(
+    makePayload([{ groupName: 'HAEMATOLOGY', results: [{ ...wbcResult }] }], [])
+  );
+  assert(out.results[0].groupHeading === 'HAEMATOLOGY', 'named group: groupHeading matches specimen');
+}
+{
+  const out = normaliseInvestigationReport(makePayload([], [{ ...wbcResult }]));
+  assert(out.results[0].groupHeading === 'WBC', "ungrouped: groupHeading falls back to the result's own description");
+  assert(out.results[0].specimen === null, 'ungrouped: specimen itself is untouched, still null');
+}
+{
+  // No description at all (or blank) on the ungrouped result → still fail-open to null, never a guess
+  const r = { ...wbcResult, description: '  ' };
+  const out = normaliseInvestigationReport(makePayload([], [r]));
+  assert(
+    out.results[0].groupHeading === null,
+    'an ungrouped result with no usable description still gets groupHeading null'
+  );
+}
+{
+  // An untitled GROUP still gets groupHeading: null too — a multi-result group has no single result whose own name
+  // could stand in for the group's heading, so there is no safe fallback there either.
+  const out = normaliseInvestigationReport(makePayload([{ results: [{ ...wbcResult }] }], []));
+  assert(out.results[0].groupHeading === null, 'untitled group: groupHeading null, same as specimen');
+}
+
+// ── Additive (Phase E): report.lab and result.code — never read by the legacy engine ──────────
+console.log('\n--- report.lab (Phase E, lab-filing-catalogue.js) ---');
+{
+  const out = normaliseInvestigationReport(makePayload([], [wbcResult]));
+  assert(
+    out.lab && out.lab.organisation === null && out.lab.department === null,
+    'no performer on the payload -> lab is present but both fields null (never absent, never a throw)'
+  );
+  const withPerformer = {
+    data: {
+      patient: { id: 'p1' },
+      investigationReport: {
+        isMatchedToPatient: true,
+        performer: { organisationName: 'LAB01', departmentName: 'General Pathology' },
+        investigationGroups: [],
+        ungroupedResults: [wbcResult],
+      },
+    },
+  };
+  const out2 = normaliseInvestigationReport(withPerformer);
+  assert(
+    out2.lab.organisation === 'LAB01' && out2.lab.department === 'General Pathology',
+    'performer org/department read into report.lab'
+  );
+}
+
+console.log('\n--- result.code (Phase E, lab-filing-catalogue.js) ---');
+{
+  const out = normaliseInvestigationReport(makePayload([], [wbcResult]));
+  assert(out.results[0].code === null, 'a result with no resultCode gets code: null, not a throw');
+  const coded = { ...wbcResult, resultCode: { conceptId: '1000621000000104', description: 'Serum ALP' } };
+  const out2 = normaliseInvestigationReport(makePayload([], [coded]));
+  assert(out2.results[0].code === '1000621000000104', 'resultCode.conceptId is read as the SNOMED code');
+  const numericId = { ...wbcResult, resultCode: { conceptId: 12345 } };
+  const out3 = normaliseInvestigationReport(makePayload([], [numericId]));
+  assert(
+    out3.results[0].code === '12345',
+    'a numeric conceptId is coerced to a string, matching the catalogue’s own string ids'
+  );
+}
+
+console.log('\n--- comment text is not doubled, and commentParts says whether a result has a comment (2026-10-02) ---');
+{
+  // Live capture, 2026-10-02: Medicus puts a lab comment in BOTH performerComments and resultPerformerComments[],
+  // identical, on every commented result (45 of 45) — and never doubles any single field.
+  const note = 'Insufficient historical creatinine data to assess AKI risk';
+  const commented = { ...wbcResult, performerComments: note, resultPerformerComments: [note] };
+  const c = normaliseInvestigationReport(makePayload([], [commented])).results[0];
+  assert(c.text.split(note).length === 2, 'the same comment arriving in two Medicus fields appears ONCE in text');
+  assert(c.commentParts.length === 1 && c.commentParts[0] === note, 'commentParts holds the one distinct comment');
+  const two = { ...wbcResult, performerComments: note, resultPerformerComments: [note, 'A second, different comment'] };
+  const t = normaliseInvestigationReport(makePayload([], [two])).results[0];
+  assert(
+    t.commentParts.length === 2 && t.text.includes('A second, different comment'),
+    'a genuinely different second comment is kept'
+  );
+  const none = { ...wbcResult, performerComments: null, resultPerformerComments: [], filingComments: [] };
+  const n = normaliseInvestigationReport(makePayload([], [none])).results[0];
+  assert(
+    Array.isArray(n.commentParts) && n.commentParts.length === 0,
+    'a result with no comment fields has an empty commentParts'
+  );
+  assert(n.text === n.rawValue, 'and its text is just the value — nothing else joined in');
+}
+
+// ── Summary ───────────────────────────────────────────────────────────────────
+console.log(`\n${'─'.repeat(50)}`);
+console.log(`Tests: ${passed + failed} total · ${passed} passed · ${failed} failed`);
+if (failed > 0) {
+  console.error('\nFAIL — fix the above before shipping.');
+  process.exit(1);
+} else {
+  console.log('\nAll tests passed.');
+}

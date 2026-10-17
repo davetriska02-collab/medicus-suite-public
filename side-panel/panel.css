@@ -1,0 +1,3262 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Medicus Suite — Side Panel */
+
+/* JetBrains Mono vendored locally (audit M16, 2026-07-18): the remote Google
+   Fonts @import made an outbound third-party request on every panel open —
+   an IG/data-minimisation break for software whose posture is "nothing
+   leaves the browser" — and broke typography offline. Latin-subset variable
+   font (weights 100-800 on the wght axis) from fonts.gstatic.com JetBrains
+   Mono v24, OFL-1.1 licensed; see docs/SOUP.md. */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('../vendor/fonts/jetbrains-mono-latin-var.woff2') format('woff2');
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* Default: light theme — canon: .claude/skills/ui-design/TOKENS.md */
+  --bg-deep: #f8fafc;
+  --bg-mid: #f1f5f9;
+  --bg-elev: #ffffff;
+  --bg-hover: #e2eaf5;
+  --border: #cbd5e1;
+  --border-hi: #94a3b8;
+  --text-1: #0f172a;
+  --text-2: #1e3a5f;
+  --text-3: #475569;
+  /* Eyesight floor: --text-4 / --text-5 carry load-bearing micro-labels
+     (setup badges, strip labels, OPTIONAL/RECOMMENDED). Lifted one slate step
+     each for contrast — a tired technophobe reader misread the old pale grey. */
+  --text-4: #556377;
+  --text-5: #5f6f85;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-dim: rgba(37, 99, 235, 0.09);
+  --accent-line: rgba(37, 99, 235, 0.3);
+  /* Status triads: ink / wash / line */
+  --green: #16a34a;
+  --green-dim: rgba(22, 163, 74, 0.09);
+  --green-line: rgba(22, 163, 74, 0.3);
+  --amber: #b45309;
+  --amber-dim: rgba(180, 83, 9, 0.09);
+  --amber-line: rgba(180, 83, 9, 0.32);
+  --red: #dc2626;
+  --red-dim: rgba(220, 38, 38, 0.08);
+  --red-line: rgba(220, 38, 38, 0.3);
+  /* Violet triad — custom/user-defined rule accent. NOT a clinical status;
+     deliberately outside the RAG set and untouched by colorblind mode. */
+  --violet: #7c3aed;
+  --violet-dim: rgba(124, 58, 237, 0.09);
+  --violet-line: rgba(124, 58, 237, 0.3);
+  /* Shape, depth, motion */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-pill: 999px;
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-2: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.14);
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --med: 200ms;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Overlay scrim — pure refactor; same value as the raw rgba it replaces */
+  --scrim: rgba(15, 23, 42, 0.55);
+  /* Legacy aliases — older strip rules referenced --t1..--t5 */
+  --t1: var(--text-1);
+  --t2: var(--text-2);
+  --t3: var(--text-3);
+  --t4: var(--text-4);
+  --t5: var(--text-5);
+  /* Categorical data-viz ramp — NON-clinical chart series. Deliberately avoids the --red/--amber alert hues. Canon: TOKENS.md */
+  --cat-1: #2563eb;
+  --cat-2: #0d9488;
+  --cat-3: #a21caf;
+  --cat-4: #7c3aed;
+  --cat-5: #64748b;
+  --cat-6: #0891b2;
+  /* User colour swatches — the fixed organising palette a user picks from to
+     colour-code pills/tiles (Slots types, Reception pathways, …). NON-clinical:
+     purely for the user's own grouping, never a status. Distinct from --cat-*
+     (chart series) and from the status triads. Canon: TOKENS.md §swatches. */
+  --swatch-slate: #64748b;
+  --swatch-red: #dc2626;
+  --swatch-orange: #ea580c;
+  --swatch-amber: #d97706;
+  --swatch-green: #16a34a;
+  --swatch-teal: #0d9488;
+  --swatch-blue: #2563eb;
+  --swatch-purple: #7c3aed;
+  --swatch-pink: #db2777;
+}
+
+/* Dark theme override */
+html[data-theme='dark'] {
+  --bg-deep: #050a14;
+  --bg-mid: #0b1424;
+  --bg-elev: #131e34;
+  --bg-hover: #1a2a44;
+  --border: #1c2e4e;
+  --border-hi: #2a4060;
+  --text-1: #f1f5f9;
+  --text-2: #cfe1ff;
+  --text-3: #93a8c5;
+  /* Eyesight floor (dark): lift the two faintest text tokens one step. */
+  --text-4: #7d97b5;
+  --text-5: #6c89ac;
+  --accent: #5b8fc7;
+  --accent-hover: #7eaad6;
+  --accent-dim: rgba(91, 143, 199, 0.14);
+  --accent-line: rgba(91, 143, 199, 0.35);
+  --green: #4ade80;
+  --green-dim: rgba(74, 222, 128, 0.12);
+  --green-line: rgba(74, 222, 128, 0.32);
+  --amber: #fbbf24;
+  --amber-dim: rgba(251, 191, 36, 0.16);
+  --amber-line: rgba(251, 191, 36, 0.32);
+  --red: #f87171;
+  --red-dim: rgba(248, 113, 113, 0.17);
+  --red-line: rgba(248, 113, 113, 0.34);
+  --violet: #a78bfa;
+  --violet-dim: rgba(167, 139, 250, 0.14);
+  --violet-line: rgba(167, 139, 250, 0.35);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 10px 32px rgba(0, 0, 0, 0.55);
+  /* Heavier veil on dark — the light-tuned 15/23/42 @ .55 barely darkens an
+     already-dark page; modal/overlay separation needs a deeper scrim here. */
+  --scrim: rgba(0, 0, 0, 0.66);
+  --cat-1: #5b8fc7;
+  --cat-2: #2dd4bf;
+  --cat-3: #e879c9;
+  --cat-4: #a78bfa;
+  --cat-5: #93a8c5;
+  --cat-6: #38bdf8;
+  /* Lightness-raised for legibility on #0b1424, mirroring the --cat dark lifts. */
+  --swatch-slate: #93a8c5;
+  --swatch-red: #f87171;
+  --swatch-orange: #fb923c;
+  --swatch-amber: #fbbf24;
+  --swatch-green: #4ade80;
+  --swatch-teal: #2dd4bf;
+  --swatch-blue: #5b8fc7;
+  --swatch-purple: #a78bfa;
+  --swatch-pink: #f472b6;
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+  background: var(--bg-deep);
+  color: var(--text-1);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+/* Keyboard focus — single global ring, never suppressed */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Shell layout ─────────────────────────────────────────────────────────── */
+
+.suite-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100%;
+}
+
+/* ── Nav bar ──────────────────────────────────────────────────────────────── */
+
+.suite-nav {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--bg-mid);
+  border-bottom: 1px solid var(--border);
+  padding: 0 8px;
+  height: 44px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+/* Fade gradients on edges when nav tabs overflow */
+.suite-nav::after,
+.suite-nav::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--med) var(--ease);
+  z-index: 1;
+}
+.suite-nav::after {
+  right: 38px;
+  background: linear-gradient(to right, transparent, var(--bg-mid));
+}
+.suite-nav::before {
+  left: 110px;
+  background: linear-gradient(to left, transparent, var(--bg-mid));
+}
+.suite-nav.has-overflow-right::after {
+  opacity: 1;
+}
+.suite-nav.has-overflow-left::before {
+  opacity: 1;
+}
+
+/* Scroll arrows */
+.nav-scroll-indicator {
+  position: absolute;
+  top: 50%;
+  width: 20px;
+  height: 20px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-2);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  pointer-events: none;
+  font-size: 13px;
+  z-index: 2;
+}
+.nav-scroll-right {
+  right: 38px;
+  transform: translateY(-50%);
+}
+.nav-scroll-left {
+  left: 110px;
+  transform: translateY(-50%);
+}
+.suite-nav.has-overflow-right .nav-scroll-right {
+  display: flex;
+  animation: nudge-right 1.6s ease-in-out infinite;
+}
+.suite-nav.has-overflow-left .nav-scroll-left {
+  display: flex;
+  animation: nudge-left 1.6s ease-in-out infinite;
+}
+
+@keyframes nudge-right {
+  0%,
+  100% {
+    transform: translateY(-50%) translateX(0);
+  }
+  50% {
+    transform: translateY(-50%) translateX(3px);
+  }
+}
+@keyframes nudge-left {
+  0%,
+  100% {
+    transform: translateY(-50%) translateX(0);
+  }
+  50% {
+    transform: translateY(-50%) translateX(-3px);
+  }
+}
+
+/* ── Signature motion (2026-06-21 craft pass) ────────────────────────────────
+   Restrained, interaction-driven only — overlays ease in on open, never on a
+   data poll (modules re-render on poll, so animating their content would twitch
+   every few seconds). All motion is killed under prefers-reduced-motion. */
+@keyframes ch-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes ch-pop-in-center {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+.dp-popover,
+.alltabs-popover,
+.help-popover {
+  animation: ch-pop-in 130ms var(--ease);
+}
+.suite-palette {
+  animation: ch-pop-in-center 130ms var(--ease);
+}
+
+/* Reticle-geometry spinner — a ring with one accent arc, echoing the brand
+   mark's rangefinder ring. Consumed via the .ch-spinner utility or ::before. */
+@keyframes ch-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.ch-spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: ch-spin 700ms linear infinite;
+  vertical-align: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dp-popover,
+  .alltabs-popover,
+  .help-popover,
+  .suite-palette {
+    animation: none;
+  }
+  .ch-spinner {
+    animation-duration: 0s;
+  }
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  margin-right: 8px;
+}
+
+.nav-logo {
+  width: 16px;
+  height: 16px;
+  display: block;
+  border-radius: 4px;
+  flex: none;
+}
+
+/* In the 400px panel chrome the wordmark text crowded the tab rail enough to
+   clip the active tab's label ("TODA"). The distinctive mark now carries the
+   brand in-chrome; the full wordmark still appears in About / Options / the
+   visualiser. (Practice/Vogue 10-review, 2026-06-21.) */
+.nav-name {
+  display: none;
+}
+
+.nav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  scroll-behavior: smooth;
+  /* The overflow fade hints "more tabs that way" but must never eat a tab label:
+     an 8% fade clipped the active tab to "TODA". Keep it to a narrow 3% so the
+     hint stays without truncating the busiest control. (Practice/Vogue 10-review,
+     2026-06-21.) */
+  -webkit-mask-image: linear-gradient(to right, black 97%, transparent 100%);
+  mask-image: linear-gradient(to right, black 97%, transparent 100%);
+}
+.nav-tabs::-webkit-scrollbar {
+  display: none;
+}
+.suite-nav:not(.has-overflow) .nav-tabs {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
+.nav-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid transparent; /* reserved so .active never shifts layout */
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: var(--r-md);
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+  white-space: nowrap;
+}
+
+.nav-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+
+.nav-tab.active {
+  background: var(--accent-dim);
+  color: var(--text-2);
+  border-color: var(--accent-line);
+}
+
+.nav-tab svg {
+  flex-shrink: 0;
+}
+
+/* Drag-and-drop reordering */
+.nav-tab[draggable='true'] {
+  cursor: grab;
+}
+.nav-tab.nav-tab-dragging {
+  cursor: grabbing;
+  opacity: 0.5;
+  background: var(--accent-dim);
+}
+/* Insertion marker — left/right edge highlight on the drop-target tab */
+.nav-tab.nav-tab-drop-before {
+  box-shadow: inset 2px 0 0 0 var(--accent);
+}
+.nav-tab.nav-tab-drop-after {
+  box-shadow: inset -2px 0 0 0 var(--accent);
+}
+
+.nav-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-4);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: var(--r-md);
+  display: flex;
+  align-items: center;
+  transition:
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+
+.icon-btn:hover {
+  color: var(--text-2);
+  background: var(--bg-hover);
+}
+
+.icon-btn:active {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+/* Shared data-freshness chip (side-panel/modules/shared/freshness.js). One
+   consistent "Updated · 12s ago" relative stamp across every data module, with a
+   visible stale state so users can tell live from stale from silently-failed. */
+.freshness-stamp {
+  font-variant-numeric: tabular-nums;
+}
+.freshness-stamp.is-stale {
+  color: var(--amber);
+}
+.freshness-warn {
+  color: var(--amber);
+}
+
+/* Persistent "all N tabs live here" hint on the command-palette button, so the
+   narrow rail's off-screen tabs are discoverable without hover or prior knowledge. */
+.palette-count {
+  margin-left: 4px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: var(--r-sm);
+  background: var(--bg-mid);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Content area ─────────────────────────────────────────────────────────── */
+
+.suite-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--bg-deep);
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: var(--r-sm);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hi);
+}
+
+/* ── Shared module styles (used by both Slots and Submissions) ─────────────── */
+
+.module-wrap {
+  padding: 16px;
+  min-height: 100%;
+}
+
+.mod-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+/* Type-system revision 2026-06-21 (DOCTRINE #4): the module eyebrow is the
+   voice, so it is sentence-case sans now, not mono-caps. Hierarchy by weight. */
+.mod-eyebrow {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-3);
+  margin-bottom: 3px;
+}
+
+.mod-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-1);
+  letter-spacing: -0.01em;
+}
+
+.mod-subtitle {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.ghost-btn {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  border-radius: var(--r-md);
+  padding: 5px 10px;
+  transition:
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+
+.ghost-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+
+.ghost-btn:active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.ghost-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.banner {
+  padding: 8px 12px;
+  border-radius: var(--r-lg);
+  font-size: 11px;
+  color: var(--red);
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  margin-bottom: 12px;
+}
+
+.banner.info {
+  color: var(--text-3);
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+
+.banner.hidden {
+  display: none;
+}
+
+/* ── Sentinel panel ───────────────────────────────────────────────────────── */
+
+.sentinel-panel {
+  padding: 16px;
+}
+
+.module-ver {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-5);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+.sentinel-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-1);
+  margin: 14px 0 10px;
+  font-size: 12px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sentinel-status.checking .status-dot {
+  background: var(--text-5);
+}
+.sentinel-status.checking .status-text {
+  color: var(--text-4);
+}
+
+.sentinel-status.inactive .status-dot {
+  background: var(--text-5);
+}
+.sentinel-status.inactive .status-text {
+  color: var(--text-4);
+}
+
+.sentinel-status.idle .status-dot {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber-line);
+}
+.sentinel-status.idle .status-text {
+  color: var(--text-3);
+}
+
+.sentinel-status.active .status-dot {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green-line);
+}
+.sentinel-status.active .status-text {
+  color: var(--green);
+}
+
+.sentinel-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 11px 16px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: var(--r-lg);
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease);
+  margin-bottom: 16px;
+}
+
+.sentinel-toggle-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  box-shadow: var(--shadow-1);
+}
+
+.sentinel-toggle-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sentinel-explainer {
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sentinel-explainer p {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.55;
+}
+
+.sentinel-links {
+  margin-bottom: 16px;
+}
+
+.purpose-banner {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+}
+
+.purpose-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-5);
+  margin-bottom: 5px;
+}
+
+.purpose-text {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.55;
+  font-style: italic;
+}
+
+/* Slot count badge on nav tab */
+.nav-badge {
+  background: var(--accent);
+  color: var(--bg-deep);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  border-radius: var(--r-pill);
+  padding: 1px 5px;
+  margin-left: 3px;
+  min-width: 18px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+/* Monitoring action-count severity, layered on the neutral .nav-badge above —
+   used only when the WR strip is hidden (no waiting patients) so the Sentinel
+   badge falls back to the nav tab. See panel.js applySentinelBadgeToDom. */
+.nav-badge-amber {
+  background: var(--amber);
+}
+.nav-badge-red {
+  background: var(--red);
+}
+
+/* ── Waiting Room global strip ───────────────────────────────────────────────
+   Sits between the nav bar and the module content. Visible on every tab.   */
+
+/* ── Canonical pill (TOKENS.md §Pill) ─────────────────────────────────────────
+   The suite-wide pill, generalised from the Slots per-type pills: a coloured
+   DOT (category/severity carrier — survives colourblind because shape, not only
+   hue), a NAME in the human/sans voice, and a COUNT in the machine/mono tabular
+   voice. Colour rides on two custom props so the (future) organise mode can set
+   them per-pill: --pill-line (border + dot) and --pill-fill (background).
+
+   Two modes, never mixed:
+   • Categorical (.pill, set --pill-line/--pill-fill from --cat-*): non-clinical
+     organising colour, fully user-configurable in the config pass.
+   • Clinical RAG (.pill--green/.pill--amber/.pill--red): severity triad.
+     SAFETY: a red pill's FILL is locked to --red-dim with !important, so the
+     forthcoming colour config can only ever change a red pill's BORDER, never
+     neutralise the red fill. Alert salience is a safety property. */
+.pill {
+  --pill-line: var(--border);
+  --pill-fill: var(--bg-mid);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 7px;
+  background: var(--pill-fill);
+  border: 1px solid var(--pill-line);
+  border-radius: var(--r-pill);
+  max-width: 100%;
+  white-space: nowrap;
+}
+.pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--pill-line);
+  flex-shrink: 0;
+}
+.pill-name {
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pill-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+/* Optional secondary datum (e.g. worst wait "25m") — muted, machine voice. */
+.pill-meta {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+/* Clinical RAG variants — dot + border take the triad line, fill takes the wash,
+   count takes the ink. The non-colour severity cue: red = FILLED dot (default),
+   amber = HOLLOW ring dot, so red vs amber is distinguishable by shape alone. */
+.pill--green {
+  --pill-line: var(--green-line);
+  --pill-fill: var(--green-dim);
+}
+.pill--green .pill-dot {
+  background: var(--green);
+}
+.pill--green .pill-count {
+  color: var(--green);
+}
+.pill--amber {
+  --pill-line: var(--amber-line);
+  --pill-fill: var(--amber-dim);
+}
+.pill--amber .pill-dot {
+  background: transparent;
+  border: 1.5px solid var(--amber);
+}
+.pill--amber .pill-count {
+  color: var(--amber);
+}
+.pill--red {
+  --pill-line: var(--red-line);
+  --pill-fill: var(--red-dim) !important; /* red fill is locked — see note above */
+}
+.pill--red .pill-dot {
+  background: var(--red);
+}
+.pill--red .pill-count {
+  color: var(--red);
+}
+
+/* ── Alert roll-up (groups 2+ elevated strips into one bar; see panel.js) ───── */
+.alert-rollup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  min-height: 30px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background var(--med) var(--ease),
+    border-color var(--med) var(--ease);
+}
+.alert-rollup-hidden {
+  display: none;
+}
+.alert-rollup--amber {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.alert-rollup--red {
+  background: var(--red-dim);
+  border-bottom-color: var(--red-line);
+}
+.alert-rollup-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.alert-rollup-count {
+  font-weight: 700;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+/* "as at HH:MM" — anchors the figures to a moment; muted, machine voice. */
+.alert-rollup-stamp {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.alert-rollup-pills {
+  display: flex;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+/* Roll-up pills are the canonical .pill in clinical-RAG mode, sized down a touch
+   to sit in the compact bar. Name + count anatomy carries F1 (a count that
+   reconciles to the expanded detail); the dot shape carries F3 (red filled vs
+   amber ring — severity without relying on hue). */
+.alert-rollup-pills .pill {
+  gap: 5px;
+  padding: 2px 8px 2px 6px;
+}
+/* Slightly larger than the prior 10px so the counts clear the eyesight floor
+   (the one place the type scale was too tight for the technophobe partner). */
+.alert-rollup-pills .pill-name {
+  font-size: 11px;
+}
+.alert-rollup-pills .pill-count {
+  font-size: 11px;
+}
+.alert-rollup-pills .pill-meta {
+  font-size: 10px;
+}
+.alert-rollup-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  flex-shrink: 0;
+  padding: 0;
+}
+.alert-rollup-chev {
+  font-size: 9px;
+}
+
+.wr-strip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  transition:
+    background var(--med) var(--ease),
+    border-color var(--med) var(--ease);
+  /* overflow visible + min-height so wrapped name chips show in full rather than
+     clipping into the "Monitoring →" button (the count must reconcile to the list). */
+  min-height: 28px;
+}
+
+.wr-strip-hidden {
+  display: none;
+}
+
+/* G2 (design-house appraisal 2026-06-21): a resting strip is CALM chrome, not an
+   always-on wash. A green tint that is always present cannot also be a sharp
+   signal, so the below-threshold state rests neutral and only amber/red (a
+   crossed threshold) washes. This RAISES signal contrast; it never dims an
+   alert. */
+.wr-strip-green {
+  background: var(--bg-mid);
+  border-bottom-color: var(--border);
+}
+.wr-strip-amber {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.wr-strip-red {
+  background: var(--red-dim);
+  border-bottom-color: var(--red-line);
+}
+
+.wr-strip-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.wr-strip-count {
+  font-weight: 700;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.05em;
+  color: var(--text-2);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.wr-strip-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.wr-chip {
+  font-size: 10px;
+  font-family: var(--mono);
+  padding: 2px 7px;
+  border-radius: var(--r-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
+.wr-chip-ok {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: var(--green-line);
+}
+.wr-chip-amber {
+  background: var(--amber-dim);
+  color: var(--amber);
+  border-color: var(--amber-line);
+}
+.wr-chip-red {
+  background: var(--red-dim);
+  color: var(--red);
+  border-color: var(--red-line);
+}
+.wr-chip-more {
+  background: var(--bg-mid);
+  color: var(--text-4);
+  border-color: var(--border-hi);
+}
+
+.wr-strip-goto {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-3);
+  background: none;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  transition:
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+  white-space: nowrap;
+}
+.wr-strip-goto:hover {
+  color: var(--text-2);
+  border-color: var(--accent);
+}
+.wr-strip-goto:active {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+/* Monitoring action-count chip on the "Monitoring →" button — the open-patient
+   red/amber Sentinel count, visible from any tab without switching to
+   Monitoring. Amber/red only; never shown for an unavailable snapshot. */
+.wr-strip-goto-count {
+  margin-left: 4px;
+  font-weight: 700;
+}
+.wr-strip-goto-count-amber {
+  color: var(--amber);
+}
+.wr-strip-goto-count-red {
+  color: var(--red);
+}
+
+/* ── Request Monitor strip (v1.3) ────────────────────────────────────────────
+   Same band style as the waiting room strip, with four bucket pills. */
+
+.rm-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 6px 15px;
+  font-size: 13px;
+  flex-shrink: 0;
+  /* G2 (design-house 2026-06-21): rest neutral, not a permanent accent wash —
+     the always-on blue tint made the strip read as a standing alert. The
+     amber/red threshold states (.rm-strip-alerted-*) carry the signal. */
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-mid);
+  border-bottom-color: var(--border);
+  min-height: 35px;
+}
+
+.rm-strip-hidden {
+  display: none;
+}
+
+.rm-strip-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.rm-strip-label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+/* Pill convergence (Vogue map Phase 2): the strip pill adopts the canonical
+   capsule grammar — sans label, mono count — so the same data does not read in
+   two different languages between the strip and the Triage Load card. */
+.rm-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  font-family: var(--sans);
+  font-size: 11px;
+  background: var(--bg-elev);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.rm-pill:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hi);
+}
+.rm-pill:active {
+  background: var(--bg-hover);
+  border-color: var(--accent-line);
+}
+.rm-pill-count {
+  font-family: var(--mono);
+  color: var(--text-1);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  min-width: 15px;
+  text-align: right;
+}
+
+/* Highlight pills with any items — Palette cull (Vogue map Phase 1): "has items"
+   reads from a neutral fill + a weighted count, not a hue. Amber/blue stay
+   reserved for the strip's real capacity alert (.rm-strip-alerted-*) and for
+   clinical signals, not decorative bucket tinting. */
+.rm-pill-active {
+  background: var(--bg-mid);
+  border-color: var(--border-hi);
+}
+.rm-pill-active .rm-pill-count {
+  color: var(--text-1);
+}
+.rm-pill-reply.rm-pill-active {
+  background: var(--bg-mid);
+  border-color: var(--border-hi);
+}
+
+.rm-strip-error {
+  color: var(--red);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+/* Triage capacity alert states */
+.rm-strip-alerted-amber {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+.rm-strip-alerted-red {
+  background: var(--red-dim);
+  border-color: var(--red-line);
+}
+
+/* Popout button active state */
+#popoutBtn.active,
+#zenBtn.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+/* Keep the accent tint on hover of an active toggle (don't fall back to the
+   neutral hover wash, which masks the on-state). */
+#popoutBtn.active:hover,
+#zenBtn.active:hover {
+  color: var(--accent-hover);
+  background: var(--accent-dim);
+}
+
+/* On-state "FOCUS · ESC" pill — the visible, clickable answer to "you are in
+   focus mode and here is how to leave". Reuses the canonical .pill in the
+   ACCENT (non-clinical) colour so it never competes with amber/red strips, and
+   sits in the brand slot (which Zen empties). Hidden unless html[data-zen='1'].
+   Clicking it, or Esc, exits. See shared/zen-mode.js. */
+.zen-pill {
+  display: none;
+  flex-shrink: 0;
+  margin-right: 8px;
+  cursor: pointer;
+  /* R2: a full --accent border (not the faint --accent-line) so the on-state
+     pill reads clearly for tired eyes, especially on the dark nav. */
+  --pill-line: var(--accent);
+  --pill-fill: var(--accent-dim);
+}
+html[data-zen='1'] .zen-pill {
+  display: inline-flex;
+}
+.zen-pill .pill-dot {
+  background: var(--accent);
+}
+.zen-pill .pill-name {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-1);
+}
+.zen-pill .pill-meta {
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.zen-pill:hover {
+  --pill-fill: var(--bg-hover);
+  --pill-line: var(--accent);
+}
+
+/* ── Zen (focus) mode ─────────────────────────────────────────────────────────
+   Visual declutter for focused work in the narrow panel: drop the brand, collapse
+   nav tab labels to icons, tighten chrome and hide CALM demand strips so the active
+   module dominates. Toggled via #zenBtn / Ctrl+. / the command palette; applied as
+   html[data-zen="1"] by shared/display-prefs.js, so it persists and syncs panel↔pop-out.
+
+   CLINICAL SAFETY: only chrome and GREEN/calm decoration is hidden. Amber and red
+   waiting-room, triage and demand strips are never matched by these rules, so a
+   clinical signal can never be hidden by Zen. Keep that invariant if you edit this. */
+html[data-zen='1'] .nav-brand {
+  display: none;
+}
+html[data-zen='1'] .nav-tab {
+  padding: 6px 7px;
+  gap: 0;
+}
+html[data-zen='1'] .nav-tab > span:not(.nav-badge) {
+  display: none;
+}
+/* Icon-only tabs usually fit, so retire the overflow fade/arrows for a calm rail. */
+html[data-zen='1'] .suite-nav::after,
+html[data-zen='1'] .suite-nav::before {
+  opacity: 0;
+}
+html[data-zen='1'] .nav-scroll-indicator {
+  display: none;
+}
+/* Hide calm/green strips only — amber and red are deliberately not selected. */
+html[data-zen='1'] #wrStrip.wr-strip-green {
+  display: none;
+}
+html[data-zen='1'] #rmStrip:not(.rm-strip-alerted-amber):not(.rm-strip-alerted-red) {
+  display: none;
+}
+
+/* ── Submissions demand strip (global) ──────────────────────── */
+
+.sub-rag-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  min-height: 28px;
+  white-space: nowrap;
+}
+
+.sub-rag-strip-hidden {
+  display: none;
+}
+
+.sub-rag-strip--amber {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.sub-rag-strip--red {
+  background: var(--red-dim);
+  border-bottom-color: var(--red-line);
+}
+
+.sub-rag-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.sub-rag-label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.sub-rag-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.sub-rag-pill--amber {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  color: var(--amber);
+}
+.sub-rag-pill--red {
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  color: var(--red);
+}
+
+/* ── Suite health strip (global, Horizon-1 H2) ────────────────────────────────
+   Amber-only self-diagnosis banner: shown when the runtime DOM-contract canary
+   (shared/contract-canary.js) has found >= 1 integration point the suite
+   depends on missing from the live Medicus page. NEVER red — this is the
+   extension flagging its OWN selectors may be stale, not a clinical alert.
+   Same band shape as .wr-strip/.sub-rag-strip; text is allowed to wrap since
+   feature-name lists have no natural width cap. */
+.health-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  transition:
+    background var(--med) var(--ease),
+    border-color var(--med) var(--ease);
+  min-height: 28px;
+}
+.health-strip-hidden {
+  display: none;
+}
+.health-strip-amber {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.health-strip-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+  color: var(--amber);
+}
+.health-strip-text {
+  color: var(--text-2);
+  flex: 1 1 auto;
+  line-height: 1.35;
+}
+.health-strip-goto {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-3);
+  background: none;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  transition:
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+  white-space: nowrap;
+}
+.health-strip-dismiss {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-4);
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 3px 5px;
+  cursor: pointer;
+}
+.health-strip-dismiss:hover {
+  color: var(--text-1);
+  background: var(--amber-dim);
+}
+
+.health-strip-goto:hover {
+  color: var(--text-2);
+  border-color: var(--accent);
+}
+.health-strip-goto:active {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+/* Local bits (practice OS-sync). Ops, not clinical. Hidden unless disk stamp is newer. */
+.local-bits-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  min-height: 28px;
+}
+.local-bits-strip-hidden {
+  display: none;
+}
+.local-bits-strip-ready {
+  background: var(--accent-dim);
+  border-bottom-color: var(--accent);
+}
+.local-bits-strip-text {
+  color: var(--text-2);
+  flex: 1 1 auto;
+  line-height: 1.35;
+}
+.local-bits-strip-reload {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-1);
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* ── Patient Alerts strip (global) ─────────────────────────────
+   Per-patient practice flags (patientAlerts.byPatient) for the patient
+   currently open in Medicus. Same band shape as .sub-rag-strip. */
+
+.pa-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  min-height: 28px;
+  white-space: nowrap;
+}
+.pa-strip-hidden {
+  display: none;
+}
+.pa-strip--amber {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.pa-strip--red {
+  background: var(--red-dim);
+  border-bottom-color: var(--red-line);
+}
+.pa-strip-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.pa-strip--red .pa-strip-icon {
+  color: var(--red);
+}
+.pa-strip--amber .pa-strip-icon {
+  color: var(--amber);
+}
+.pa-strip-label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.pa-strip-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 600;
+  flex-shrink: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pa-strip-pill--red {
+  background: var(--red-dim);
+  border: 1px solid var(--red-line);
+  color: var(--red);
+}
+.pa-strip-pill--amber {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  color: var(--amber);
+}
+.pa-strip-pill--info {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+}
+.pa-strip-more {
+  font-size: 10px;
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+.pa-strip-goto {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 9px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-3);
+  background: none;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pa-strip-goto:hover {
+  color: var(--text-2);
+  border-color: var(--accent);
+}
+
+/* ── Urgent breach-risk strip (global — A2) ───────────────────────────────────
+   Warns when URGENT unactioned requests are ageing towards the same-day
+   contractual cutoff: amber approaching, red past the red threshold. The
+   'unknown' variant is the fail-visible state (priority field unreadable) —
+   amber-toned, since "couldn't tell" is a caution, not a clinical emergency.
+   Same band shape as .sub-rag-strip. */
+.sla-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  min-height: 28px;
+  white-space: nowrap;
+}
+.sla-strip-hidden {
+  display: none;
+}
+.sla-strip--amber,
+.sla-strip--unknown {
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+}
+.sla-strip--red {
+  background: var(--red-dim);
+  border-bottom-color: var(--red-line);
+}
+.sla-strip-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.sla-strip--red .sla-strip-icon {
+  color: var(--red);
+}
+.sla-strip--amber .sla-strip-icon,
+.sla-strip--unknown .sla-strip-icon {
+  color: var(--amber);
+}
+.sla-strip-label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.sla-strip-text {
+  color: var(--text-2);
+  flex: 1 1 auto;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sla-strip-goto {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 9px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-3);
+  background: none;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sla-strip-goto:hover {
+  color: var(--text-2);
+  border-color: var(--accent);
+}
+
+/* ── Medicus UI-change canary strip (global) ──────────────────────────────────
+   Amber banner shown when a patient record is on screen but the extension could
+   extract nothing from it — i.e. Medicus likely changed its layout. NOT a
+   clinical signal: it tells the clinician to verify in Medicus and check for an
+   extension update. Mirrors the sub-rag strip but allows the text to wrap. */
+.ui-health-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 11px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--amber-dim);
+  border-bottom-color: var(--amber-line);
+  min-height: 28px;
+}
+.ui-health-strip-hidden {
+  display: none;
+}
+.ui-health-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+  color: var(--amber);
+}
+.ui-health-text {
+  color: var(--text-2);
+  flex: 1 1 auto;
+  line-height: 1.35;
+}
+.ui-health-btn {
+  flex-shrink: 0;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.ui-health-btn:hover {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: var(--bg-elev);
+}
+.ui-health-btn:active {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: var(--bg-elev);
+  opacity: 0.85;
+}
+.ui-health-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.ui-health-status {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.ui-health-status a {
+  color: var(--accent);
+}
+
+.sub-rag-goto {
+  margin-left: auto;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-4);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  flex-shrink: 0;
+  transition:
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.sub-rag-goto:hover {
+  color: var(--text-2);
+  border-color: var(--border-hi);
+}
+.sub-rag-goto:active {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+/* ── Display preferences ─────────────────────────────────────────────────── */
+
+/* Text size — zoom scales all px dimensions uniformly without touching module CSS */
+html[data-size='small'] {
+  zoom: 0.85;
+}
+html[data-size='medium'] {
+  zoom: 1;
+}
+html[data-size='large'] {
+  zoom: 1.25;
+}
+
+/* Colorblind-friendly palette: swap red→orange, green→blue (whole triads,
+   so components built from ink/wash/line inherit the swap for free) */
+html[data-colorblind='true'] {
+  --red: #ea580c;
+  --red-dim: rgba(234, 88, 12, 0.08);
+  --red-line: rgba(234, 88, 12, 0.3);
+  --green: #2563eb;
+  --green-dim: rgba(37, 99, 235, 0.09);
+  --green-line: rgba(37, 99, 235, 0.3);
+}
+
+/* Colorblind badge overrides (hard-coded rgba fills need explicit override) */
+html[data-colorblind='true'] .sent-chip-red {
+  border-left-color: #ea580c;
+  background: rgba(234, 88, 12, 0.06);
+}
+html[data-colorblind='true'] .sent-chip-green {
+  border-left-color: #2563eb;
+  background: rgba(37, 99, 235, 0.06);
+}
+html[data-colorblind='true'] .sent-badge-red {
+  background: rgba(234, 88, 12, 0.18);
+  color: #ea580c;
+  border-color: rgba(234, 88, 12, 0.3);
+}
+html[data-colorblind='true'] .sent-badge-green {
+  background: rgba(37, 99, 235, 0.12);
+  color: #2563eb;
+  border-color: rgba(37, 99, 235, 0.25);
+}
+html[data-colorblind='true'] .sent-test-red {
+  color: #ea580c !important;
+}
+html[data-colorblind='true'] .sent-test-green {
+  color: #2563eb !important;
+}
+html[data-colorblind='true'] .ampm-am .ampm-num {
+  color: #ea580c;
+}
+html[data-colorblind='true'] .ampm-pm .ampm-num {
+  color: #2563eb;
+}
+
+/* ── Display settings popover (nav-level, all tabs) ─────────────────────── */
+
+.nav-disp-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.dp-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 12px 14px;
+  min-width: 210px;
+  z-index: 9999;
+  box-shadow: var(--shadow-3);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dp-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+  margin-bottom: 1px;
+}
+
+.dp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dp-lbl {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.dp-segs {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 2px;
+}
+
+.dp-seg {
+  background: transparent;
+  border: 1px solid transparent; /* reserved so .active never shifts layout */
+  border-radius: var(--r-sm);
+  padding: 3px 9px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.dp-seg:hover {
+  color: var(--text-2);
+}
+.dp-seg:active {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+.dp-seg.active {
+  background: var(--bg-hover);
+  color: var(--text-1);
+  border-color: var(--border-hi);
+}
+
+/* Toggle switch */
+.dp-toggle {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+.dp-toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.dp-track {
+  width: 32px;
+  height: 18px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  border-radius: 9px;
+  position: relative;
+  transition: background var(--med) var(--ease);
+}
+.dp-toggle input:checked + .dp-track {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.dp-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  background: var(--text-4);
+  border-radius: 50%;
+  transition:
+    transform var(--med) var(--ease),
+    background var(--fast) var(--ease);
+}
+.dp-toggle input:checked + .dp-track .dp-thumb {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+
+/* ── Guided tour (spotlight step-through) ───────────────────────────────────
+   Engine: side-panel/tour/tour.js · steps: side-panel/tour/tour-steps.js.
+   Shell-owned (not module CSS) because the walkthrough runs across tabs and
+   must be styled before any module stylesheet has loaded. The layer blocks
+   interaction; the spotlight cuts a hole in the scrim via an oversized
+   box-shadow so the highlighted element shows through at full brightness. */
+.suite-tour-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  font-family: var(--sans);
+}
+.suite-tour-spot {
+  position: fixed;
+  border-radius: var(--r-md);
+  /* Scrim drawn as the spotlight's shadow — same dark scrim as the modals */
+  box-shadow:
+    0 0 0 9999px var(--scrim),
+    0 0 0 2px var(--accent),
+    0 0 0 5px var(--accent-line);
+  transition:
+    left var(--med) var(--ease),
+    top var(--med) var(--ease),
+    width var(--med) var(--ease),
+    height var(--med) var(--ease);
+  pointer-events: none;
+}
+/* Centred (no-target) steps: no cutout — the layer itself carries the scrim.
+   (A parked/zero-size spotlight can't do it: Chromium culls box-shadow
+   painting for offscreen/zero-area boxes.) */
+.suite-tour-layer.suite-tour-center {
+  background: var(--scrim);
+}
+.suite-tour-center .suite-tour-spot {
+  display: none;
+}
+.suite-tour-card {
+  position: fixed;
+  width: min(300px, calc(100vw - 24px));
+  padding: 12px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  transition:
+    left var(--med) var(--ease),
+    top var(--med) var(--ease);
+}
+.suite-tour-tag {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.suite-tour-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-bottom: 4px;
+}
+.suite-tour-body {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.suite-tour-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
+.suite-tour-progress {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+.suite-tour-btns {
+  display: flex;
+  gap: 4px;
+}
+.suite-tour-btn {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 4px 9px;
+  cursor: pointer;
+  transition:
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.suite-tour-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+.suite-tour-btn:active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.suite-tour-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.suite-tour-next {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-deep);
+}
+.suite-tour-next:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--bg-deep);
+}
+.suite-tour-next:active {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.suite-tour-skip {
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-4);
+  transition: color var(--fast) var(--ease);
+}
+.suite-tour-skip:hover {
+  color: var(--text-2);
+}
+.suite-tour-track {
+  height: 2px;
+  background: var(--bg-mid);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.suite-tour-track-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  width: 0;
+  transition: width var(--med) var(--ease);
+}
+@media (prefers-reduced-motion: reduce) {
+  .suite-tour-spot,
+  .suite-tour-card {
+    transition: none;
+  }
+}
+
+/* ── Command palette (Ctrl+K) ───────────────────────────────────────────────
+   Engine: side-panel/palette/palette.js (shell-owned; panel + pop-out).
+   One keystroke to any tab, display setting, options section or help action. */
+.suite-palette-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 90; /* under the tour (100), over modals (50/51) */
+  background: var(--scrim);
+  font-family: var(--sans);
+}
+.suite-palette {
+  position: absolute;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(420px, calc(100vw - 24px));
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+}
+.suite-palette-inputrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-4);
+}
+.suite-palette-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-1);
+  font-family: var(--sans);
+  font-size: 13px;
+}
+.suite-palette-input::placeholder {
+  color: var(--text-5);
+}
+.suite-palette-kbd {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+.suite-palette-list {
+  max-height: min(46vh, 380px);
+  overflow-y: auto;
+  padding: 4px;
+}
+.suite-palette-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid transparent; /* reserved — selection adds border without layout shift */
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.suite-palette-row.selected {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+.suite-palette-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+.suite-palette-row.selected .suite-palette-icon {
+  color: var(--accent);
+}
+.suite-palette-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.suite-palette-row.selected .suite-palette-label {
+  color: var(--text-1);
+}
+.suite-palette-group {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-5);
+  flex-shrink: 0;
+}
+.suite-palette-empty {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  text-align: center;
+  padding: 24px 0;
+}
+.suite-palette-hints {
+  display: flex;
+  gap: 12px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-4);
+  letter-spacing: 0.04em;
+}
+
+/* ── First-run setup checklist card ─────────────────────────────────────────
+   In-flow card injected above <main id="suiteContent"> by panel.js.
+   No overlay, no fixed positioning — lives naturally in the flex column. */
+
+#setupHost {
+  padding: 8px 10px 0;
+}
+
+#setupHost[style*='display: none'] {
+  padding: 0;
+}
+
+.setup-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  padding: 12px 14px 10px;
+  /* F7: breathing room above so the card's EXPAND/DISMISS controls are not flush
+     under the alert roll-up's DETAILS toggle (mis-click hazard, Practice crit). */
+  margin: 8px 0 2px;
+}
+
+/* Collapsed strip — shown once the practice code is detected so the full
+   multi-step card no longer dominates the module body. Thin, single row.
+   Phase 3 (Vogue map): a transient confirmation must NOT out-rank the live
+   Waiting Room card below it, so the collapsed strip sheds the bright card
+   surface (bg/border/shadow) and rests as a quiet line. */
+.setup-card--collapsed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  margin-bottom: 2px;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.setup-collapsed-icon {
+  flex: none;
+  color: var(--green);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.setup-collapsed-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.setup-card--collapsed .setup-expand,
+.setup-card--collapsed .setup-dismiss {
+  flex: none;
+}
+
+.setup-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.setup-card-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.setup-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setup-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.setup-step--done {
+  background: transparent;
+  border-color: var(--green-line);
+}
+
+.setup-step--disabled {
+  opacity: 0.55;
+}
+
+.setup-step--optional {
+  border-color: var(--border);
+}
+
+.setup-step-icon {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+}
+
+.setup-step-icon--done {
+  color: var(--green);
+}
+
+.setup-step-icon--pending {
+  color: var(--text-4);
+}
+
+.setup-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.setup-step-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.setup-step-detail {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+.setup-step-hint {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-5);
+}
+
+.setup-step-meta {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-step-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.setup-optional-badge,
+.setup-recommended-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 1px 5px;
+}
+
+.setup-result {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-result--ok {
+  color: var(--green);
+}
+
+.setup-result--fail {
+  color: var(--red);
+}
+
+.setup-card-footer {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  margin-top: 10px;
+}
+
+.setup-kbd {
+  font-family: var(--mono);
+  font-size: 9px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  padding: 1px 4px;
+  color: var(--text-3);
+}
+
+.setup-card-progress {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+/* Reassures the cautious/technophobe user that the suite already works and the
+   remaining steps are optional, rather than reading the checklist as "broken". */
+.setup-card-reassure {
+  margin: 0 0 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.setup-link {
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-line);
+  transition: color var(--fast) var(--ease);
+}
+
+.setup-link:hover {
+  color: var(--accent-hover);
+}
+
+.setup-code-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm);
+  padding: 1px 6px;
+  letter-spacing: 0.06em;
+}
+
+/* ── "Set up now" CTA used in no-practice-code error states ─────────────────
+   Rendered by slots, capacity, activity, condor when no practice code is set.
+   Dispatches suite:open-setup so the setup card opens (panel); falls back to
+   options.html#sect-suite in the pop-out (which has no setup card). */
+.setup-now-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+/* ── Quiet mode pill ─────────────────────────────────────────────────────── */
+.quiet-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--amber-dim);
+  color: var(--amber);
+  border: 1px solid var(--amber-line);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity var(--fast) var(--ease);
+}
+.quiet-pill:hover {
+  background: var(--amber);
+  color: var(--bg-elev);
+}
+.quiet-pill-hidden {
+  display: none;
+}
+
+/* ── Tab visibility (suite.hiddenTabs) ──────────────────────────────────────
+   Hidden tabs leave the nav but remain reachable via the Ctrl+K palette. */
+.nav-tab-hidden {
+  display: none !important;
+}
+
+/* ── Tab chooser ("Choose your tabs") ───────────────────────────────────────
+   Engine: side-panel/tabs-chooser/tabs-chooser.js · data: tab-catalog.js. */
+.suite-tabs-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 92; /* over the palette, under the tour */
+  background: var(--scrim);
+  font-family: var(--sans);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 28px 12px;
+}
+.suite-tabs-sheet {
+  width: min(440px, 100%);
+  max-height: calc(100vh - 56px);
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  padding: 14px;
+}
+.suite-tabs-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.suite-tabs-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.suite-tabs-sub {
+  font-size: 11px;
+  color: var(--text-4);
+  margin-top: 2px;
+  line-height: 1.45;
+}
+.suite-tabs-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  padding: 3px 9px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.suite-tabs-presets {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 12px;
+}
+.suite-tabs-presets-label {
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-4);
+  margin-right: 2px;
+}
+.suite-tabs-preset {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-pill);
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition:
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    background var(--fast) var(--ease);
+}
+.suite-tabs-preset:hover {
+  border-color: var(--accent);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+.suite-tabs-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.suite-tabs-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 8px 9px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition:
+    border-color var(--fast) var(--ease),
+    background var(--fast) var(--ease),
+    opacity var(--fast) var(--ease);
+  opacity: 0.62;
+}
+.suite-tabs-card:hover {
+  border-color: var(--border-hi);
+  opacity: 0.85;
+}
+.suite-tabs-card.on {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  opacity: 1;
+}
+.suite-tabs-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.suite-tabs-card-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-5);
+  flex-shrink: 0;
+}
+.suite-tabs-card.on .suite-tabs-card-icon {
+  color: var(--accent);
+}
+.suite-tabs-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.suite-tabs-card.on .suite-tabs-card-name {
+  color: var(--text-1);
+}
+.suite-tabs-card-state {
+  font-size: 11px;
+  color: var(--accent);
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
+}
+.suite-tabs-card-blurb {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-4);
+}
+.suite-tabs-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+}
+.suite-tabs-hint {
+  font-size: 10px;
+  color: var(--text-4);
+  line-height: 1.4;
+  transition: color var(--fast) var(--ease);
+}
+.suite-tabs-hint.flash {
+  color: var(--amber);
+  font-weight: 600;
+}
+.suite-tabs-hint.flash.ok {
+  color: var(--green);
+}
+.suite-tabs-done {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-md);
+  color: var(--bg-deep);
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 6px 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--fast) var(--ease);
+}
+.suite-tabs-done:hover {
+  background: var(--accent-hover);
+}
+
+/* ── Alert-threshold editor (reuses the suite-tabs-* sheet scaffolding) ──────── */
+.thresh-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.thresh-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.thresh-section-name {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.thresh-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.thresh-enable input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.thresh-fields {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.thresh-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.thresh-field--amber > span:first-child {
+  color: var(--amber);
+}
+.thresh-field--red > span:first-child {
+  color: var(--red);
+}
+.thresh-field input[type='number'] {
+  width: 56px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-1);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  padding: 4px 6px;
+  text-align: center;
+}
+.thresh-field input[type='number']:focus-visible {
+  border-color: var(--accent);
+  background: var(--bg-elev);
+}
+.thresh-unit {
+  color: var(--text-4);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.thresh-link {
+  display: inline-block;
+  margin-top: 14px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  text-decoration: none;
+}
+.thresh-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+/* Disabled (alert-off) strip: dim the fields but keep the head + note legible, so
+   a muted strip is never silent AND invisible. */
+.thresh-section--off .thresh-fields,
+.thresh-section--off .thresh-section-foot {
+  opacity: 0.45;
+}
+.thresh-off-note {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--amber);
+  margin: 0 0 6px;
+}
+.thresh-always {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--green);
+}
+.thresh-section-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.thresh-default {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+.thresh-reset {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 0;
+}
+.thresh-reset:hover {
+  color: var(--accent);
+}
+
+/* ── Legibility floor for load-bearing micro-labels ──────────────────────────
+   Synthetic usability finding: a tired technophobe reader misread the tiny
+   (8–9px) uppercase, widely letter-spaced micro-labels (e.g. "DEMAND" read as
+   "DERRAND", "OPTIONAL" unreadable). The house type scale is right everywhere
+   else; this is the one place it sits below the eyesight floor. We tighten the
+   tracking on JUST these small uppercased labels so the letters stop dissolving
+   into one another. Colour contrast is handled separately via the lifted
+   --text-4 / --text-5 tokens above. Conservative + token-level: no component is
+   restyled, only the tracking on these specific labels. */
+.setup-step-label,
+.setup-step-hint,
+.setup-step-meta,
+.setup-optional-badge,
+.setup-recommended-badge,
+.setup-card-footer,
+.setup-card-progress,
+.setup-link,
+.rm-strip-label,
+.sub-rag-label {
+  letter-spacing: 0.01em;
+}
+
+/* ── Per-tab help popover ────────────────────────────────────────────────────
+   A persistent "?" control in the nav opens a plain-English two-line summary of
+   the CURRENTLY ACTIVE tab: what it is, and what to do first. Reference aid only
+   — not clinical decision support. Modelled on the display popover. */
+.nav-help-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+/* "All tabs" menu — lists every tab by full name so any is reachable in one
+   click at the narrow panel width (appraisal G1). Mirrors the help popover. */
+.nav-alltabs-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.alltabs-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 8px;
+  width: 236px;
+  max-width: 78vw;
+  max-height: 72vh;
+  overflow-y: auto;
+  z-index: 9999;
+  box-shadow: var(--shadow-3);
+}
+.alltabs-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 2px 6px 8px;
+}
+.alltabs-list {
+  display: flex;
+  flex-direction: column;
+}
+.alltabs-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.alltabs-group + .alltabs-group {
+  margin-top: 2px;
+}
+.alltabs-section {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 10px 6px 4px;
+}
+.alltabs-group:first-child > .alltabs-section {
+  padding-top: 2px;
+}
+.alltabs-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  color: var(--text-2);
+  text-align: left;
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.alltabs-item:hover {
+  background: var(--bg-hover);
+}
+.alltabs-item.active {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+.alltabs-item-icon {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.alltabs-item.active .alltabs-item-icon {
+  color: var(--accent);
+}
+.alltabs-item-label {
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.alltabs-hint {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-4);
+  margin-top: 6px;
+  padding: 6px 6px 2px;
+  border-top: 1px solid var(--border);
+}
+
+.help-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 12px 14px;
+  width: 250px;
+  max-width: 78vw;
+  z-index: 9999;
+  box-shadow: var(--shadow-3);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.help-popover-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.help-popover-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.help-popover-lbl {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+
+.help-popover-text {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+/* ── Keyboard-shortcuts section appended to every help popover ──────────────
+   side-panel/panel.js buildKeyboardHelpSectionHTML(). Kbd token styled like
+   .suite-palette-kbd so the two shortcut surfaces read as one system. */
+.help-popover-kbd-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.help-popover-kbd-list > span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.help-popover-kbd {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+
+/* ── "g" chord transient indicator ───────────────────────────────────────────
+   side-panel/panel.js wireKeyboardNav()/showGChordIndicator(). Emulates the
+   popover shell (bg-elev/border-hi/shadow-3) + kbd token above rather than a
+   new visual language; fades in/out, never steals focus (pointer-events: none). */
+.kbdnav-chord-indicator {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity var(--fast) var(--ease),
+    transform var(--fast) var(--ease);
+}
+.kbdnav-chord-indicator-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.kbdnav-chord-indicator kbd {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+
+/* ── Quick Leaflet popover (panel shell — see quick-leaflet/quick-leaflet.js) ─ */
+
+.ql-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(300px, calc(100vw - 24px));
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 10px;
+  z-index: 9999;
+  box-shadow: var(--shadow-3);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ql-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  outline: none;
+}
+.ql-input:focus {
+  border-color: var(--accent-line);
+}
+
+.ql-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.ql-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border-radius: var(--r-md);
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.ql-row:hover,
+.ql-row--active {
+  background: var(--accent-dim);
+  color: var(--text-1);
+}
+
+.ql-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ql-kind,
+.ql-recent {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 4px;
+}
+
+.ql-copy {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text-4);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 1px 4px;
+  border-radius: var(--r-sm);
+}
+.ql-copy:hover {
+  color: var(--text-1);
+  background: var(--bg);
+}
+
+.ql-row--fallback {
+  border-top: 1px dashed var(--border);
+  margin-top: 3px;
+  padding-top: 7px;
+}
+
+.ql-hint {
+  padding: 8px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-4);
+}
+
+.ql-foot {
+  border-top: 1px solid var(--border);
+  padding-top: 7px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ql-open-tab {
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: var(--r-sm);
+}
+.ql-open-tab:hover {
+  background: var(--accent-dim);
+}

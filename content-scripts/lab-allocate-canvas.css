@@ -1,0 +1,2924 @@
+/* Lab + workflow + Rx + request allocation canvases. Injected surfaces:
+   #ms-lac-overlay, #ms-wac-overlay, #ms-rxac-overlay and #ms-qac-overlay
+   carry their own token block (panel.css :root is not available on Medicus
+   pages) — values mirror the canon light column in
+   .claude/skills/ui-design/TOKENS.md. */
+#ms-qac-launch-wrap,
+#ms-rxac-launch-wrap {
+  position: fixed;
+  top: 12px;
+  z-index: 2147482990;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#ms-qac-launch-wrap {
+  right: 16px;
+}
+
+/* Sit left of Medicus's own Sign control on prescription task-lists. */
+#ms-rxac-launch-wrap {
+  right: 180px;
+}
+
+#ms-qac-inbox-n {
+  padding: 6px 12px;
+  font:
+    650 13px/1.2 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  color: #0f172a;
+  background: #fff;
+  border: 1px solid #94a3b8;
+  border-radius: 999px;
+}
+
+#ms-qac-launch-wrap #ms-qac-launch,
+#ms-rxac-launch-wrap #ms-rxac-launch,
+#ms-rxac-launch-wrap #ms-rx-od-btn {
+  position: static;
+  top: auto;
+  right: auto;
+  z-index: auto;
+}
+
+#ms-rx-od-btn {
+  padding: 6px 12px;
+  font:
+    600 12px/1.2 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  color: #1e3a5f;
+  background: #fff;
+  border: 1px solid #94a3b8;
+  border-radius: 999px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+  cursor: pointer;
+}
+
+#ms-rx-od-btn:hover {
+  border-color: #2563eb;
+  background: #eff4fd;
+}
+
+#ms-rx-od-btn:disabled {
+  cursor: progress;
+  opacity: 0.85;
+}
+
+#ms-rx-od-btn:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.ms-rx-od {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.ms-rx-od-inline {
+  margin-left: 6px;
+}
+
+.ms-rx-od-btn {
+  padding: 1px 7px;
+  border-radius: 10px;
+  font:
+    500 10.5px/1.4 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  border: 1px solid rgba(184, 38, 46, 0.25);
+  background: #fbe6e7;
+  color: #b8262e;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-rx-od-btn:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+}
+
+#ms-rx-od-pop {
+  position: absolute;
+  z-index: 2147483000;
+  max-width: 320px;
+  padding: 10px 12px;
+  background: #fff;
+  color: #0f172a;
+  border: 1px solid #94a3b8;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+  font:
+    400 12px/1.4 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+}
+
+.ms-rx-od-pop-h {
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+
+.ms-rx-od-pop-list {
+  margin: 0 0 8px;
+  padding-left: 16px;
+}
+
+.ms-rx-od-pop-note {
+  margin: 0;
+  color: #475569;
+  font-size: 11px;
+}
+
+#ms-lac-launch,
+#ms-wac-launch,
+#ms-rxac-launch,
+#ms-qac-launch {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 2147482990;
+  padding: 6px 12px;
+  font:
+    600 12px/1.2 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  color: #1e3a5f;
+  background: #fff;
+  border: 1px solid #94a3b8;
+  border-radius: 999px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+  cursor: pointer;
+}
+
+#ms-lac-launch:hover,
+#ms-wac-launch:hover,
+#ms-rxac-launch:hover,
+#ms-qac-launch:hover {
+  border-color: #2563eb;
+  background: #eff4fd;
+}
+
+/* The launcher is appended to <html>, NOT inside #ms-lac-overlay, so the
+   token block below is not an ancestor of it — var(--accent) would resolve
+   to nothing and invalidate the whole `outline` shorthand, leaving the
+   button with no keyboard focus ring. Literal value, same colour. */
+#ms-lac-launch:focus-visible,
+#ms-wac-launch:focus-visible,
+#ms-rxac-launch:focus-visible,
+#ms-qac-launch:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+#ms-lac-overlay,
+#ms-wac-overlay,
+#ms-rxac-overlay,
+#ms-qac-overlay {
+  --bg-deep: #f8fafc;
+  --bg-mid: #f1f5f9;
+  --bg-elev: #ffffff;
+  --bg-hover: #e2eaf5;
+  --border: #cbd5e1;
+  --border-hi: #94a3b8;
+  --text-1: #0f172a;
+  --text-2: #1e3a5f;
+  --text-3: #475569;
+  --text-4: #556377;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-dim: rgba(37, 99, 235, 0.09);
+  --accent-line: rgba(37, 99, 235, 0.35);
+  --red: #dc2626;
+  --amber: #b45309;
+  --amber-dim: rgba(180, 83, 9, 0.09);
+  --amber-line: rgba(180, 83, 9, 0.32);
+  --green: #16a34a;
+  --green-dim: rgba(22, 163, 74, 0.09);
+  --green-line: rgba(22, 163, 74, 0.3);
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-pill: 999px;
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-2: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.14);
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --med: 200ms;
+  --text-5: #5f6f85;
+  --red-dim: rgba(220, 38, 38, 0.08);
+  --red-line: rgba(220, 38, 38, 0.3);
+  --chip-on-bg: #eff4fd;
+  --chip-on-text: #1e3a5f;
+  --chip-on-border: #2563eb;
+  --ms-lac-footer-space: 128px;
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.ms-lac-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.ms-lac-shell {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.ms-lac-panel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-elev);
+  border-radius: var(--r-lg);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.28);
+  color: var(--text-1);
+  overflow: hidden;
+}
+
+.ms-lac-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  padding: 14px 18px 0;
+  background: var(--bg-mid);
+  flex: 0 0 auto;
+}
+
+.ms-lac-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.ms-lac-header-counts {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.ms-lac-header-note {
+  flex: 1 1 100%;
+  order: 20;
+  margin: 0 -18px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-deep);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* Who-ordered enrich: full-width banner. The old #ms-lac-progress hint
+   sat in the header at 11px --text-4 and was easy to miss. */
+#ms-lac-overlay .ms-lac-reorg[hidden] {
+  display: none !important;
+}
+
+#ms-lac-overlay .ms-lac-reorg {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 14px 18px 16px;
+  background: var(--accent-dim);
+  border-bottom: 2px solid var(--accent-line);
+  color: var(--text-1);
+}
+
+#ms-lac-overlay .ms-lac-reorg-stage {
+  position: relative;
+  flex: 0 0 168px;
+  height: 56px;
+}
+
+#ms-lac-overlay .ms-lac-reorg-card,
+#ms-lac-overlay .ms-lac-reorg-pile {
+  position: absolute;
+  left: 0;
+  top: 10px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-hi);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-1);
+  color: var(--text-2);
+}
+
+#ms-lac-overlay .ms-lac-reorg-card:nth-child(1) {
+  top: 4px;
+  left: 0;
+  animation: ms-lac-reorg-deal 1.6s var(--ease) infinite;
+}
+#ms-lac-overlay .ms-lac-reorg-card:nth-child(2) {
+  top: 12px;
+  left: 8px;
+  animation: ms-lac-reorg-deal 1.6s var(--ease) 0.2s infinite;
+}
+#ms-lac-overlay .ms-lac-reorg-card:nth-child(3) {
+  top: 20px;
+  left: 16px;
+  animation: ms-lac-reorg-deal 1.6s var(--ease) 0.4s infinite;
+}
+
+#ms-lac-overlay .ms-lac-reorg-arrow {
+  position: absolute;
+  left: 78px;
+  top: 18px;
+  font-size: 16px;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+#ms-lac-overlay .ms-lac-reorg-pile {
+  left: 100px;
+  top: 12px;
+  background: var(--chip-on-bg);
+  border-color: var(--chip-on-border);
+  color: var(--chip-on-text);
+}
+
+#ms-lac-overlay .ms-lac-reorg-copy {
+  flex: 1 1 240px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#ms-lac-overlay .ms-lac-reorg-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text-1);
+}
+
+#ms-lac-overlay .ms-lac-reorg-sub {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+#ms-lac-overlay .ms-lac-reorg-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+#ms-lac-overlay .ms-lac-reorg-meter {
+  height: 8px;
+  margin-top: 6px;
+  background: var(--bg-elev);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+
+#ms-lac-overlay .ms-lac-reorg-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width var(--med) var(--ease);
+}
+
+#ms-lac-overlay .ms-lac-reorg-settled {
+  background: var(--green-dim);
+  border-bottom-color: var(--green-line);
+}
+
+#ms-lac-overlay .ms-lac-reorg-settled .ms-lac-reorg-fill {
+  background: var(--green);
+}
+
+#ms-lac-overlay .ms-lac-reorg-settled .ms-lac-reorg-card {
+  animation: none;
+}
+
+#ms-lac-overlay .ms-lac-panel-reorg .ms-lac-board {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+@keyframes ms-lac-reorg-deal {
+  0%,
+  100% {
+    transform: translate(0, 0);
+    opacity: 1;
+  }
+  45% {
+    transform: translate(88px, 4px);
+    opacity: 0.35;
+  }
+}
+
+.ms-lac-close,
+.ms-lac-ghost {
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-pill);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.ms-lac-close {
+  margin-left: auto;
+}
+
+.ms-lac-close:hover,
+.ms-lac-ghost:hover:not(:disabled) {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.ms-lac-close:active,
+.ms-lac-ghost:active:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.ms-lac-close:focus-visible,
+.ms-lac-ghost:focus-visible,
+.ms-lac-confirm-btn:focus-visible,
+#ms-lac-add-name:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ms-lac-ghost:disabled,
+.ms-lac-confirm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Selection bar — the visible next step after a group click. */
+.ms-lac-selectbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 18px;
+  border-bottom: 1px solid var(--accent-line);
+  background: var(--accent-dim);
+  flex: 0 0 auto;
+}
+
+.ms-lac-selectbar-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.ms-lac-selectbar-label {
+  font-size: 12px;
+  color: var(--text-2);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-lac-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  overflow: auto;
+}
+
+.ms-lac-board {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  padding: 12px 18px;
+}
+
+.ms-lac-workspace {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  gap: 12px;
+}
+
+.ms-lac-col {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: auto;
+}
+
+/* Inbox well — a pile, not a stack of person cards. */
+.ms-lac-pool {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 8px 8px;
+  background: var(--bg-mid);
+  border: 1px dashed var(--border-hi);
+}
+
+.ms-lac-pool-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 8px 8px;
+  margin: 0 -8px;
+  background: var(--bg-mid);
+  border-bottom: 1px dashed var(--border-hi);
+}
+
+.ms-lac-pool-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ms-lac-pool-eyebrow {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+
+.ms-lac-pool-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ms-lac-pool-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ms-lac-rail {
+  flex: 0 0 280px;
+  min-width: 232px;
+  max-width: 320px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.ms-lac-rail-head {
+  margin-bottom: 8px;
+}
+
+.ms-lac-col-heading {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin: 0;
+}
+
+.ms-lac-col-meta {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+/* Clinician fields — compact person cards, not a second inbox list. */
+.ms-lac-chip-wrap,
+.ms-lac-field {
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-1);
+  transition:
+    border-color 150ms var(--ease),
+    background 150ms var(--ease);
+}
+
+.ms-lac-field-has {
+  border-style: solid;
+}
+
+.ms-lac-field-expand {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+
+#ms-rxac-overlay .ms-lac-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+
+#ms-rxac-overlay .ms-lac-chip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#ms-rxac-overlay button.ms-lac-field-expand {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+#ms-rxac-overlay button.ms-lac-field-expand:hover,
+#ms-rxac-overlay button.ms-lac-field-expand:focus-visible {
+  background: var(--accent-dim);
+}
+
+#ms-rxac-overlay .ms-lac-chip-drawer {
+  flex: 1 1 100%;
+}
+
+.ms-lac-chip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text-1);
+  transition: background 150ms var(--ease);
+}
+
+.ms-lac-chip:hover,
+.ms-lac-chip:focus-visible {
+  background: var(--accent-dim);
+}
+
+.ms-lac-chip:active {
+  background: var(--bg-hover);
+}
+
+.ms-lac-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.ms-lac-chip-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ms-lac-chip-count {
+  flex-basis: 100%;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  color: var(--text-4);
+}
+
+.ms-lac-chip-flag {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+
+.ms-lac-chip-flag-in {
+  color: var(--green);
+  background: var(--green-dim);
+  border-color: var(--green-line);
+}
+
+.ms-lac-chip-flag-team {
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border-color: var(--border);
+}
+
+.ms-lac-rail-teams {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-hi);
+}
+
+.ms-lac-chip-stagehint {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.ms-lac-chip-away {
+  border-color: var(--amber-line);
+  background: var(--amber-dim);
+}
+
+.ms-lac-chip-away .ms-lac-chip-name {
+  color: var(--text-4);
+}
+
+.ms-lac-chip-in {
+  border-color: var(--green-line);
+}
+
+.ms-lac-chip-open {
+  border-style: solid;
+  border-color: var(--accent-line);
+}
+
+.ms-lac-chip-target {
+  border-style: dashed;
+  border-color: var(--accent-line);
+}
+
+.ms-lac-chip-drawer {
+  padding: 0 8px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.ms-lac-col-absence,
+.ms-lac-col-in {
+  font-size: 11px;
+  line-height: 1.4;
+  border-radius: var(--r-sm);
+  padding: 6px 7px;
+  margin: 8px 0;
+}
+
+.ms-lac-col-absence {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+}
+
+.ms-lac-col-in {
+  color: var(--green);
+  background: var(--green-dim);
+  border: 1px solid var(--green-line);
+}
+
+.ms-lac-add-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+#ms-lac-add-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 5px 8px;
+  color: var(--text-1);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+#ms-lac-add-name:focus {
+  border-color: var(--accent);
+}
+
+/* Requester groups — list sections inside the inbox well, not person cards. */
+.ms-lac-group {
+  margin-top: 2px;
+}
+
+.ms-lac-group-head {
+  position: sticky;
+  top: 54px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px 6px;
+  background: var(--bg-mid);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  cursor: grab;
+  transition: background 150ms var(--ease);
+}
+
+.ms-lac-group-head:hover {
+  background: var(--accent-dim);
+}
+
+.ms-lac-group-head:active {
+  cursor: grabbing;
+}
+
+.ms-lac-group-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.ms-lac-group-grip {
+  color: var(--border-hi);
+  font-size: 11px;
+}
+
+.ms-lac-group-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ms-lac-group-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ms-lac-group-pick {
+  margin-left: auto;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  background: transparent;
+  font-family: inherit;
+  font-size: 10.5px;
+  color: var(--text-4);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ms-lac-group-pick:hover,
+.ms-lac-group-pick:focus-visible {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.ms-lac-group-pick:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ms-lac-group-picked {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.ms-lac-group-on > .ms-lac-group-head {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.ms-lac-group-some > .ms-lac-group-head {
+  box-shadow: inset 3px 0 0 var(--accent-line);
+}
+
+.ms-lac-field-select {
+  display: block;
+  margin: 8px 0 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: transparent;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.ms-lac-field-select:hover,
+.ms-lac-field-select:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.ms-lac-field-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ms-lac-group-toggle {
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.ms-lac-group-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* One-line rows: the pile must read at 73 results. */
+.ms-lac-tile {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px 4px 4px;
+  border-bottom: 1px solid var(--bg-mid);
+  cursor: grab;
+  transition: background 120ms var(--ease);
+}
+
+.ms-lac-tile:hover {
+  background: var(--bg-mid);
+}
+
+.ms-lac-tile:active {
+  cursor: grabbing;
+}
+
+.ms-lac-tile:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.ms-lac-tile-check {
+  flex: 0 0 18px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--accent);
+  text-align: center;
+  cursor: pointer;
+}
+
+.ms-lac-tile-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-lac-tile-test {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.ms-lac-tile-token {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+/* "Med review overdue" (rxOverdueMedReviewBadgeHtml) — a genuine clinical
+   flag, not routing metadata like the other tokens, so it gets the same
+   amber treatment as every other overdue/warning signal in this file
+   rather than the neutral default. */
+.ms-lac-tile-token-warn {
+  color: var(--amber);
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+  font-weight: 600;
+}
+
+.ms-lac-tile-who {
+  flex-basis: 100%;
+  font-size: 10.5px;
+  color: var(--text-3);
+  padding-left: 22px;
+}
+
+/* Prescription-request-specific: requested-item counts + overdue-reauth
+   summary (rx-allocate-canvas.js's rxMonitoringLineHtml). Lab/workflow/
+   request canvases have no repeats/acute/batches concept, so this is
+   scoped to the rx overlay only rather than joining .ms-lac-tile-who.
+   Deliberately NOT flex:0 0 100% (that forces its own line, per a colleague's
+   correction 2026-09-10) — a normal flex item on .ms-lac-tile's own
+   flex-wrap:wrap row, so it sits on the same line as name/status/tokens
+   when there's room and only wraps if there genuinely isn't. */
+#ms-rxac-overlay .ms-lac-tile-monitoring {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: normal;
+}
+
+/* Complexity 1-5 badge (rxComplexityBadgeHtml) — green (least complex) to
+   amber (most complex), a colleague's request 2026-09-10. Solid background (not
+   the usual --X-dim wash) since this needs to read at a glance as a
+   colour-coded signal, not a subtle tint. 5-step linear interpolation
+   between --green (#16a34a) and --amber (#b45309) in RGB space. */
+#ms-rxac-overlay .ms-lac-tile-complexity {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+}
+
+#ms-rxac-overlay .ms-lac-tile-complexity-1 {
+  background: #16a34a;
+}
+
+#ms-rxac-overlay .ms-lac-tile-complexity-2 {
+  background: #3e8f3a;
+}
+
+#ms-rxac-overlay .ms-lac-tile-complexity-3 {
+  background: #657b2a;
+}
+
+#ms-rxac-overlay .ms-lac-tile-complexity-4 {
+  background: #8d6719;
+}
+
+#ms-rxac-overlay .ms-lac-tile-complexity-5 {
+  background: #b45309;
+}
+
+.ms-lac-tile-picked {
+  background: var(--accent-dim);
+  border-bottom-color: var(--accent-line);
+}
+
+.ms-lac-tile-picked:hover {
+  background: var(--accent-dim);
+}
+
+.ms-lac-tile-staged .ms-lac-tile-name {
+  color: var(--text-4);
+}
+
+.ms-lac-drop-hover {
+  border-color: var(--accent) !important;
+  background: var(--accent-dim);
+}
+
+/* Lifting a clinician block from Unallocated: dim the rest of the pile
+   and mark the payload. The well itself is not a drop target for that
+   gesture, so it must not wash the whole list. */
+.ms-lac-lifting .ms-lac-group:not(.ms-lac-group-lift):not(.ms-lac-group-lift-partial),
+.ms-lac-lifting .ms-lac-pool-head {
+  opacity: 0.4;
+}
+
+.ms-lac-group-lift > .ms-lac-group-head {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.ms-lac-tile.ms-lac-drag-source {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+  opacity: 1;
+}
+
+/* Drag ghost is appended to document.body — outside the token scope, so
+   literal values (same colours as the canon). */
+.ms-lac-drag-ghost {
+  position: fixed;
+  top: -200px;
+  left: -200px;
+  padding: 6px 12px;
+  font:
+    600 12px/1.2 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  color: #fff;
+  background: #1e3a5f;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.3);
+  pointer-events: none;
+  z-index: 2147483646;
+  max-width: 320px;
+}
+
+.ms-lac-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 48px 24px;
+  color: var(--text-4);
+  text-align: center;
+}
+
+.ms-lac-empty svg {
+  color: var(--text-4);
+}
+
+.ms-lac-empty-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ms-lac-empty-sub {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+.ms-lac-empty-sm {
+  font-size: 11px;
+  color: var(--text-4);
+  padding: 8px 4px;
+}
+
+.ms-lac-msg {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 24px;
+}
+
+.ms-lac-hint {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+.ms-lac-confirmbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-mid);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+  flex: 0 0 auto;
+}
+
+.ms-lac-confirmbar-note {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.ms-lac-confirmbar-error {
+  background: var(--amber-dim);
+  border-top-color: var(--amber-line);
+  color: var(--amber);
+}
+
+.ms-lac-confirmbar-warn {
+  background: var(--amber-dim);
+  border-top-color: var(--amber-line);
+  color: var(--text-1);
+}
+
+.ms-lac-confirmbar-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+}
+
+.ms-lac-writelist {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  max-height: 160px;
+  overflow: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-lac-panel-writing .ms-lac-body,
+.ms-lac-panel-writing .ms-lac-close {
+  pointer-events: none;
+}
+
+.ms-lac-confirm-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.ms-lac-confirm-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.ms-lac-confirm-btn.ms-lac-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-deep);
+}
+
+.ms-lac-confirm-btn.ms-lac-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.ms-lac-split {
+  margin: 8px 10px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+}
+
+.ms-lac-split-title {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-1);
+}
+
+.ms-lac-split-day {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+
+.ms-lac-split-day-label {
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--text-3);
+}
+
+.ms-lac-split-day input[type='date'] {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-deep);
+}
+
+.ms-lac-split-day-on {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+#ms-lac-overlay .ms-lac-nwd-offer {
+  margin: 0 18px 10px;
+  padding: 12px 14px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-1);
+}
+
+#ms-lac-overlay .ms-lac-nwd-offer strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+#ms-lac-overlay .ms-lac-send-not-in {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+#ms-lac-overlay .ms-lac-send-not-in input {
+  margin-top: 3px;
+}
+
+#ms-lac-overlay .ms-lac-nwd-offer .ms-lac-confirm-btn {
+  margin-top: 10px;
+}
+
+/* Rx usual-GP send is another distribute path, not a featured CTA.
+   Preview is supporting copy; the button sits with Split / Top up /
+   Distribute equally at the quieter (non-primary) weight. */
+#ms-rxac-overlay .ms-lac-nwd-offer {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+#ms-rxac-overlay .ms-lac-nwd-offer strong {
+  display: inline;
+  margin: 0;
+  font-size: inherit;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+#ms-rxac-overlay .ms-lac-send-not-in {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 0 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+#ms-rxac-overlay .ms-lac-send-not-in input {
+  margin-top: 2px;
+}
+
+#ms-rxac-overlay .ms-rxac-send-group {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+#ms-lac-overlay .ms-lac-daybar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+#ms-lac-overlay .ms-lac-daybar .ms-lac-split-day {
+  margin: 0;
+}
+
+#ms-lac-overlay .ms-lac-daybar-summary {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-3);
+}
+
+#ms-lac-overlay #ms-lac-day {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-deep);
+}
+
+#ms-lac-overlay #ms-lac-day:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ms-lac-split-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.ms-lac-split-list {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.ms-lac-split-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--border);
+}
+
+.ms-lac-split-list li:last-child {
+  border-bottom: 0;
+}
+
+.ms-lac-split-name {
+  color: var(--text-2);
+}
+
+.ms-lac-split-count {
+  font-weight: 650;
+  color: var(--text-1);
+}
+
+.ms-lac-split .ms-lac-confirm-btn {
+  width: 100%;
+}
+
+#ms-rxac-overlay .ms-lac-board {
+  flex-direction: column;
+  gap: 10px;
+}
+
+#ms-rxac-overlay .ms-lac-split {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin: 0;
+  max-height: none;
+  padding: 10px 12px;
+  pointer-events: auto;
+}
+
+#ms-rxac-overlay .ms-rxac-split-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+#ms-rxac-overlay .ms-rxac-split-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-left: auto;
+}
+
+#ms-rxac-overlay .ms-rxac-split-actions .ms-rxac-split-go {
+  margin-left: 0;
+}
+
+#ms-rxac-overlay .ms-lac-split .ms-lac-confirm-btn,
+#ms-rxac-overlay .ms-lac-split .ms-lac-ghost {
+  width: auto;
+}
+
+#ms-rxac-overlay .ms-lac-split-summary {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-3);
+  flex: 1 1 auto;
+  margin-left: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-split-go,
+#ms-rxac-overlay .ms-rxac-action {
+  margin-left: 0;
+  padding: 10px 18px;
+  min-height: 40px;
+  font-size: 13px;
+  font-weight: 650;
+  border-radius: var(--r-md);
+  width: auto;
+}
+
+#ms-rxac-overlay .ms-rxac-split-go {
+  margin-left: auto;
+  padding: 10px 22px;
+  font-size: 14px;
+}
+
+#ms-rxac-overlay .ms-rxac-dests {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  line-height: 1.35;
+}
+
+#ms-rxac-overlay #ms-rxac-add-team {
+  min-width: 180px;
+  max-width: 240px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+}
+
+#ms-rxac-overlay .ms-rxac-split-proposing {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+#ms-rxac-overlay .ms-rxac-proposal {
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  border: 1px solid var(--accent-line);
+  color: var(--text-1);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+#ms-rxac-overlay .ms-rxac-proposal strong {
+  font-weight: 650;
+}
+
+#ms-rxac-overlay .ms-rxac-drag-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+#ms-rxac-overlay #ms-rxac-add-team:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-rxac-overlay #ms-rxac-day {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-deep);
+}
+
+#ms-rxac-overlay #ms-rxac-day:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-rxac-overlay .ms-lac-primary {
+  background: var(--accent);
+  color: var(--bg-deep);
+  border-color: var(--accent);
+}
+
+#ms-rxac-overlay .ms-lac-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  filter: none;
+}
+
+#ms-rxac-overlay .ms-lac-primary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#ms-rxac-overlay .ms-lac-header-note {
+  white-space: normal;
+  color: var(--text-3);
+}
+
+#ms-rxac-overlay .ms-lac-pool-eyebrow {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+#ms-rxac-overlay .ms-rxac-folders {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  align-content: start;
+}
+
+#ms-rxac-overlay .ms-rxac-board {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  gap: 12px;
+}
+
+#ms-rxac-overlay .ms-rxac-main {
+  flex: 1 1 64%;
+  min-width: 0;
+  display: flex;
+}
+
+#ms-rxac-overlay .ms-rxac-main .ms-rxac-folder {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-rail {
+  flex: 0 0 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow: auto;
+}
+
+#ms-rxac-overlay .ms-rxac-rail .ms-rxac-folder {
+  min-height: 0;
+  max-height: 220px;
+  flex: 0 0 auto;
+}
+
+#ms-rxac-overlay .ms-rxac-rail .ms-rxac-folder-body {
+  min-height: 0;
+  max-height: 140px;
+}
+
+#ms-rxac-overlay .ms-rxac-rail .ms-lac-add-row {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  position: static;
+  padding-top: 8px;
+  background: var(--bg-deep);
+}
+
+#ms-rxac-overlay .ms-rxac-board-clear {
+  display: grid;
+  grid-template-columns: minmax(148px, 200px) minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  align-items: stretch;
+  min-height: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-board-clear > .ms-rxac-folder-inbox {
+  grid-row: 1;
+  grid-column: 1;
+  min-height: 0;
+  align-self: start;
+}
+
+#ms-rxac-overlay .ms-rxac-board-clear > .ms-rxac-folders {
+  grid-row: 1 / 3;
+  grid-column: 2;
+  min-height: 0;
+  overflow: auto;
+}
+
+#ms-rxac-overlay .ms-rxac-board-clear > .ms-lac-add-row {
+  grid-row: 3;
+  grid-column: 1 / -1;
+  position: static;
+}
+
+#ms-rxac-overlay .ms-rxac-folders .ms-rxac-folder {
+  min-height: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-folders .ms-rxac-folder-body {
+  min-height: 44px;
+  max-height: 140px;
+}
+
+#ms-rxac-overlay .ms-rxac-folder {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  transition:
+    border-color var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease),
+    background-color var(--fast) var(--ease);
+}
+
+#ms-rxac-overlay .ms-rxac-folder:hover {
+  border-color: var(--border-hi);
+  box-shadow: var(--shadow-2);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox {
+  background: var(--bg-mid);
+  border-style: dashed;
+  border-color: var(--border-hi);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear {
+  background: var(--green-dim);
+  border-color: var(--green-line);
+  border-style: solid;
+  box-shadow: none;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear:hover {
+  border-color: var(--green-line);
+  box-shadow: none;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-name {
+  color: var(--text-2);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-count {
+  color: var(--green);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-meta,
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-meta-text {
+  color: var(--green);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-body {
+  min-height: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-away {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-away:hover {
+  border-color: var(--amber-line);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-away .ms-rxac-folder-name {
+  color: var(--text-2);
+}
+
+#ms-rxac-overlay .ms-rxac-share {
+  grid-column: 1 / -1;
+  justify-self: start;
+  margin: 4px 0 0;
+  padding: 5px 10px;
+  min-height: 28px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  font: inherit;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color var(--fast) var(--ease),
+    background-color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+#ms-rxac-overlay .ms-rxac-share-quiet {
+  color: var(--text-3);
+  background: transparent;
+}
+
+#ms-rxac-overlay .ms-rxac-share:hover:not(:disabled),
+#ms-rxac-overlay .ms-rxac-share-quiet:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+
+#ms-rxac-overlay .ms-rxac-share:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent-line);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+
+#ms-rxac-overlay .ms-rxac-share-away:not(:disabled) {
+  color: var(--amber);
+  border-color: var(--amber-line);
+  background: var(--amber-dim);
+}
+
+#ms-rxac-overlay .ms-rxac-share-away:hover:not(:disabled),
+#ms-rxac-overlay .ms-rxac-share-away:focus-visible {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-dim);
+}
+
+#ms-rxac-overlay .ms-rxac-share-off,
+#ms-rxac-overlay .ms-rxac-share:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  color: var(--text-4);
+  border-color: var(--border);
+  background: transparent;
+}
+
+#ms-rxac-overlay.ms-lac-lifting .ms-rxac-share {
+  pointer-events: none;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 2px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-title {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-name {
+  flex: 1 1 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-proposed {
+  border-color: var(--accent-line);
+  box-shadow:
+    inset 3px 0 0 var(--accent),
+    var(--shadow-1);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-proposed:hover {
+  border-color: var(--accent-line);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  color: var(--text-3);
+  line-height: 1.3;
+}
+
+/* Sum of this doctor's tiles' complexity levels (rxColumnComplexityHtml) —
+   next to their name, per a colleague's request 2026-09-10, with its own visible
+   "Complexity" label (a colleague's follow-up the same day) so the number reads
+   as self-explanatory rather than depending on the hover title. Not
+   colour-graded like the per-tile badge (an open-ended sum isn't itself a
+   1-5 level) — a plain muted pill. flex:0 0 auto so it never shrinks/
+   truncates when the doctor's name itself is long. */
+#ms-rxac-overlay .ms-rxac-folder-complexity {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  color: var(--text-3);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  line-height: 1.4;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-complexity-label {
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--text-4);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-complexity-value {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--text-2);
+}
+
+#ms-rxac-overlay .ms-rxac-count-proposed {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0;
+  line-height: 1;
+}
+
+#ms-rxac-overlay .ms-rxac-count-pop {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  line-height: 1;
+}
+
+#ms-rxac-overlay .ms-rxac-count-label {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+#ms-rxac-overlay .ms-rxac-count-sit {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  margin-top: 2px;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-meta {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-4);
+}
+
+#ms-rxac-overlay .ms-rxac-folder-meta-text {
+  min-width: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-folder-body {
+  flex: 1 1 auto;
+  min-height: 44px;
+  overflow: auto;
+  padding: 2px 0 6px;
+}
+
+#ms-rxac-overlay .ms-lac-confirmbar {
+  flex: 0 0 auto;
+  margin: 0 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  background: var(--bg-mid);
+  padding: 10px 14px;
+}
+
+#ms-rxac-overlay .ms-rxac-review-dock,
+#ms-rxac-overlay .ms-rxac-review-open {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 14px 16px;
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  box-shadow: var(--shadow-2);
+}
+
+#ms-rxac-overlay .ms-rxac-review-open {
+  align-items: start;
+  max-height: 36vh;
+  overflow: auto;
+  background: var(--bg-elev);
+  border-color: var(--amber-line);
+}
+
+#ms-rxac-overlay .ms-rxac-review-copy {
+  min-width: 0;
+}
+
+#ms-rxac-overlay .ms-rxac-review-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-1);
+  margin: 0 0 4px;
+}
+
+#ms-rxac-overlay .ms-rxac-review-go {
+  font-size: 16px;
+  font-weight: 650;
+  padding: 14px 24px;
+  min-height: 52px;
+  border-radius: var(--r-md);
+  white-space: nowrap;
+}
+
+#ms-rxac-overlay .ms-rxac-review-open .ms-lac-writelist {
+  max-height: 22vh;
+}
+
+#ms-rxac-overlay .ms-rxac-review-dock .ms-lac-confirmbar-actions,
+#ms-rxac-overlay .ms-rxac-review-open .ms-lac-confirmbar-actions {
+  margin-left: 0;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+#ms-rxac-overlay .ms-lac-tile-staged {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+#ms-rxac-overlay .ms-lac-tile-staged .ms-lac-tile-name {
+  color: var(--text-1);
+}
+
+.ms-lac-split .ms-lac-confirm-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* qac reuses rx folder board */
+
+#ms-qac-overlay .ms-lac-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+
+#ms-qac-overlay .ms-lac-chip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#ms-qac-overlay button.ms-lac-field-expand {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+#ms-qac-overlay button.ms-lac-field-expand:hover,
+#ms-qac-overlay button.ms-lac-field-expand:focus-visible {
+  background: var(--accent-dim);
+}
+
+#ms-qac-overlay .ms-lac-chip-drawer {
+  flex: 1 1 100%;
+}
+
+#ms-qac-overlay .ms-lac-board {
+  flex-direction: column;
+  gap: 10px;
+}
+
+#ms-qac-overlay .ms-lac-split {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin: 0;
+  max-height: none;
+  padding: 10px 12px;
+  pointer-events: auto;
+}
+
+#ms-qac-overlay .ms-rxac-split-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+#ms-qac-overlay .ms-lac-split .ms-lac-confirm-btn,
+#ms-qac-overlay .ms-lac-split .ms-lac-ghost {
+  width: auto;
+}
+
+#ms-qac-overlay .ms-lac-split-summary {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-3);
+  flex: 1 1 auto;
+  margin-left: 0;
+}
+
+#ms-qac-overlay .ms-rxac-split-go,
+#ms-qac-overlay .ms-rxac-action {
+  margin-left: 0;
+  padding: 10px 18px;
+  min-height: 40px;
+  font-size: 13px;
+  font-weight: 650;
+  border-radius: var(--r-md);
+  width: auto;
+}
+
+#ms-qac-overlay .ms-rxac-split-go {
+  margin-left: auto;
+  padding: 10px 22px;
+  font-size: 14px;
+}
+
+#ms-qac-overlay .ms-rxac-dests {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  line-height: 1.35;
+}
+
+#ms-qac-overlay #ms-rxac-add-team {
+  min-width: 180px;
+  max-width: 240px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+}
+
+#ms-qac-overlay .ms-rxac-split-proposing {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+#ms-qac-overlay .ms-rxac-proposal {
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  border: 1px solid var(--accent-line);
+  color: var(--text-1);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+#ms-qac-overlay .ms-rxac-proposal strong {
+  font-weight: 650;
+}
+
+#ms-qac-overlay .ms-rxac-drag-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+#ms-qac-overlay #ms-rxac-add-team:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-qac-overlay #ms-rxac-day {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-deep);
+}
+
+#ms-qac-overlay #ms-rxac-day:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-qac-overlay .ms-lac-primary {
+  background: var(--accent);
+  color: var(--bg-deep);
+  border-color: var(--accent);
+}
+
+#ms-qac-overlay .ms-lac-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  filter: none;
+}
+
+#ms-qac-overlay .ms-lac-primary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#ms-qac-overlay .ms-lac-header-note {
+  white-space: normal;
+  color: var(--text-3);
+}
+
+#ms-qac-overlay .ms-lac-pool-eyebrow {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+#ms-qac-overlay .ms-rxac-folders {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  align-content: start;
+}
+
+#ms-qac-overlay .ms-rxac-board {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  gap: 12px;
+}
+
+#ms-qac-overlay .ms-rxac-main {
+  flex: 1 1 64%;
+  min-width: 0;
+  display: flex;
+}
+
+#ms-qac-overlay .ms-rxac-main .ms-rxac-folder {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#ms-qac-overlay .ms-rxac-rail {
+  flex: 0 0 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow: auto;
+}
+
+#ms-qac-overlay .ms-rxac-rail .ms-rxac-folder {
+  min-height: 0;
+  max-height: 220px;
+  flex: 0 0 auto;
+}
+
+#ms-qac-overlay .ms-rxac-rail .ms-rxac-folder-body {
+  min-height: 0;
+  max-height: 140px;
+}
+
+#ms-qac-overlay .ms-rxac-rail .ms-lac-add-row {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  position: static;
+  padding-top: 8px;
+  background: var(--bg-deep);
+}
+
+#ms-qac-overlay .ms-rxac-board-clear {
+  display: grid;
+  grid-template-columns: minmax(148px, 200px) minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  align-items: stretch;
+  min-height: 0;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear > .ms-rxac-folder-inbox {
+  grid-row: 1;
+  grid-column: 1;
+  min-height: 0;
+  align-self: start;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear > .ms-rxac-folders {
+  grid-row: 1 / 3;
+  grid-column: 2;
+  min-height: 0;
+  overflow: auto;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear > .ms-lac-add-row {
+  grid-row: 3;
+  grid-column: 1 / -1;
+  position: static;
+}
+
+#ms-qac-overlay .ms-rxac-folders .ms-rxac-folder {
+  min-height: 0;
+}
+
+#ms-qac-overlay .ms-rxac-folders .ms-rxac-folder-body {
+  min-height: 44px;
+  max-height: 140px;
+}
+
+#ms-qac-overlay .ms-rxac-folder {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  transition:
+    border-color var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease),
+    background-color var(--fast) var(--ease);
+}
+
+#ms-qac-overlay .ms-rxac-folder:hover {
+  border-color: var(--border-hi);
+  box-shadow: var(--shadow-2);
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox {
+  background: var(--bg-mid);
+  border-style: dashed;
+  border-color: var(--border-hi);
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear {
+  background: var(--green-dim);
+  border-color: var(--green-line);
+  border-style: solid;
+  box-shadow: none;
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear:hover {
+  border-color: var(--green-line);
+  box-shadow: none;
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-name {
+  color: var(--text-2);
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-count {
+  color: var(--green);
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-meta,
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-meta-text {
+  color: var(--green);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+#ms-qac-overlay .ms-rxac-folder-inbox.ms-rxac-folder-clear .ms-rxac-folder-body {
+  min-height: 0;
+}
+
+#ms-qac-overlay .ms-rxac-folder-away {
+  background: var(--amber-dim);
+  border-color: var(--amber-line);
+}
+
+#ms-qac-overlay .ms-rxac-folder-away:hover {
+  border-color: var(--amber-line);
+}
+
+#ms-qac-overlay .ms-rxac-folder-away .ms-rxac-folder-name {
+  color: var(--text-2);
+}
+
+#ms-qac-overlay .ms-rxac-share {
+  grid-column: 1 / -1;
+  justify-self: start;
+  margin: 4px 0 0;
+  padding: 5px 10px;
+  min-height: 28px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  font: inherit;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color var(--fast) var(--ease),
+    background-color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+#ms-qac-overlay .ms-rxac-share-quiet {
+  color: var(--text-3);
+  background: transparent;
+}
+
+#ms-qac-overlay .ms-rxac-share:hover:not(:disabled),
+#ms-qac-overlay .ms-rxac-share-quiet:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+
+#ms-qac-overlay .ms-rxac-share:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent-line);
+  color: var(--text-2);
+  background: var(--accent-dim);
+}
+
+#ms-qac-overlay .ms-rxac-share-away:not(:disabled) {
+  color: var(--amber);
+  border-color: var(--amber-line);
+  background: var(--amber-dim);
+}
+
+#ms-qac-overlay .ms-rxac-share-away:hover:not(:disabled),
+#ms-qac-overlay .ms-rxac-share-away:focus-visible {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-dim);
+}
+
+#ms-qac-overlay .ms-rxac-share-off,
+#ms-qac-overlay .ms-rxac-share:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  color: var(--text-4);
+  border-color: var(--border);
+  background: transparent;
+}
+
+#ms-qac-overlay.ms-lac-lifting .ms-rxac-share {
+  pointer-events: none;
+}
+
+#ms-qac-overlay .ms-rxac-folder-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 2px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#ms-qac-overlay .ms-rxac-folder-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#ms-qac-overlay .ms-rxac-folder-title {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#ms-qac-overlay .ms-rxac-folder-name {
+  flex: 1 1 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#ms-qac-overlay .ms-rxac-folder-proposed {
+  border-color: var(--accent-line);
+  box-shadow:
+    inset 3px 0 0 var(--accent),
+    var(--shadow-1);
+}
+
+#ms-qac-overlay .ms-rxac-folder-proposed:hover {
+  border-color: var(--accent-line);
+}
+
+#ms-qac-overlay .ms-rxac-folder-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  color: var(--text-3);
+  line-height: 1.3;
+}
+
+#ms-qac-overlay .ms-rxac-count-proposed {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0;
+  line-height: 1;
+}
+
+#ms-qac-overlay .ms-rxac-count-pop {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  line-height: 1;
+}
+
+#ms-qac-overlay .ms-rxac-count-label {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+#ms-qac-overlay .ms-rxac-count-sit {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  margin-top: 2px;
+}
+
+#ms-qac-overlay .ms-rxac-folder-meta {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-4);
+}
+
+#ms-qac-overlay .ms-rxac-folder-meta-text {
+  min-width: 0;
+}
+
+#ms-qac-overlay .ms-rxac-folder-body {
+  flex: 1 1 auto;
+  min-height: 44px;
+  overflow: auto;
+  padding: 2px 0 6px;
+}
+
+#ms-qac-overlay .ms-lac-body,
+#ms-rxac-overlay .ms-lac-body,
+#ms-lac-overlay .ms-lac-body {
+  padding-bottom: var(--ms-lac-footer-space, 128px);
+}
+
+/* After-split dest cards must size to their contents. max-height: 100% plus
+   min-height: 0 on the dest grid crushed the folder-head into the patient list.
+   The dest grid itself must also grow with those cards (body scrolls) — a
+   128px footer pad inside a 1fr row left a ~0px content box at 720px. */
+#ms-qac-overlay .ms-rxac-board-clear,
+#ms-rxac-overlay .ms-rxac-board-clear {
+  grid-template-rows: auto auto auto;
+  height: auto;
+  min-height: min-content;
+  align-items: start;
+  flex: 1 0 auto;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear > .ms-rxac-folders,
+#ms-rxac-overlay .ms-rxac-board-clear > .ms-rxac-folders {
+  align-items: start;
+  align-content: start;
+  grid-auto-rows: auto;
+  grid-row: 1 / 3;
+  min-height: min-content;
+  height: auto;
+  overflow: visible;
+  padding-bottom: 8px;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear .ms-rxac-folders .ms-rxac-folder,
+#ms-rxac-overlay .ms-rxac-board-clear .ms-rxac-folders .ms-rxac-folder {
+  height: auto;
+  max-height: none;
+  min-height: unset;
+  overflow: hidden;
+  align-self: start;
+}
+
+#ms-qac-overlay .ms-rxac-board-clear .ms-rxac-folders .ms-rxac-folder-body,
+#ms-rxac-overlay .ms-rxac-board-clear .ms-rxac-folders .ms-rxac-folder-body {
+  flex: 0 1 auto;
+  min-height: 44px;
+  max-height: 440px;
+  overflow: auto;
+}
+
+#ms-qac-overlay .ms-rxac-folders .ms-lac-tile,
+#ms-rxac-overlay .ms-rxac-folders .ms-lac-tile {
+  flex-shrink: 0;
+}
+
+#ms-qac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-lac-body,
+#ms-rxac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-lac-body {
+  display: none;
+}
+
+#ms-qac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-board,
+#ms-qac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-board-clear,
+#ms-rxac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-board,
+#ms-rxac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-board-clear {
+  display: none;
+}
+
+#ms-qac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-review-open,
+#ms-rxac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-rxac-review-open {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+}
+
+#ms-qac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-lac-writelist,
+#ms-rxac-overlay .ms-lac-panel.ms-rxac-reviewing .ms-lac-writelist {
+  max-height: none;
+}
+
+#ms-qac-overlay .ms-rxac-folders,
+#ms-rxac-overlay .ms-rxac-folders {
+  padding-bottom: var(--ms-lac-footer-space, 128px);
+}
+
+#ms-qac-overlay .ms-rxac-rail,
+#ms-rxac-overlay .ms-rxac-rail {
+  padding-bottom: 8px;
+}
+
+#ms-qac-overlay .ms-lac-confirmbar {
+  flex: 0 0 auto;
+  margin: 0 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  background: var(--bg-mid);
+  padding: 10px 14px;
+  position: relative;
+  z-index: 4;
+}
+
+#ms-qac-overlay .ms-rxac-review-dock,
+#ms-qac-overlay .ms-rxac-review-open {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 14px 16px;
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  box-shadow: var(--shadow-2);
+}
+
+#ms-qac-overlay .ms-rxac-review-open {
+  align-items: start;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg-elev);
+  border-color: var(--amber-line);
+}
+
+#ms-qac-overlay .ms-rxac-review-copy {
+  min-width: 0;
+}
+
+#ms-qac-overlay .ms-rxac-review-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-1);
+  margin: 0 0 4px;
+}
+
+#ms-qac-overlay .ms-rxac-review-go {
+  font-size: 16px;
+  font-weight: 650;
+  padding: 14px 24px;
+  min-height: 52px;
+  border-radius: var(--r-md);
+  white-space: nowrap;
+}
+
+#ms-qac-overlay .ms-rxac-review-open .ms-lac-writelist {
+  max-height: none;
+}
+
+#ms-qac-overlay .ms-rxac-review-dock .ms-lac-confirmbar-actions,
+#ms-qac-overlay .ms-rxac-review-open .ms-lac-confirmbar-actions {
+  margin-left: 0;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+#ms-qac-overlay .ms-lac-tile-staged {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+#ms-qac-overlay .ms-lac-tile-staged .ms-lac-tile-name {
+  color: var(--text-1);
+}
+#ms-lac-overlay .ms-ags-strip,
+#ms-rxac-overlay .ms-ags-strip,
+#ms-qac-overlay .ms-ags-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+}
+#ms-lac-overlay .ms-ags-label,
+#ms-rxac-overlay .ms-ags-label,
+#ms-qac-overlay .ms-ags-label {
+  font: 600 12px/1.2 var(--sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  color: var(--text-2, #1e3a5f);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#ms-lac-overlay .ms-ags-chips,
+#ms-rxac-overlay .ms-ags-chips,
+#ms-qac-overlay .ms-ags-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+#ms-lac-overlay .ms-ags-chip,
+#ms-lac-overlay .ms-ags-well,
+#ms-rxac-overlay .ms-ags-chip,
+#ms-rxac-overlay .ms-ags-well,
+#ms-qac-overlay .ms-ags-chip,
+#ms-qac-overlay .ms-ags-well {
+  padding: 4px 10px;
+  font: 600 12px/1.3 var(--sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  color: var(--text-1, #0f172a);
+  background: var(--bg-elev, #fff);
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 999px;
+  cursor: pointer;
+}
+#ms-lac-overlay .ms-ags-chip-on,
+#ms-lac-overlay .ms-ags-well-on,
+#ms-rxac-overlay .ms-ags-chip-on,
+#ms-rxac-overlay .ms-ags-well-on,
+#ms-qac-overlay .ms-ags-chip-on,
+#ms-qac-overlay .ms-ags-well-on {
+  border-color: var(--chip-on-border, var(--accent, #2563eb));
+  background: var(--chip-on-bg, #eff4fd);
+  color: var(--chip-on-text, #1e3a5f);
+}
+#ms-lac-overlay .ms-ags-well,
+#ms-rxac-overlay .ms-ags-well,
+#ms-qac-overlay .ms-ags-well {
+  border-style: dashed;
+}
+#ms-lac-overlay .ms-ags-to,
+#ms-lac-overlay .ms-ags-skip,
+#ms-lac-overlay .ms-ags-hint,
+#ms-rxac-overlay .ms-ags-to,
+#ms-rxac-overlay .ms-ags-skip,
+#ms-rxac-overlay .ms-ags-hint,
+#ms-qac-overlay .ms-ags-to,
+#ms-qac-overlay .ms-ags-skip,
+#ms-qac-overlay .ms-ags-hint {
+  font: 12px/1.4 var(--sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  color: var(--text-2, #1e3a5f);
+}
+#ms-lac-overlay .ms-ags-skip,
+#ms-rxac-overlay .ms-ags-skip,
+#ms-qac-overlay .ms-ags-skip {
+  color: var(--amber);
+}
+#ms-lac-overlay .ms-ags-actions,
+#ms-rxac-overlay .ms-ags-actions,
+#ms-qac-overlay .ms-ags-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+#ms-lac-overlay .ms-ags-save-row,
+#ms-rxac-overlay .ms-ags-save-row,
+#ms-qac-overlay .ms-ags-save-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font: 12px/1.4 var(--sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+}
+#ms-lac-overlay .ms-ags-save-row input,
+#ms-rxac-overlay .ms-ags-save-row input,
+#ms-qac-overlay .ms-ags-save-row input {
+  min-width: 160px;
+  font: 12px/1.4 inherit;
+  padding: 4px 8px;
+}
+#ms-lac-overlay .ms-ags-field-on,
+#ms-rxac-overlay .ms-ags-field-on,
+#ms-qac-overlay .ms-ags-field-on {
+  outline: 2px solid var(--accent, #2563eb);
+  outline-offset: 2px;
+}
+#ms-lac-overlay .ms-ags-marquee,
+#ms-rxac-overlay .ms-ags-marquee,
+#ms-qac-overlay .ms-ags-marquee {
+  position: absolute;
+  border: 1px dashed var(--accent, #2563eb);
+  background: rgba(37, 99, 235, 0.08);
+  pointer-events: none;
+  z-index: 5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #ms-lac-overlay *,
+  #ms-wac-overlay *,
+  #ms-rxac-overlay *,
+  #ms-qac-overlay * {
+    transition: none !important;
+  }
+  #ms-lac-overlay .ms-lac-reorg-card {
+    animation: none !important;
+  }
+}

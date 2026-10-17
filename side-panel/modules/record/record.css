@@ -1,0 +1,884 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Record (live) module styles. Built on the suite canon tokens (panel.css):
+   theming (light/dark) and colour-blind remap (--red→orange, --green→blue) are
+   inherited for free — no bespoke per-theme hex. */
+
+.rec-root {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px 12px;
+}
+
+/* head ---------------------------------------------------------------------- */
+.rec-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-deep);
+  padding-bottom: 6px;
+}
+.rec-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+/* button cluster in the title row: Copy summary + Refresh */
+.rec-title-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Copy summary button */
+.rec-copy-btn {
+  border: 1px solid var(--border-hi);
+  background: var(--bg-elev);
+  color: var(--text-2);
+  border-radius: 6px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.rec-copy-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+.rec-copy-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.rec-copy-btn--ok {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: var(--green);
+}
+.rec-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin: 0;
+}
+.rec-refresh {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text-3);
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  font-size: 15px;
+  cursor: pointer;
+  line-height: 1;
+}
+.rec-refresh:hover {
+  background: var(--bg-hover);
+}
+
+/* source / provenance line — load-bearing, so weighted up from a sub-label */
+.rec-source {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-3);
+  margin-top: 5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rec-source-live {
+  color: var(--green);
+  font-weight: 600;
+}
+.rec-snapshot-word {
+  color: var(--text-4);
+  font-weight: 400;
+  font-style: italic;
+}
+.rec-source-err {
+  color: var(--red);
+  font-weight: 600;
+}
+.rec-source-warn {
+  color: var(--amber);
+  font-weight: 600;
+}
+.rec-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-dim);
+  display: inline-block;
+  flex: none;
+}
+/* feed provenance ("Data: API feed" / "Data: session") — subtle, not a badge */
+.rec-feed-label {
+  color: var(--text-4);
+  font-weight: 400;
+}
+
+/* "Since last visit" — the brief's headline, rendered first ------------------ */
+.rec-delta-card {
+  border-left: 4px solid var(--accent);
+}
+.rec-delta-baseline,
+.rec-delta-none {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.rec-delta-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rec-delta-item {
+  font-size: 12.5px;
+  color: var(--text-1);
+  line-height: 1.4;
+}
+.rec-delta-allergy {
+  color: var(--red);
+  font-weight: 700;
+}
+.rec-delta-problem {
+  color: var(--amber);
+  font-weight: 600;
+}
+.rec-delta-medication,
+.rec-delta-immunisation {
+  color: var(--text-1);
+}
+.rec-delta-removed {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+/* demographics -------------------------------------------------------------- */
+.rec-demo {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.rec-demo-name {
+  font-size: 16px;
+  font-weight: 700;
+}
+.rec-demo-meta {
+  font-size: 12px;
+  opacity: 0.95;
+  margin-top: 2px;
+}
+.rec-demo-nhs,
+.rec-demo-gp {
+  font-size: 11px;
+  opacity: 0.92;
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+.rec-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 10px;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+.rec-badge-deceased {
+  background: var(--text-3);
+  color: #fff;
+}
+.rec-badge-test {
+  background: var(--amber);
+  color: #fff;
+}
+
+/* primary safety banner (the one genuine warning) --------------------------- */
+.rec-warn-banner {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-left: 4px solid var(--amber);
+  border-radius: 6px;
+  padding: 8px 10px 8px 32px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.4;
+  position: relative;
+}
+.rec-warn-banner::before {
+  content: '⚠';
+  position: absolute;
+  left: 10px;
+  top: 8px;
+  font-size: 14px;
+  color: var(--amber);
+}
+.rec-warn-banner strong {
+  display: block;
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.rec-partial {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+/* gap markers — SOLID caution treatment (a data gap, not a placeholder) ------ */
+.rec-gaps {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.rec-gap {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--amber-line);
+  border-left: 4px solid var(--amber);
+  border-radius: 6px;
+  padding: 6px 9px 6px 30px;
+  background: var(--amber-dim);
+  position: relative;
+}
+.rec-gap::before {
+  content: '⚠';
+  position: absolute;
+  left: 9px;
+  top: 6px;
+  font-size: 13px;
+  color: var(--amber);
+}
+.rec-gap-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+.rec-gap-val {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* cards --------------------------------------------------------------------- */
+.rec-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.rec-card-h {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text-3);
+  margin: 0 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rec-count {
+  background: var(--bg-mid);
+  color: var(--text-3);
+  border-radius: 10px;
+  font-size: 11px;
+  padding: 0 7px;
+  font-weight: 700;
+}
+.rec-window {
+  font-size: 10px;
+  color: var(--text-4);
+  margin-top: 7px;
+  font-style: italic;
+}
+
+/* score caveat — INFO tier (grey), distinct from the amber warning above ----- */
+.rec-caveat {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 0 0 9px;
+  line-height: 1.4;
+  background: var(--bg-mid);
+  border-left: 3px solid var(--border-hi);
+  border-radius: 5px;
+  padding: 6px 9px;
+}
+.rec-empty {
+  font-size: 12px;
+  color: var(--text-4);
+  list-style: none;
+  padding: 4px 0;
+}
+
+/* lists --------------------------------------------------------------------- */
+.rec-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* problems */
+.rec-prob {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.rec-prob:last-child {
+  border-bottom: 0;
+}
+.rec-prob-major .rec-prob-name {
+  font-weight: 700;
+}
+.rec-prob-name {
+  color: var(--text-1);
+}
+.rec-prob-date {
+  color: var(--text-4);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* meds */
+.rec-med {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.rec-med:last-child {
+  border-bottom: 0;
+}
+.rec-med-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.rec-med-dose {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.rec-med-meta {
+  font-size: 10.5px;
+  color: var(--text-4);
+}
+.rec-med-flag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 8px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.rec-med-overdue {
+  background: var(--red-dim);
+  color: var(--red);
+}
+.rec-med-review {
+  background: var(--amber-dim);
+  color: var(--amber);
+}
+
+/* results */
+.rec-res {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.rec-res:last-child {
+  border-bottom: 0;
+}
+.rec-res-name {
+  color: var(--text-1);
+}
+.rec-res-val {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.rec-res-date {
+  font-size: 11px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.rec-res-high .rec-res-val {
+  color: var(--red);
+}
+.rec-res-low .rec-res-val {
+  color: var(--accent);
+}
+.rec-res-arrow {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* safety scores ------------------------------------------------------------- */
+.rec-score {
+  border: 1px solid var(--border);
+  border-left-width: 5px;
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin-bottom: 6px;
+}
+.rec-score-ok {
+  border-left-color: var(--green);
+}
+.rec-score-mid {
+  border-left-color: var(--amber);
+}
+.rec-score-alert {
+  border-left-color: var(--red);
+}
+.rec-score-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.rec-score-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  flex: 1;
+}
+.rec-score-val {
+  font-size: 16px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+}
+.rec-score-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+.rec-score-detail {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+.rec-ss-flag {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 0 4px;
+  border-radius: 3px;
+  letter-spacing: 0.03em;
+}
+.rec-ss-stopp {
+  background: var(--red-dim);
+  color: var(--red);
+}
+.rec-ss-start {
+  background: var(--green-dim);
+  color: var(--green);
+}
+
+/* Drug-allergy alert(s) — rendered by buildAllergyPrompts() via the SAME
+   ChipRenderer.renderDrugAllergyChip() markup content-scripts/sentinel.js
+   uses for this exact chip type (shared/chip-renderer.js), so it must carry
+   the same `.sent-chip*` classes here. sentinel.css (where these classes are
+   otherwise defined) is lazy-loaded per-module and is NOT guaranteed to be
+   loaded when the Record tab renders one of these, so the subset actually
+   used by renderDrugAllergyChip is reproduced below, scoped to
+   .rec-allergy-alerts so it can't leak into (or clash with) any other
+   module's rendering. Colour tokens (--red/--amber/--green/...) are suite
+   canon (panel.css), shared across every module. ------------------------- */
+.rec-allergy-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.rec-allergy-alerts .sent-chip {
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 8px 10px;
+  border-left-width: 3px;
+  position: relative;
+}
+.rec-allergy-alerts .sent-chip-red {
+  border-left-color: var(--red);
+  background: var(--red-dim);
+}
+.rec-allergy-alerts .sent-chip-amber {
+  border-left-color: var(--amber);
+  background: var(--amber-dim);
+}
+.rec-allergy-alerts .sent-chip-green {
+  border-left-color: var(--green);
+  background: var(--green-dim);
+}
+.rec-allergy-alerts .sent-chip-neutral {
+  border-left-color: var(--border-hi);
+}
+.rec-allergy-alerts .sent-chip-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.rec-allergy-alerts .sent-chip-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  flex: 1;
+  min-width: 0;
+}
+.rec-allergy-alerts .sent-chip-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  border-radius: var(--r-sm);
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 7px;
+}
+.rec-allergy-alerts .sent-badge-red {
+  background: var(--red-dim);
+  color: var(--red);
+  border: 1px solid var(--red-line);
+}
+.rec-allergy-alerts .sent-badge-amber {
+  background: var(--amber-dim);
+  color: var(--amber);
+  border: 1px solid var(--amber-line);
+}
+.rec-allergy-alerts .sent-badge-green {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid var(--green-line);
+}
+.rec-allergy-alerts .sent-badge-neutral {
+  background: var(--bg-mid);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+}
+.rec-allergy-alerts .sent-chip-obs {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+  font-family: var(--mono);
+}
+.rec-allergy-alerts .sent-chip-facts {
+  margin-top: 4px;
+}
+.rec-allergy-alerts .sent-chip-fact {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+.rec-allergy-alerts .sent-chip-fact-label {
+  font-weight: 600;
+  color: var(--text-2);
+}
+.rec-allergy-alerts .sent-chip-cat {
+  font-size: 10px;
+  color: var(--text-4);
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-top: 4px;
+}
+.rec-allergy-alerts .sent-custom-tag {
+  --tag-ink: var(--violet);
+  --tag-dim: var(--violet-dim);
+  --tag-line: var(--violet-line);
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 8.5px;
+  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--tag-ink);
+  background: var(--tag-dim);
+  border: 1px solid var(--tag-line);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  vertical-align: middle;
+  text-transform: uppercase;
+}
+.rec-allergy-alerts .sent-chip-chevron {
+  font-size: 9px;
+  color: var(--text-4);
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+/* No click-to-expand wired in the Record tab (the facts are already shown
+   inline above) — the chevron/data-evidence attributes ride along on the
+   shared chip markup but are inert here, so the "clickable" affordance
+   (pointer cursor, hover glow) is deliberately suppressed rather than
+   promising an interaction that doesn't happen. */
+.rec-allergy-alerts .sent-chip-clickable {
+  cursor: default;
+}
+
+/* Pre-flight — what-if safety preview ---------------------------------------- */
+.rec-preflight {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px 12px;
+}
+.rec-preflight-summary {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-1);
+  padding: 9px 0;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rec-preflight-summary::-webkit-details-marker {
+  display: none;
+}
+.rec-preflight-summary::before {
+  content: '▸';
+  font-size: 10px;
+  color: var(--text-4);
+}
+.rec-preflight[open] .rec-preflight-summary::before {
+  content: '▾';
+}
+.rec-preflight-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rec-preflight-body {
+  padding: 0 0 12px;
+}
+.rec-preflight-intro {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.45;
+  margin: 0 0 9px;
+}
+.rec-preflight-row {
+  display: flex;
+  gap: 6px;
+}
+.rec-preflight-input {
+  flex: 1;
+  border: 1px solid var(--border-hi);
+  background: var(--bg-mid);
+  color: var(--text-1);
+  border-radius: 6px;
+  padding: 0 10px;
+  height: 30px;
+  font-size: 12.5px;
+}
+.rec-preflight-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.rec-preflight-btn {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  height: 30px;
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.rec-preflight-btn:hover {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.rec-preflight-loading,
+.rec-preflight-empty {
+  font-size: 11.5px;
+  color: var(--text-4);
+  padding: 10px 2px 0;
+}
+.rec-preflight-empty {
+  color: var(--amber);
+}
+
+/* result — calm cards, red/amber only where an engine actually says so */
+.rec-pf-unknown {
+  font-size: 11.5px;
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin-top: 10px;
+  line-height: 1.4;
+}
+.rec-pf-group {
+  margin-top: 10px;
+}
+.rec-pf-group-h {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 5px;
+}
+.rec-pf-section {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.rec-pf-section:first-child {
+  margin-top: 10px;
+}
+.rec-pf-ok {
+  border-left-color: var(--green);
+}
+.rec-pf-mid {
+  border-left-color: var(--amber);
+}
+.rec-pf-alert {
+  border-left-color: var(--red);
+}
+.rec-pf-section-h {
+  font-weight: 700;
+  color: var(--text-1);
+}
+.rec-pf-section-body {
+  color: var(--text-2);
+  margin-top: 2px;
+  line-height: 1.45;
+}
+.rec-pf-source {
+  font-size: 10.5px;
+  color: var(--text-4);
+  margin-top: 4px;
+  font-style: italic;
+}
+.rec-pf-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rec-pf-list li {
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.4;
+}
+.rec-pf-test-name {
+  font-weight: 600;
+  color: var(--text-1);
+}
+.rec-pf-test-ok {
+  color: var(--text-2);
+}
+.rec-pf-test-missing {
+  color: var(--amber);
+}
+.rec-pf-caveat {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 12px 0 0;
+  line-height: 1.4;
+  background: var(--bg-mid);
+  border-left: 3px solid var(--border-hi);
+  border-radius: 5px;
+  padding: 6px 9px;
+}
+
+/* state cards --------------------------------------------------------------- */
+.rec-state {
+  text-align: center;
+  padding: 28px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+/* Reticle brand glyph echoed into the empty/state card (monochrome, faint —
+   no brand cyan in the clinical chrome). (Craft pass 2026-06-21.) */
+.rec-state-glyph {
+  display: block;
+  margin: 0 auto 10px;
+  color: var(--text-5);
+}
+.rec-state-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+.rec-state-msg {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 6px;
+  line-height: 1.4;
+}
+.rec-retry {
+  margin-top: 10px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* skeleton ------------------------------------------------------------------ */
+.rec-skel-head {
+  height: 52px;
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--bg-mid) 25%, var(--bg-hover) 50%, var(--bg-mid) 75%);
+  background-size: 200% 100%;
+  animation: rec-shimmer 1.2s infinite;
+}
+.rec-skel-row {
+  margin-top: 10px;
+}
+.rec-skel-bar {
+  height: 14px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+  background: linear-gradient(90deg, var(--bg-mid) 25%, var(--bg-hover) 50%, var(--bg-mid) 75%);
+  background-size: 200% 100%;
+  animation: rec-shimmer 1.2s infinite;
+}
+.rec-skel-bar.short {
+  width: 60%;
+}
+@keyframes rec-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rec-skel-head,
+  .rec-skel-bar {
+    animation: none;
+  }
+}

@@ -1,0 +1,947 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Shared — Patient-journal observation parsing + observationHistory merge (v3.264.3)
+//
+// Pure helpers behind content-scripts/sentinel.js's journal augment. Extracted
+// from fetchJournalObservations so the parsing is unit-testable AND so the two
+// live-consult ingestion gaps found 2026-09-21 stay fixed:
+//
+//   1. FLAT top-level `observation` items. The bulk journal payload
+//      (docs/learnings-patient-journal-api.md, confirmed live 2026-07-02:
+//      `observation` is one of the 11 confirmed top-level item.type values)
+//      carries observations coded OUTSIDE a consultation as flat
+//      `items[]` entries — exactly what a clinician gets when adding a
+//      standalone "Journal Observation" mid-consult (BP "119/86",
+//      "Teetotaller", "Ex-smoker"). The old parser walked ONLY
+//      `item.type === 'encounter'` → consultationTopics → headings → entries,
+//      so every flat observation was silently dropped and the Companion
+//      showed stale/absent BP, alcohol and smoking status during the consult.
+//   2. Journal observations never reached data.observationHistory — only
+//      data.observations — so history consumers (Trends buildBpModel,
+//      Sentinel brief/passport BP lines) could not see a journal-coded BP at
+//      all. mergeJournalObsIntoHistory below is the one ingest path that
+//      folds them in.
+//   3. Coded consultation notes (entryType "note" with a
+//      clinicalCodeDescription) were dropped. Medicus files SNOMED terms
+//      such as "Smoker" and "Asthma monitoring check done" as notes, so
+//      SMOK002 and AST015 stayed overdue against an older dashboard row.
+//      Those coded notes are ingested. Uncoded free text is not. A concept
+//      id is stored when the payload has one. A draft or incorrect note is
+//      not. The note's clinical date is recordDate, not the migration
+//      timestamp `created`. The free-text `note` body is never the
+//      observation name or value: a Nexus recall writes "Vaccination
+//      VAC_COVID — recorded … (filed automatically with the invitation
+//      that was sent)" into that body, and that sentence is not a dose.
+//   4. Immunisation entries (entryType "immunisation") are ingested from
+//      the coded description only, the same way. The note body is not.
+//      They are NOT cut by the 400-day window. A one-off vaccine (RSV,
+//      pneumococcal, shingles) is given once and the coded dose may be
+//      years or decades old. Flu and COVID still use their seasonal
+//      windows in the rules engine, so an old immunisation does not
+//      satisfy this season. Ordinary observations and coded notes stay
+//      on the window. A coded note that is itself an RSV, pneumococcal
+//      or shingles record is kept for the whole payload (H-095): those
+//      doses are filed as notes as well as immunisations, and the 400-day
+//      cap was dropping them. Flu notes, COVID notes and the flu
+//      eligibility flag stay on the window. Invitations are not lifetime.
+//   5. Procedure entries (entryType "procedure") are ingested only when
+//      the coded description or concept id is a vaccine record (H-096).
+//      The same matcher, season windows and one-off lifetime rule apply.
+//      A blood test or an operation is not ingested. A structured
+//      not-given status is copied onto the row as vaccineOutcome so an
+//      administration-named entry marked not given is not a dose.
+//   6. Immunisation lines filed under a Document (an inbound pharmacy or
+//      GP Connect "Immunization record") are read from that document's
+//      attached entries. The bulk journal walk never entered item.type
+//      "document", so those doses never reached the matcher. The same
+//      gap covers RSV, pneumococcal and shingles when they arrive the
+//      same way. An administered date is preferred to the document date.
+//      A coded invitation is still not a dose. A follow-up list of
+//      Immunization record documents that had no attached dose in the
+//      bulk payload is exposed for GET clinical/document/entries/{id},
+//      which is where linked entries were confirmed to live when
+//      careRecordElements was empty (2026-07-08). The live shape of a
+//      pharmacy immunisation on that endpoint is not separately captured.
+//   7. A top-level Immunisation whose preferred term is only on the row
+//      label (item.title, item.descriptionText, or data.text) was dropped
+//      when clinicalCodeDescription was empty. "Administration of first
+//      inactivated seasonal influenza vaccination" already matches the flu
+//      given set; "first" and "inactivated" do not exclude it. The same
+//      row-label read covers the practice's standard in-house COVID entry
+//      "Immunisation: Administration of SARS-CoV-2 vaccine". The
+//      wrapper title is used only when the item itself is an immunisation.
+//      A Document titled "Immunization record" is not the dose name. The
+//      free-text note body is still not read. "Immunisation consent given"
+//      is a note and is not a dose.
+//
+// Dual-mode export (same pattern as shared/smoking-status.js):
+//   Browser (classic script): window.JournalObservations.<fn>(...)
+//   Node / test:              require('./shared/journal-observations.js').<fn>(...)
+
+(function (global) {
+  'use strict';
+
+  // One-off vaccine notes skip the 400-day cap. Flu and COVID notes do not.
+  // Content scripts load shared/vaccine-given.js before this file.
+  var VaccineGiven = (function loadVaccineGiven() {
+    if (typeof module !== 'undefined' && module.exports) {
+      try {
+        return require('./vaccine-given.js');
+      } catch (e) {
+        return null;
+      }
+    }
+    if (typeof window !== 'undefined' && window.VaccineGiven) return window.VaccineGiven;
+    return null;
+  })();
+
+  var MONTH_INDEX = {
+    Jan: 0,
+    Feb: 1,
+    Mar: 2,
+    Apr: 3,
+    May: 4,
+    Jun: 5,
+    Jul: 6,
+    Aug: 7,
+    Sep: 8,
+    Oct: 9,
+    Nov: 10,
+    Dec: 11,
+  };
+
+  // Parse "DD Mon YYYY" (entry.observationDate) or "DayName DD Mon YYYY"
+  // (day-group record.title — the two formats differ, see
+  // docs/learnings-patient-journal-api.md "Day-group shape").
+  function parseDisplayDate(str) {
+    if (!str) return null;
+    var parts = String(str).trim().split(' ').filter(Boolean);
+    var dayStr = parts.length === 3 ? parts[0] : parts[1];
+    var monStr = parts.length === 3 ? parts[1] : parts[2];
+    var yearStr = parts.length === 3 ? parts[2] : parts[3];
+    if (!dayStr || !monStr || !yearStr) return null;
+    var mon = MONTH_INDEX[monStr];
+    if (mon === undefined) return null;
+    var d = new Date(parseInt(yearStr, 10), mon, parseInt(dayStr, 10));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // Bare entry-type labels are not a vaccine name. "Immunisation" as the
+  // whole description is the kind, not the product. A descriptive `code`
+  // string (the clinical/document/entries shape, where `code` is the
+  // preferred term) is the name. A numeric code is a concept id, not a name.
+  var KIND_NAME_RE = /^(?:immunisations?|immunizations?|procedures?|documents?|notes?|observations?|entries?)$/i;
+
+  // Medicus codes are { conceptId, description, descriptionId }, sometimes
+  // wrapped as { value: { ... } } (the problem-listing shape). The journal
+  // line "Immunisation: Administration of …" is the entry type plus
+  // `description`. clinicalCodeDescription is a separate string and is
+  // empty on the in-house immunisation (H-099). descriptionId is not a
+  // concept id and is never returned from here.
+  var SNOMED_CODE_KEYS = [
+    'clinicalCode',
+    'code',
+    'noteSNOMEDctCode',
+    'noteSNOMEDct',
+    'snomed',
+    'snomedCode',
+    'snomedCtCode',
+    'vaccineCode',
+    'immunisationCode',
+    'immunizationCode',
+  ];
+
+  function snomedCodeNodes(entry) {
+    var out = [];
+    if (!entry || typeof entry !== 'object') return out;
+    for (var i = 0; i < SNOMED_CODE_KEYS.length; i++) {
+      var node = entry[SNOMED_CODE_KEYS[i]];
+      if (!node || typeof node !== 'object') continue;
+      out.push(node);
+      if (node.value && typeof node.value === 'object') out.push(node.value);
+    }
+    return out;
+  }
+
+  function termFromSnomedNode(node) {
+    if (!node || typeof node !== 'object') return '';
+    var keys = ['description', 'preferredTerm', 'term', 'display'];
+    for (var i = 0; i < keys.length; i++) {
+      if (node[keys[i]] == null) continue;
+      var s = String(node[keys[i]]).trim();
+      if (s && !KIND_NAME_RE.test(s)) return s;
+    }
+    return '';
+  }
+
+  function conceptIdFromEntry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    var direct = entry.conceptId || entry.snomedConceptId || entry.clinicalCodeId;
+    if (direct != null && String(direct).trim()) return String(direct).trim();
+    if (typeof entry.code === 'string' && /^\d{6,18}$/.test(entry.code)) return entry.code;
+    var nodes = snomedCodeNodes(entry);
+    for (var i = 0; i < nodes.length; i++) {
+      var id = nodes[i].conceptId;
+      if (id != null && String(id).trim()) return String(id).trim();
+    }
+    return null;
+  }
+
+  function descriptiveCode(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    var direct = entry.clinicalCodeDescription == null ? '' : String(entry.clinicalCodeDescription).trim();
+    if (direct && !KIND_NAME_RE.test(direct)) return direct;
+    var code = entry.code;
+    if (typeof code === 'string') {
+      var s = code.trim();
+      if (s && !/^\d{6,18}$/.test(s) && !KIND_NAME_RE.test(s)) return s;
+    }
+    if (code && typeof code === 'object') {
+      var fromObj = termFromSnomedNode(code) || termFromSnomedNode(code.value);
+      if (fromObj) return fromObj;
+    }
+    var nodes = snomedCodeNodes(entry);
+    for (var n = 0; n < nodes.length; n++) {
+      var fromNode = termFromSnomedNode(nodes[n]);
+      if (fromNode) return fromNode;
+    }
+    var title = entry.title == null ? '' : String(entry.title).trim();
+    if (title && !KIND_NAME_RE.test(title)) return title;
+    var typeName = entry.type == null ? '' : String(entry.type).trim();
+    if (typeName && !KIND_NAME_RE.test(typeName)) return typeName;
+    return '';
+  }
+
+  // "Immunisation: Administration of …" is the journal row label. The word
+  // before the colon is the kind, not the product. A bare "Immunisation" is
+  // still not a name.
+  function stripKindPrefix(str) {
+    var s = String(str || '').trim();
+    s = s.replace(/^(?:immunisations?|immunizations?)\s*:\s*/i, '').trim();
+    if (!s || KIND_NAME_RE.test(s)) return '';
+    return s;
+  }
+
+  function isAdministeredDateOnly(str) {
+    return /^Administered\s+(?:\d{1,2}\s+[A-Za-z]{3}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})\.?$/i.test(
+      String(str || '').trim()
+    );
+  }
+
+  function firstVaccineLabel(candidates) {
+    for (var i = 0; i < candidates.length; i++) {
+      var label = stripKindPrefix(candidates[i]);
+      if (!label || isAdministeredDateOnly(label)) continue;
+      return label;
+    }
+    return '';
+  }
+
+  // Coded description first. Then the entry's own visible label (description
+  // text, display, name, text). The free-text note body is not a candidate:
+  // VAC_* invitation text lives there. item.title and item.descriptionText
+  // are the dose name only when the wrapper item itself is an immunisation.
+  // A document's title must not become the dose.
+  function visibleImmunisationName(entry, item) {
+    var fromCode = firstVaccineLabel([descriptiveCode(entry)]);
+    if (fromCode) return fromCode;
+    var fromEntry = firstVaccineLabel(
+      entry ? [entry.descriptionText, entry.display, entry.name, entry.text] : []
+    );
+    if (fromEntry) return fromEntry;
+    var itemKind = String((item && item.type) || '').toLowerCase();
+    if (itemKind !== 'immunisation' && itemKind !== 'immunization') return '';
+    return firstVaccineLabel([item.descriptionText, item.title, item.text]);
+  }
+
+  function itemIsImmunisation(item) {
+    var kind = String((item && item.type) || '').toLowerCase();
+    return kind === 'immunisation' || kind === 'immunization';
+  }
+
+  function parseIsoOrDisplay(str) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(str || '').trim());
+    if (m) {
+      var iso = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+      if (!isNaN(iso.getTime())) return iso;
+    }
+    var slash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(str || '').trim());
+    if (slash) {
+      var uk = new Date(parseInt(slash[3], 10), parseInt(slash[2], 10) - 1, parseInt(slash[1], 10));
+      if (!isNaN(uk.getTime())) return uk;
+    }
+    return parseDisplayDate(str);
+  }
+
+  function administeredFromDisplay(str) {
+    var found = /Administered\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/i.exec(
+      String(str || '')
+    );
+    return found ? parseIsoOrDisplay(found[1]) : null;
+  }
+
+  // Administered date when the record has one. The document filed date and
+  // the day-group title are the fallback. recordDate alone is not preferred
+  // over an explicit administered field.
+  function vaccineClinicalDate(entry, fallbackDate) {
+    if (!entry) return fallbackDate || null;
+    return (
+      parseIsoOrDisplay(entry.administeredDate) ||
+      parseIsoOrDisplay(entry.dateAdministered) ||
+      parseIsoOrDisplay(entry.administrationDate) ||
+      parseIsoOrDisplay(entry.dateOfAdministration) ||
+      parseIsoOrDisplay(entry.occurrenceDateTime) ||
+      administeredFromDisplay(entry.administeredDateDisplay) ||
+      administeredFromDisplay(entry.text) ||
+      administeredFromDisplay(entry.additionalInformation) ||
+      parseIsoOrDisplay(entry.recordDate) ||
+      parseIsoOrDisplay(entry.observationDate) ||
+      fallbackDate ||
+      null
+    );
+  }
+
+  function attachmentLists(node) {
+    var lists = [];
+    if (!node || typeof node !== 'object') return lists;
+    var keys = ['careRecordElements', 'entries', 'linkedEntries', 'codesAndActions'];
+    for (var i = 0; i < keys.length; i++) {
+      var value = node[keys[i]];
+      if (Array.isArray(value)) lists.push(value);
+      else if (value && Array.isArray(value.entries)) lists.push(value.entries);
+    }
+    return lists;
+  }
+
+  function entryKindOf(entry) {
+    return String((entry && (entry.entryType || entry.type)) || '').toLowerCase();
+  }
+
+  function isImmunisationKind(kind) {
+    return kind === 'immunisation' || kind === 'immunization';
+  }
+
+  function documentIsImmunizationRecord(node) {
+    if (!node || typeof node !== 'object') return false;
+    var label = [node.documentTypeLabel, node.title, node.type, node.documentType]
+      .filter(function (part) {
+        return part != null && String(part).trim();
+      })
+      .join(' ');
+    return /immuni[sz]ation record/i.test(label);
+  }
+
+  function nodeFlagged(node) {
+    if (!node) return false;
+    return node.isMarkedIncorrect === true || node.isMarkedAsIncorrect === true || node.isDraft === true;
+  }
+
+  function documentIdOf(item, data) {
+    var id = (data && data.id) || (item && item.id) || null;
+    if (id == null) return null;
+    var s = String(id).trim();
+    return s || null;
+  }
+
+  function localIsoFromDate(d) {
+    if (!d || isNaN(d.getTime())) return null;
+    var m = d.getMonth() + 1;
+    var day = d.getDate();
+    return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (day < 10 ? '0' : '') + day;
+  }
+
+  function conceptIdLoose(entry) {
+    return conceptIdFromEntry(entry);
+  }
+
+  // True when the bulk document already carries a vaccine row, so the
+  // clinical/document/entries follow-up is not needed for that document.
+  function inlineHasVaccineAttachment(node) {
+    var lists = attachmentLists(node);
+    for (var i = 0; i < lists.length; i++) {
+      for (var j = 0; j < lists[i].length; j++) {
+        var child = lists[i][j];
+        if (!child || nodeFlagged(child)) continue;
+        var kind = entryKindOf(child);
+        var desc = visibleImmunisationName(child, null);
+        var code = conceptIdLoose(child);
+        if (isImmunisationKind(kind) && (desc || code)) return true;
+        if (
+          (kind === 'procedure' || kind === 'note') &&
+          VaccineGiven &&
+          VaccineGiven.isVaccineProcedureRecord &&
+          VaccineGiven.isVaccineProcedureRecord(desc, code)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Minimal numeric parse for history points (mirrors the common cases of
+  // engine/normalisers.js parseObservationValue — callers in the extension
+  // pass the real parseObservationValue in; this is the test/fallback impl).
+  function defaultParseValue(rawValue) {
+    if (rawValue == null) return NaN;
+    var s = String(rawValue).trim();
+    if (s === '') return NaN;
+    var bpMatch = s.match(/^(\d{2,3})\s*\/\s*\d{2,3}/);
+    if (bpMatch) return parseFloat(bpMatch[1]);
+    var stripped = s.replace(/^[<>~=≤≥]+\s*/, '');
+    var n = parseFloat(stripped);
+    return isFinite(n) ? n : NaN;
+  }
+
+  // Calendar day of a local Date. parseDisplayDate builds local midnight
+  // (`new Date(y, m, d)`). toISOString() then shifts that instant to UTC, so
+  // during British Summer Time every journal date is stored as the previous
+  // day — 21 Sep becomes 20 Sep, and a 1 Apr code lands in the previous QOF
+  // year. Dashboard dates are already YYYY-MM-DD, so the shift also breaks
+  // same-day de-dupe and draws a second trend point.
+  function localIsoDate(d) {
+    var m = d.getMonth() + 1;
+    var day = d.getDate();
+    return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (day < 10 ? '0' : '') + day;
+  }
+
+  // parseJournalObservations(payload, opts) → [{ name, value, date, source: 'journal' }]
+  //
+  // payload: the raw /clinical/data/patient-journal/overview/{patientId} JSON.
+  // opts:
+  //   existingObs — observations already extracted (investigation dashboard);
+  //                 used to de-dupe by lowercased name + ISO date.
+  //   now         — Date or ISO string for the recency window (default: today).
+  //   windowDays  — how far back to ingest observations and coded notes
+  //                 (default 400 — the "13 months" window
+  //                 shared/smoking-status.js's honest-absence wording is
+  //                 derived from; keep in sync). Immunisation entries ignore
+  //                 this and are kept for the whole payload. So does a coded
+  //                 note that is an RSV, pneumococcal or shingles record.
+  //                 Flu notes, COVID notes and every other note keep the window.
+  //                 A vaccine procedure follows the same split. Other
+  //                 procedures are not ingested.
+  //
+  // Walks BOTH confirmed shapes that carry coded observations:
+  //   - nested:  encounter items → consultationTopics → headings → entries
+  //              (entry.entryType === 'observation')
+  //   - flat:    top-level items with item.type === 'observation' whose
+  //              entry-like fields live on item.data (finer-grained
+  //              data.entryType confirmed in the 2026-07-02 full-entry scan)
+  // Pure and defensive: never throws on malformed payloads; unrecognised
+  // items are skipped, never guessed at.
+  function parseJournalObservations(payload, opts) {
+    var o = opts || {};
+    var windowDays = typeof o.windowDays === 'number' ? o.windowDays : 400;
+    var now = o.now ? new Date(o.now) : new Date();
+    var cutoff = new Date(now.getTime());
+    cutoff.setDate(cutoff.getDate() - windowDays);
+
+    var existingKeys = {};
+    (Array.isArray(o.existingObs) ? o.existingObs : []).forEach(function (obs) {
+      if (!obs) return;
+      existingKeys[String(obs.name || '').toLowerCase() + '|' + (obs.date || '')] = true;
+    });
+
+    var result = [];
+    var rowsByKey = {};
+
+    // Generic wrapper names carry no coded meaning — Medicus labels a
+    // standalone flat item with a UI wrapper title when the coded term lives
+    // in `value` instead. The rules engine matches observation NAMES only
+    // (filterMatchingObservations), so an entry named "Journal observation"
+    // with value "Ex-smoker" is invisible to every indicator (the SMOK002
+    // live NO DATA report, 2026-09-21).
+    var GENERIC_NAME_RE = /^(?:journal\s+)?(?:observation|entry)s?$/i;
+
+    // Naming hardening: promote the coded term out of `value` when the
+    // resolved name is absent/generic and the value reads as a term (has
+    // letters — never a bare numeric/BP reading — and is short enough to be
+    // a coded display name, not free text).
+    function resolveName(name, value) {
+      var n = name == null ? '' : String(name).trim();
+      var v = typeof value === 'string' ? value.trim() : '';
+      var generic = !n || GENERIC_NAME_RE.test(n);
+      if (generic && v && v.length <= 80 && /[a-z]/i.test(v)) return v;
+      return n || null;
+    }
+
+    // Concept id, when the payload has one. The bulk journal's confirmed
+    // coded-note field is clinicalCodeDescription; conceptId is not on every
+    // entry. Accept the shapes seen on notes and observations so a rule can
+    // match the code instead of a display string.
+    function conceptIdOf(entry) {
+      return conceptIdFromEntry(entry);
+    }
+
+    function outcomeOf(entry) {
+      if (!VaccineGiven || !VaccineGiven.structuredVaccineOutcome) return null;
+      return VaccineGiven.structuredVaccineOutcome(entry);
+    }
+
+    function pushEntry(name, value, entryDate, code, entryKind, outcome) {
+      if (!name || !entryDate) return;
+      // Lifetime immunisation history. One-off vaccines are not "recent
+      // observations". Seasonal rules still ignore a dose outside their
+      // own season. A coded note of an RSV, pneumococcal or shingles dose
+      // is the same history: the 400-day cap must not drop it. Flu, COVID,
+      // smoking and every other note keep the window.
+      var lifetimeNote =
+        (entryKind === 'note' || entryKind === 'procedure') &&
+        VaccineGiven &&
+        VaccineGiven.isLifetimeVaccineRecord &&
+        VaccineGiven.isLifetimeVaccineRecord(name, code);
+      if (entryKind !== 'immunisation' && !lifetimeNote && entryDate < cutoff) return;
+      var isoDate = localIsoDate(entryDate);
+      var nameKey = String(name).toLowerCase() + '|' + isoDate;
+      if (existingKeys[nameKey]) {
+        // A later row for the same coded day can be the one that says the
+        // dose was not given. Keep that status on the row already stored.
+        if (outcome && rowsByKey[nameKey] && !rowsByKey[nameKey].vaccineOutcome) {
+          rowsByKey[nameKey].vaccineOutcome = outcome;
+        }
+        return;
+      }
+      existingKeys[nameKey] = true; // de-dupe within journal results too
+      var row = {
+        name: name,
+        value: typeof value === 'string' ? value : '',
+        date: isoDate,
+        source: 'journal',
+      };
+      if (code) row.code = String(code);
+      if (entryKind) row.entryKind = entryKind;
+      if (outcome) row.vaccineOutcome = outcome;
+      rowsByKey[nameKey] = row;
+      result.push(row);
+    }
+
+    // The free-text note body is not a coded value. If the payload copies
+    // that body into `value`, drop it. A short coded value that is not the
+    // body is kept.
+    function codedValue(entry) {
+      var raw = typeof entry.value === 'string' ? entry.value : '';
+      var body = typeof entry.note === 'string' ? entry.note : '';
+      if (body && raw.trim() === body.trim()) return '';
+      return raw;
+    }
+
+    // ISO day (YYYY-MM-DD) or ISO datetime. Built as a local calendar day so
+    // British Summer Time does not shift it back a day. `created` is a
+    // migration timestamp and is never passed here.
+    function parseIsoDay(str) {
+      var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(str || '').trim());
+      if (!m) return null;
+      var d = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    function parseClinicalDate(str) {
+      return parseIsoDay(str) || parseDisplayDate(str);
+    }
+
+    // recordDate is the clinical date of a coded note. observationDate is the
+    // display form used on observations. The day-group title is only a
+    // fallback. created, createdDateTime and createdInOriginalSystemDateTime
+    // are system or migration timestamps and are not read.
+    function noteClinicalDate(entry, fallbackDate) {
+      return parseClinicalDate(entry.recordDate) || parseClinicalDate(entry.observationDate) || fallbackDate;
+    }
+
+    function flaggedIncorrectOrDraft(node) {
+      if (!node) return false;
+      return node.isMarkedIncorrect === true || node.isMarkedAsIncorrect === true || node.isDraft === true;
+    }
+
+    // A coded note is clinical evidence. Medicus files SNOMED terms under
+    // entryType "note" with the preferred term in clinicalCodeDescription.
+    // Uncoded free text (entry.note only) is not a code and stays out.
+    // A note marked incorrect, or still a draft, is not evidence.
+    function pushCodedNote(entry, fallbackDate, item) {
+      if (!entry || entry.entryType !== 'note') return;
+      if (flaggedIncorrectOrDraft(entry) || flaggedIncorrectOrDraft(item)) return;
+      var desc = entry.clinicalCodeDescription == null ? '' : String(entry.clinicalCodeDescription).trim();
+      if (!desc) return;
+      pushEntry(
+        desc,
+        codedValue(entry),
+        noteClinicalDate(entry, fallbackDate),
+        conceptIdOf(entry),
+        'note',
+        outcomeOf(entry)
+      );
+    }
+
+    // An Immunisation journal entry is administration evidence when its
+    // coded description, or the row label on the immunisation item itself,
+    // is an administration concept. The free-text note body is not read:
+    // VAC_* markers and "filed automatically with the invitation" live
+    // there and are not a dose. A document title is not the name.
+    function immunisationRowDate(entry, item, fallbackDate) {
+      var fromEntry = vaccineClinicalDate(entry, null);
+      if (fromEntry) return fromEntry;
+      if (itemIsImmunisation(item)) {
+        var fromLabel =
+          administeredFromDisplay(item.descriptionText) ||
+          administeredFromDisplay(item.title) ||
+          administeredFromDisplay(item.text);
+        if (fromLabel) return fromLabel;
+      }
+      return fallbackDate || null;
+    }
+
+    function pushImmunisation(entry, fallbackDate, item) {
+      if (!entry) return;
+      var kind = String(entry.entryType || (item && item.type) || '').toLowerCase();
+      if (kind !== 'immunisation' && kind !== 'immunization') return;
+      if (flaggedIncorrectOrDraft(entry) || flaggedIncorrectOrDraft(item)) return;
+      var code = conceptIdOf(entry);
+      var desc = visibleImmunisationName(entry, item);
+      if (!desc && code) desc = 'Immunisation';
+      if (!desc) return;
+      pushEntry(desc, codedValue(entry), immunisationRowDate(entry, item, fallbackDate), code, 'immunisation', outcomeOf(entry));
+    }
+
+    // A procedure is administration evidence only when the coded term or
+    // concept id is a vaccine record. Same date rules as a coded note:
+    // RSV, pneumococcal and shingles are kept for the whole payload; flu
+    // and COVID stay on the 400-day window and the season window still
+    // decides this season. The note body is not read.
+    function pushProcedure(entry, fallbackDate, item) {
+      if (!entry) return;
+      var kind = String(entry.entryType || (item && item.type) || '').toLowerCase();
+      if (kind !== 'procedure') return;
+      if (flaggedIncorrectOrDraft(entry) || flaggedIncorrectOrDraft(item)) return;
+      var code = conceptIdOf(entry);
+      var desc = descriptiveCode(entry);
+      if (!desc && code) desc = 'Procedure';
+      if (!desc) return;
+      if (
+        !VaccineGiven ||
+        !VaccineGiven.isVaccineProcedureRecord ||
+        !VaccineGiven.isVaccineProcedureRecord(desc, code)
+      ) {
+        return;
+      }
+      pushEntry(desc, codedValue(entry), vaccineClinicalDate(entry, fallbackDate), code, 'procedure', outcomeOf(entry));
+    }
+
+    // A document does not carry the dose in its own title. The coded
+    // immunisation, or a vaccine procedure or vaccine note, is an attached
+    // entry. Other notes on a letter stay out: ingesting every document
+    // note would pull unrelated codes into QOF. Invitations fail
+    // isVaccineProcedureRecord and are not attached as doses.
+    function asAttachedEntry(child) {
+      var entry = child || {};
+      var kind = entryKindOf(entry);
+      var entryType = entry.entryType;
+      if (!entryType) {
+        if (kind === 'immunization') entryType = 'immunisation';
+        else if (kind === 'immunisation' || kind === 'procedure' || kind === 'note') entryType = kind;
+      }
+      var desc = descriptiveCode(entry);
+      var next = entry;
+      if (entryType && entryType !== entry.entryType) next = Object.assign({}, next, { entryType: entryType });
+      if (desc && !next.clinicalCodeDescription) next = Object.assign({}, next, { clinicalCodeDescription: desc });
+      return next;
+    }
+
+    function pushDocumentNode(doc, fallbackDate, item) {
+      if (!doc || flaggedIncorrectOrDraft(doc) || flaggedIncorrectOrDraft(item)) return;
+      var when = parseIsoOrDisplay(doc.documentDate) || parseIsoOrDisplay(doc.recordDate) || fallbackDate;
+      var lists = attachmentLists(doc);
+      for (var a = 0; a < lists.length; a++) {
+        for (var n = 0; n < lists[a].length; n++) {
+          var child = asAttachedEntry(lists[a][n]);
+          if (flaggedIncorrectOrDraft(child)) continue;
+          var kind = String(child.entryType || '').toLowerCase();
+          if (kind === 'immunisation' || kind === 'immunization') {
+            pushImmunisation(child, when, item);
+          } else if (kind === 'procedure') {
+            pushProcedure(child, when, item);
+          } else if (kind === 'note') {
+            var noteCode = conceptIdOf(child);
+            var noteDesc = child.clinicalCodeDescription || descriptiveCode(child);
+            if (
+              !VaccineGiven ||
+              !VaccineGiven.isVaccineProcedureRecord ||
+              !VaccineGiven.isVaccineProcedureRecord(noteDesc, noteCode)
+            ) {
+              continue;
+            }
+            var administered = vaccineClinicalDate(child, when);
+            var noteEntry = administered
+              ? Object.assign({}, child, { recordDate: localIsoFromDate(administered) })
+              : child;
+            pushCodedNote(noteEntry, when, item);
+          }
+        }
+      }
+    }
+
+    try {
+      var records = (payload && payload.patientJournalRecords) || [];
+      for (var r = 0; r < records.length; r++) {
+        var record = records[r] || {};
+        var groupDate = parseDisplayDate(record.title);
+        var items = record.items || [];
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i] || {};
+          // Flat top-level observation item — standalone "Journal Observation"
+          // coded outside a consultation (live-consult gap 1 above).
+          if (item.type === 'observation') {
+            var fd = item.data || {};
+            if (fd.entryType && fd.entryType !== 'observation') continue;
+            pushEntry(
+              resolveName(fd.type || item.title || null, fd.value),
+              fd.value,
+              parseDisplayDate(fd.observationDate) || groupDate,
+              conceptIdOf(fd),
+              null,
+              outcomeOf(fd)
+            );
+            continue;
+          }
+          // Flat coded note (same contract as a nested consultation note).
+          if (item.type === 'note') {
+            var nd = item.data || {};
+            if (!nd.entryType) nd = Object.assign({ entryType: 'note' }, nd);
+            pushCodedNote(nd, groupDate, item);
+            continue;
+          }
+          if (item.type === 'immunisation' || item.type === 'immunization') {
+            var imd = item.data || {};
+            if (!imd.entryType) imd = Object.assign({ entryType: 'immunisation' }, imd);
+            pushImmunisation(imd, groupDate, item);
+            continue;
+          }
+          if (item.type === 'procedure') {
+            var pd = item.data || {};
+            if (!pd.entryType) pd = Object.assign({ entryType: 'procedure' }, pd);
+            pushProcedure(pd, groupDate, item);
+            continue;
+          }
+          // Inbound document. Pharmacy and GP Connect file the dose as an
+          // Immunisation nested on an "Immunization record" document, not
+          // as its own top-level immunisation item.
+          if (item.type === 'document' || item.type === 'fit-note') {
+            pushDocumentNode(item.data || {}, groupDate, item);
+            continue;
+          }
+          // Nested consultation-coded entries (the original path).
+          if (item.type !== 'encounter') continue;
+          var topics = (item.data && item.data.consultationTopics) || [];
+          for (var t = 0; t < topics.length; t++) {
+            var headings = (topics[t] && topics[t].headings) || [];
+            for (var h = 0; h < headings.length; h++) {
+              var entries = (headings[h] && headings[h].entries) || [];
+              for (var e = 0; e < entries.length; e++) {
+                var entry = entries[e] || {};
+                if (entry.entryType === 'note') {
+                  pushCodedNote(entry, groupDate, item);
+                  continue;
+                }
+                if (entry.entryType === 'immunisation' || entry.entryType === 'immunization') {
+                  pushImmunisation(entry, groupDate, item);
+                  continue;
+                }
+                if (entry.entryType === 'procedure') {
+                  pushProcedure(entry, groupDate, item);
+                  continue;
+                }
+                if (entry.entryType === 'document' || entry.entryType === 'fit-note') {
+                  pushDocumentNode(entry, groupDate, item);
+                  continue;
+                }
+                // Skip entries missing a type name, or that aren't observations
+                // (e.g. medications, problems, uncoded notes).
+                if (!entry.type || entry.entryType !== 'observation') continue;
+                pushEntry(
+                  resolveName(entry.type, entry.value),
+                  entry.value,
+                  parseDisplayDate(entry.observationDate) || groupDate,
+                  conceptIdOf(entry),
+                  null,
+                  outcomeOf(entry)
+                );
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Defensive only — a malformed record must not lose the entries already
+      // parsed. Callers treat the returned array as best-effort.
+    }
+    return result;
+  }
+
+  // Immunization record documents whose bulk payload did not already carry
+  // a vaccine row. Linked entries for a document were confirmed at
+  // GET clinical/document/entries/{id} ({ entries: [{ type, code, text }] }),
+  // and careRecordElements on the preview was empty (2026-07-08). The caller
+  // fetches those ids. A document that already has the dose inline is omitted.
+  function immunizationRecordDocumentsNeedingEntries(payload) {
+    var out = [];
+    var seen = {};
+    function consider(item, data, groupDate) {
+      var node = data || {};
+      if (nodeFlagged(node) || nodeFlagged(item)) return;
+      var labelSource = {
+        documentTypeLabel: node.documentTypeLabel,
+        title: node.title || (item && item.title) || '',
+        type: node.documentType || node.type || (item && item.type) || '',
+        documentType: node.documentType,
+      };
+      if (!documentIsImmunizationRecord(labelSource)) return;
+      if (inlineHasVaccineAttachment(node)) return;
+      var id = documentIdOf(item, node);
+      if (!id || seen[id]) return;
+      seen[id] = true;
+      var when = parseIsoOrDisplay(node.documentDate) || parseIsoOrDisplay(node.recordDate) || groupDate;
+      out.push({ id: id, fallbackDate: localIsoFromDate(when) });
+    }
+    try {
+      var records = (payload && payload.patientJournalRecords) || [];
+      for (var r = 0; r < records.length; r++) {
+        var record = records[r] || {};
+        var groupDate = parseDisplayDate(record.title);
+        var items = record.items || [];
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i] || {};
+          if (item.type === 'document' || item.type === 'fit-note') {
+            consider(item, item.data || {}, groupDate);
+            continue;
+          }
+          if (item.type !== 'encounter') continue;
+          var topics = (item.data && item.data.consultationTopics) || [];
+          for (var t = 0; t < topics.length; t++) {
+            var headings = (topics[t] && topics[t].headings) || [];
+            for (var h = 0; h < headings.length; h++) {
+              var entries = (headings[h] && headings[h].entries) || [];
+              for (var e = 0; e < entries.length; e++) {
+                var entry = entries[e] || {};
+                if (entry.entryType === 'document' || entry.entryType === 'fit-note') consider(item, entry, groupDate);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Same best-effort rule as the parser.
+    }
+    return out;
+  }
+
+  // entries: the array from clinical/document/entries/{id}, or the
+  // { entries: [...] } wrapper. fallbackDate is YYYY-MM-DD from the document.
+  function parseDocumentEntryList(entries, fallbackDate, opts) {
+    var list = Array.isArray(entries) ? entries : entries && Array.isArray(entries.entries) ? entries.entries : [];
+    var day = fallbackDate ? String(fallbackDate).slice(0, 10) : '';
+    var title = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      var parts = day.split('-');
+      var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      title = 'Mon ' + String(parseInt(parts[2], 10)) + ' ' + months[parseInt(parts[1], 10) - 1] + ' ' + parts[0];
+    }
+    return parseJournalObservations(
+      {
+        patientJournalRecords: [
+          {
+            title: title,
+            items: [
+              {
+                type: 'document',
+                data: {
+                  entryType: 'document',
+                  documentTypeLabel: 'Immunization record',
+                  documentDate: day || null,
+                  entries: list,
+                },
+              },
+            ],
+          },
+        ],
+      },
+      opts || {}
+    );
+  }
+
+  // mergeJournalObsIntoHistory(observationHistory, journalObs, parseValue?) →
+  // a NEW observationHistory array with the journal observations folded in,
+  // so Trends / brief / passport (which read data.observationHistory, not
+  // data.observations) see journal-coded readings (live-consult gap 2 above).
+  //
+  //   - Merges into an existing group on exact (case-insensitive) name match;
+  //     otherwise creates a new group.
+  //   - A new group named exactly "Blood pressure" is UNSHIFTED to the front —
+  //     the same convention as normaliseObservationHistory's synthesised BP
+  //     group, so first-hit consumers (brief-core/passport-core find()) still
+  //     land on it. All other new groups are appended, so substring matchers
+  //     (e.g. Trends seriesFor 'weight') keep preferring the dashboard's
+  //     fuller series.
+  //   - Same-date entries already in a group win (the dashboard is
+  //     authoritative); journal points never overwrite them.
+  //   - History stays newest-first (the observationHistory contract).
+  // Never mutates the input arrays/groups.
+  function mergeJournalObsIntoHistory(observationHistory, journalObs, parseValue) {
+    var base = Array.isArray(observationHistory) ? observationHistory : [];
+    if (!Array.isArray(journalObs) || journalObs.length === 0) return base;
+    var pv = typeof parseValue === 'function' ? parseValue : defaultParseValue;
+    var out = base.map(function (g) {
+      return Object.assign({}, g, { history: Array.isArray(g.history) ? g.history.slice() : [] });
+    });
+    var byName = {};
+    out.forEach(function (g) {
+      byName[String(g.name || '').toLowerCase()] = g;
+    });
+    journalObs.forEach(function (obs) {
+      if (!obs || !obs.name || !obs.date) return;
+      var key = String(obs.name).toLowerCase();
+      var group = byName[key];
+      if (!group) {
+        group = {
+          name: obs.name,
+          code: obs.code != null && String(obs.code).trim() !== '' ? String(obs.code) : null,
+          group: null,
+          unit: null,
+          history: [],
+        };
+        byName[key] = group;
+        if (key === 'blood pressure') out.unshift(group);
+        else out.push(group);
+      }
+      var duplicate = group.history.some(function (h) {
+        return h && h.date === obs.date;
+      });
+      if (duplicate) return; // dashboard point for that date is authoritative
+      var point = {
+        date: obs.date,
+        value: pv(obs.value),
+        rawValue: String(obs.value == null ? '' : obs.value),
+        isAbove: false,
+        isBelow: false,
+        source: 'journal',
+      };
+      if (obs.vaccineOutcome) point.vaccineOutcome = obs.vaccineOutcome;
+      group.history.push(point);
+      group.history.sort(function (a, b) {
+        return b.date < a.date ? -1 : b.date > a.date ? 1 : 0;
+      });
+    });
+    return out;
+  }
+
+  var api = {
+    parseJournalObservations: parseJournalObservations,
+    mergeJournalObsIntoHistory: mergeJournalObsIntoHistory,
+    parseDisplayDate: parseDisplayDate,
+    immunizationRecordDocumentsNeedingEntries: immunizationRecordDocumentsNeedingEntries,
+    parseDocumentEntryList: parseDocumentEntryList,
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  } else {
+    global.JournalObservations = api;
+  }
+})(typeof window !== 'undefined' ? window : typeof globalThis !== 'undefined' ? globalThis : global);

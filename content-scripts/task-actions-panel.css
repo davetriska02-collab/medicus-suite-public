@@ -1,0 +1,1550 @@
+/* Medicus Suite — "Book appointment" / "Create task" floating panel for task pages */
+/* All selectors scoped to #ms-tap-widget to avoid Medicus style conflicts */
+
+/* Fixed-position floating panel — deliberately NOT nested inline in
+   Medicus's own page flow, so it survives SPA re-renders and pane-switching
+   without depending on finding a card that may not exist yet (or at all).
+   See the file header comment in task-actions-panel.js. */
+#ms-tap-widget {
+  /* Self-contained token block — light-theme canon (host page is light).
+     See .claude/skills/ui-design/TOKENS.md §Injected surfaces. New due-list
+     rules consume these; pre-existing panel chrome keeps its hexes. */
+  --text-1: #0f172a;
+  --text-2: #1e3a5f;
+  --text-3: #475569;
+  --text-4: #556377;
+  --text-5: #5f6f85;
+  --bg-deep: #f8fafc;
+  --bg-mid: #f1f5f9;
+  --bg-elev: #ffffff;
+  --border: #cbd5e1;
+  --border-hi: #94a3b8;
+  --amber: #b45309;
+  --amber-dim: rgba(180, 83, 9, 0.09);
+  --amber-line: rgba(180, 83, 9, 0.32);
+  --red: #dc2626;
+  --red-dim: rgba(220, 38, 38, 0.08);
+  --red-line: rgba(220, 38, 38, 0.3);
+  --red-ink: #b91c1c;
+  --amber-ink: #92400e;
+  --green: #16a34a;
+  --green-dim: rgba(22, 163, 74, 0.09);
+  --accent: #2563eb;
+  --accent-dim: rgba(37, 99, 235, 0.09);
+  --accent-line: rgba(37, 99, 235, 0.3);
+  --accent-hover: #1d4ed8;
+  --bg-hover: #e2eaf5;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-pill: 999px;
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-2: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.14);
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --med: 200ms;
+  --mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  position: fixed;
+  top: 72px;
+  right: 20px;
+  bottom: auto;
+  z-index: 999999;
+  width: 340px;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 92px);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--text-1);
+  box-shadow: var(--shadow-3);
+  border-radius: var(--r-lg);
+}
+
+#ms-tap-widget::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+#ms-tap-widget .ms-tap-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-2);
+  flex-shrink: 0;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+#ms-tap-widget.ms-tap-dragging .ms-tap-header {
+  cursor: grabbing;
+}
+
+#ms-tap-widget:has(.ms-tap-body) .ms-tap-header {
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+}
+
+#ms-tap-widget:not(:has(.ms-tap-body)) .ms-tap-header {
+  border-radius: var(--r-lg);
+}
+
+#ms-tap-widget .ms-tap-grip {
+  width: 8px;
+  height: 14px;
+  flex-shrink: 0;
+  background-image: radial-gradient(circle, var(--text-5) 1.1px, transparent 1.25px);
+  background-size: 4px 5px;
+  background-repeat: repeat;
+  opacity: 0.7;
+}
+
+#ms-tap-widget .ms-tap-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+#ms-tap-widget .ms-tap-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#ms-tap-widget .ms-tap-header-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  min-width: 0;
+  flex: 1;
+}
+
+#ms-tap-widget .ms-tap-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+#ms-tap-widget .ms-tap-title {
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0;
+}
+
+#ms-tap-widget .ms-tap-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+#ms-tap-widget .ms-tap-chrome {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+#ms-tap-widget .ms-tap-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-4);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+
+#ms-tap-widget .ms-tap-icon-btn:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-hi);
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-icon-btn:active {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget.ms-tap-minimised .ms-tap-title {
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+#ms-tap-widget.ms-tap-minimised .ms-tap-due-count {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#ms-tap-widget.ms-tap-minimised.ms-tap-signal-red::before,
+#ms-tap-widget.ms-tap-docked.ms-tap-signal-red::before {
+  background: var(--red);
+  height: 3px;
+}
+
+#ms-tap-widget.ms-tap-minimised.ms-tap-signal-amber::before,
+#ms-tap-widget.ms-tap-docked.ms-tap-signal-amber::before {
+  background: var(--amber);
+  height: 3px;
+}
+
+#ms-tap-widget.ms-tap-docked {
+  top: 40%;
+  right: 0;
+  left: auto;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  max-height: none;
+  box-shadow: var(--shadow-2);
+  border-radius: var(--r-lg) 0 0 var(--r-lg);
+}
+
+#ms-tap-widget.ms-tap-docked::before {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: auto;
+  width: 2px;
+  height: auto;
+  border-radius: var(--r-lg) 0 0 var(--r-lg);
+}
+
+#ms-tap-widget.ms-tap-docked.ms-tap-signal-red::before,
+#ms-tap-widget.ms-tap-docked.ms-tap-signal-amber::before {
+  width: 3px;
+  height: auto;
+}
+
+#ms-tap-widget .ms-tap-dock-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 8px;
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: var(--r-lg) 0 0 var(--r-lg);
+  background: var(--bg-mid);
+  color: var(--text-2);
+  font: 600 11px/1.2 var(--sans);
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    transform var(--med) var(--ease);
+}
+
+#ms-tap-widget .ms-tap-dock-tab:hover {
+  background: var(--bg-hover);
+  transform: translateX(-2px);
+}
+
+#ms-tap-widget .ms-tap-dock-tab:active {
+  background: var(--accent-dim);
+}
+
+#ms-tap-widget .ms-tap-dock-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget .ms-tap-dock-chevron {
+  display: flex;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-dock-tab:hover .ms-tap-dock-chevron {
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-dock-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+#ms-tap-widget .ms-tap-dock-tab .ms-tap-due-count {
+  margin-left: 0;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#ms-tap-widget .ms-tap-focus-note {
+  padding: 8px 10px 0;
+}
+
+#ms-tap-widget .ms-tap-chrome-footer {
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+#ms-tap-widget .ms-tap-everywhere {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+#ms-tap-widget .ms-tap-everywhere input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+#ms-tap-widget .ms-tap-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  background:
+    linear-gradient(135deg, transparent 0 55%, var(--border) 55% 65%, transparent 65% 75%, var(--border) 75% 85%, transparent 85%);
+}
+
+#ms-tap-widget.ms-tap-resizing {
+  user-select: none;
+}
+
+#ms-tap-widget:has(.ms-tap-body) {
+  position: fixed;
+}
+
+#ms-tap-widget.ms-tap-minimised {
+  width: max-content;
+  min-width: 0;
+  max-height: none;
+}
+
+#ms-tap-widget .ms-tap-roles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+#ms-tap-widget .ms-tap-role {
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--bg-elev);
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+
+#ms-tap-widget .ms-tap-role:hover {
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-role:active {
+  background: var(--accent-dim);
+}
+
+#ms-tap-widget .ms-tap-role.is-selected {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-role:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget .ms-tap-role-caption {
+  margin: 2px 0 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-4);
+  line-height: 1.35;
+}
+
+#ms-tap-widget .ms-tap-due-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-text-btn {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+#ms-tap-widget .ms-tap-text-btn:hover {
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-text-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#ms-tap-widget .ms-tap-glance-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#ms-tap-widget .ms-tap-glance-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+#ms-tap-widget .ms-tap-glance-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-glance-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  text-align: right;
+}
+
+#ms-tap-widget .ms-tap-glance-lead {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  line-height: 1.4;
+}
+
+#ms-tap-widget #ms-tap-pulse-head {
+  cursor: default;
+}
+
+#ms-tap-widget #ms-tap-pulse-head:hover {
+  background: transparent;
+}
+
+#ms-tap-widget .ms-tap-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-4);
+  margin-left: 2px;
+  font-size: 9px;
+  transition: transform var(--med) var(--ease);
+}
+
+#ms-tap-widget .ms-tap-chevron.is-collapsed {
+  transform: rotate(-90deg);
+}
+
+#ms-tap-widget .ms-tap-body {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+#ms-tap-widget .ms-tap-section + .ms-tap-section {
+  border-top: 1px solid #e5e7eb;
+}
+
+#ms-tap-widget .ms-tap-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-section-header:hover {
+  background: var(--bg-hover);
+}
+
+#ms-tap-widget .ms-tap-section-header:focus-visible,
+#ms-tap-widget .ms-tap-header-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget .ms-tap-section-header:active {
+  background: var(--bg-hover);
+}
+
+#ms-tap-widget .ms-tap-section-body {
+  padding: 4px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#ms-tap-widget .ms-tap-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#ms-tap-widget .ms-tap-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+#ms-tap-widget .ms-tap-select,
+#ms-tap-widget .ms-tap-date-input,
+#ms-tap-widget .ms-tap-text-input,
+#ms-tap-widget .ms-tap-textarea {
+  padding: 7px 10px;
+  border: 1px solid #c8cdd6;
+  border-radius: 5px;
+  font-size: 13px;
+  color: #1a2030;
+  background: #fff;
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+#ms-tap-widget .ms-tap-textarea {
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.4;
+}
+
+#ms-tap-widget .ms-tap-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+#ms-tap-widget .ms-tap-btn {
+  padding: 8px 16px;
+  background: var(--accent);
+  color: var(--bg-deep);
+  border: none;
+  border-radius: var(--r-md);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-start;
+  font-family: inherit;
+}
+
+#ms-tap-widget .ms-tap-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+#ms-tap-widget .ms-tap-btn:focus-visible,
+#ms-tap-widget .ms-tap-btn-ghost:focus-visible,
+#ms-tap-widget .ms-tap-bk-slot:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget .ms-tap-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#ms-tap-widget .ms-tap-btn-ghost {
+  padding: 7px 14px;
+  background: transparent;
+  color: #2563eb;
+  border: 1px solid #c3cef5;
+  border-radius: 5px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+#ms-tap-widget .ms-tap-btn-ghost:hover:not(:disabled) {
+  background: #f0f4ff;
+}
+
+#ms-tap-widget .ms-tap-btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#ms-tap-widget .ms-tap-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#ms-tap-widget .ms-tap-loading {
+  font-size: 13px;
+  color: #666;
+  font-style: italic;
+}
+
+#ms-tap-widget .ms-tap-error {
+  padding: 8px 10px;
+  background: #fff5f5;
+  border: 1px solid #fca5a5;
+  border-radius: 5px;
+  font-size: 13px;
+  color: #b91c1c;
+}
+
+#ms-tap-widget .ms-tap-warn {
+  padding: 8px 10px;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 5px;
+  font-size: 13px;
+  color: #92400e;
+}
+
+/* Patient-record section (triage tasks only) — future appointments + unused
+   booking links. Read-only, so no button/warn styling of its own beyond the
+   shared section-body layout above. Inter-group spacing comes from the
+   parent .ms-tap-section-body's own flex gap (10px) — no extra margin here,
+   that doubled it up to 22px and read as too spaced out. */
+#ms-tap-widget .ms-tap-rec-heading {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 4px;
+}
+
+#ms-tap-widget .ms-tap-rec-heading:hover {
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-rec-heading:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#ms-tap-widget .ms-tap-rec-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+#ms-tap-widget .ms-tap-rec-row {
+  padding: 7px 9px;
+  border: 1px solid #e5e7eb;
+  border-radius: 5px;
+  background: #fafbfc;
+}
+
+/* Booking links / open tasks — single-line lozenge, same card shape as a
+   What's due item, deliberately uncoloured (no dot, no left-rail) since
+   neither list carries a real severity signal the way due items do. */
+#ms-tap-widget .ms-tap-rec-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+#ms-tap-widget .ms-tap-rec-pill-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ms-tap-widget .ms-tap-rec-pill-reason {
+  font-style: italic;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+#ms-tap-widget .ms-tap-rec-row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#ms-tap-widget .ms-tap-rec-when {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1a2030;
+}
+
+#ms-tap-widget .ms-tap-rec-status {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  color: #374151;
+}
+
+#ms-tap-widget .ms-tap-rec-status-pending {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+#ms-tap-widget .ms-tap-rec-status-seen {
+  background: #dcfce7;
+  color: #166534;
+}
+
+#ms-tap-widget .ms-tap-rec-status-cancelled {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+#ms-tap-widget .ms-tap-rec-status-did-not-attend {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+#ms-tap-widget .ms-tap-rec-status-rescheduled {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+#ms-tap-widget .ms-tap-rec-status-overdue {
+  background: var(--red-dim);
+  color: var(--red);
+}
+
+#ms-tap-widget .ms-tap-rec-row-detail {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #555;
+}
+
+#ms-tap-widget .ms-tap-rec-row-reason {
+  margin-top: 4px;
+  font-size: 12px;
+  font-style: italic;
+  color: #666;
+}
+
+#ms-tap-widget .ms-tap-rec-caption {
+  font-size: 11px;
+  color: var(--text-4);
+  margin-bottom: 6px;
+}
+
+#ms-tap-widget .ms-tap-rec-empty {
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
+}
+
+#ms-tap-widget .ms-tap-bk-slot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+#ms-tap-widget .ms-tap-bk-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  width: 100%;
+  font-family: inherit;
+}
+
+#ms-tap-widget .ms-tap-bk-slot:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+#ms-tap-widget .ms-tap-bk-slot-time {
+  font-weight: 700;
+  color: #1a2030;
+  flex-shrink: 0;
+}
+
+#ms-tap-widget .ms-tap-bk-slot-dur {
+  color: #666;
+  font-size: 12px;
+}
+
+#ms-tap-widget .ms-tap-bk-slot-site {
+  color: #888;
+  font-size: 12px;
+  margin-left: auto;
+}
+
+#ms-tap-widget .ms-tap-no-slots {
+  font-size: 13px;
+  color: #666;
+  font-style: italic;
+}
+
+#ms-tap-widget .ms-tap-summary {
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#ms-tap-widget .ms-tap-success {
+  align-items: center;
+  text-align: center;
+}
+
+#ms-tap-widget .ms-tap-success-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: #dcfce7;
+  color: #166534;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+/* What's due — miniaturised Sentinel brief. Hue is never the only signal:
+   red dot is filled, amber is a hollow ring, plus an Overdue / Due soon tag. */
+#ms-tap-widget .ms-tap-due-count {
+  margin-left: auto;
+  min-width: 1.4em;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  background: var(--bg-mid);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+}
+
+#ms-tap-widget .ms-tap-due-count-red {
+  background: var(--red-dim);
+  color: var(--red);
+  border-color: var(--red-line);
+}
+
+#ms-tap-widget .ms-tap-due-count-amber {
+  background: var(--amber-dim);
+  color: var(--amber);
+  border-color: var(--amber-line);
+}
+
+#ms-tap-widget .ms-tap-due-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#ms-tap-widget .ms-tap-due-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+/* Calm field, sharp signal: the row itself stays a plain card — full-strength
+   red/amber salience lives on the 3px left rail, the dot and the tag, never
+   as a wash across the whole row. */
+#ms-tap-widget .ms-tap-due-red {
+  border-left: 3px solid var(--red);
+}
+
+#ms-tap-widget .ms-tap-due-amber {
+  border-left: 3px solid var(--amber);
+}
+
+#ms-tap-widget .ms-tap-due-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+#ms-tap-widget .ms-tap-due-red .ms-tap-due-dot {
+  background: var(--red);
+  border: 2px solid var(--red);
+}
+
+#ms-tap-widget .ms-tap-due-amber .ms-tap-due-dot {
+  background: transparent;
+  border: 2px solid var(--amber);
+}
+
+#ms-tap-widget .ms-tap-due-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-due-tag {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding-top: 2px;
+}
+
+#ms-tap-widget .ms-tap-due-red .ms-tap-due-tag {
+  color: var(--red-ink);
+}
+
+#ms-tap-widget .ms-tap-due-amber .ms-tap-due-tag {
+  color: var(--amber-ink);
+}
+
+#ms-tap-widget .ms-tap-due-more {
+  font-size: 11px;
+  color: var(--text-4);
+  padding: 2px 2px 0;
+}
+
+#ms-tap-widget .ms-tap-due-more-red {
+  color: var(--red);
+  font-weight: 600;
+}
+
+#ms-tap-widget .ms-tap-due-empty {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+#ms-tap-widget .ms-tap-due-empty-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-due-loading {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text-4);
+  font-style: normal;
+}
+
+#ms-tap-widget .ms-tap-due-error {
+  padding: 8px 10px;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-md);
+  font-size: 13px;
+  color: var(--amber);
+}
+
+#ms-tap-widget .ms-tap-due-degraded {
+  padding: 3px 8px;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  color: var(--amber);
+  line-height: 1.35;
+}
+
+#ms-tap-widget .ms-tap-due-degraded + .ms-tap-due-degraded {
+  margin-top: 4px;
+}
+
+#ms-tap-widget .ms-tap-due-retry {
+  display: inline-block;
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+
+#ms-tap-widget .ms-tap-due-retry:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-due-retry:active {
+  background: var(--accent-dim);
+}
+
+#ms-tap-widget .ms-tap-due-retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #ms-tap-widget .ms-tap-icon-btn,
+  #ms-tap-widget .ms-tap-role,
+  #ms-tap-widget .ms-tap-dock-tab,
+  #ms-tap-widget .ms-tap-chevron,
+  #ms-tap-widget .ms-tap-due-retry {
+    transition: none;
+  }
+
+  #ms-tap-widget .ms-tap-dock-tab:hover {
+    transform: none;
+  }
+}
+
+/* Lab Filing (Companion fold-in stage 1, 2026-09-27) — header/reasons/"Matched to your request" moved here from
+   content-scripts/triage-lens/lab-file-button.js's own .chlf-* styling; content only, this section is not
+   collapsible (no chevron), so its header gets no click affordance unlike every other section. */
+#ms-tap-widget .ms-tap-lf .ms-tap-section-header {
+  cursor: default;
+}
+
+#ms-tap-widget .ms-tap-lf .ms-tap-section-header:hover,
+#ms-tap-widget .ms-tap-lf .ms-tap-section-header:active {
+  background: none;
+}
+
+#ms-tap-widget .ms-tap-lf-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-lf-title.ms-tap-lf-blocked {
+  color: var(--amber-ink);
+}
+
+#ms-tap-widget .ms-tap-lf-title.ms-tap-lf-ready {
+  color: var(--green);
+}
+
+#ms-tap-widget .ms-tap-lf-title.ms-tap-lf-info {
+  color: var(--text-2);
+}
+
+#ms-tap-widget .ms-tap-lf-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+#ms-tap-widget .ms-tap-lf-reasons {
+  padding: 8px 10px;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-md);
+  font-size: 12px;
+  color: var(--amber);
+}
+
+#ms-tap-widget .ms-tap-lf-reasons summary {
+  cursor: pointer;
+  font-weight: 600;
+  list-style: revert;
+}
+
+#ms-tap-widget .ms-tap-lf-reasons-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  line-height: 1.45;
+}
+
+/* Inline confirm affordance inside "OUTSTANDING INVESTIGATIONS" rows (renderInvestigationRow) — replaces the
+   stage-1 standalone "Matched to your request" box; deliberately a text-button, not a bordered pill, so it reads
+   as part of the existing row rather than a second, competing UI element. */
+#ms-tap-widget .ms-tap-lf-inv-confirm {
+  color: var(--green);
+}
+
+/* Companion fold-in stage 2 (2026-09-27) — whitelist/unapproved-groups boxes, File/message buttons, suppress
+   link and the inline toast, ported from lab-file-button.js's own .chlf-* styling (now deleted) onto the
+   ms-tap- token system. */
+#ms-tap-widget .ms-tap-lf-wl {
+  padding: 8px 10px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#ms-tap-widget .ms-tap-lf-wl-intro {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  margin-bottom: 2px;
+}
+
+#ms-tap-widget .ms-tap-lf-wl-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+#ms-tap-widget .ms-tap-lf-wl-row input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+#ms-tap-widget .ms-tap-lf-wl-row strong {
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-lf-wl-note {
+  font-size: 10.5px;
+  color: var(--text-5);
+  margin-top: 4px;
+}
+
+#ms-tap-widget .ms-tap-lf-wl-save {
+  width: 100%;
+}
+
+#ms-tap-widget .ms-tap-lf-open-setup {
+  flex-shrink: 0;
+}
+
+#ms-tap-widget .ms-tap-lf-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+#ms-tap-widget .ms-tap-lf-file-btn {
+  appearance: none;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--green);
+  color: #fff;
+  font: 600 13px/1.2 var(--sans);
+  padding: 10px 12px;
+  cursor: pointer;
+  text-align: center;
+}
+
+#ms-tap-widget .ms-tap-lf-file-btn:hover {
+  filter: brightness(0.93);
+}
+
+#ms-tap-widget .ms-tap-lf-file-secondary {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  color: var(--green);
+}
+
+#ms-tap-widget .ms-tap-lf-suppress {
+  align-self: flex-end;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-lf-toast {
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  font-size: 12px;
+  color: #fff;
+}
+
+#ms-tap-widget .ms-tap-lf-toast-ok {
+  background: var(--green);
+}
+
+#ms-tap-widget .ms-tap-lf-toast-warn {
+  background: var(--amber);
+}
+
+#ms-tap-widget .ms-tap-lf-toast-err {
+  background: var(--red);
+}
+
+/* "Investigation results" rework (2026-10-04): requests table + one row per report group, with chips that open a detail box
+   under the row. Colour carries meaning — amber = a problem you can read about ([why]/[show]), accent = open / an action you
+   can take, green = fine, grey = neutral. The open box shares the accent bar of its row so the two read as one thing (no
+   connector line: the panel resizes and scrolls). Tokens are the panel's own (see the block at the top of this file). */
+#ms-tap-widget .ms-tap-lf-sec {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+#ms-tap-widget .ms-tap-lf-sec-sub {
+  margin-top: 6px;
+}
+
+#ms-tap-widget .ms-tap-lf-sec-note {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--amber-ink);
+}
+
+#ms-tap-widget .ms-tap-lf-muted {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-lf-ok {
+  font-size: 11px;
+  color: var(--green);
+}
+
+#ms-tap-widget .ms-tap-lf-matched {
+  font-size: 11px;
+  color: var(--accent);
+}
+
+#ms-tap-widget .ms-tap-lf-placeholder {
+  color: var(--text-4);
+  border-bottom: 1px dashed var(--border-hi);
+}
+
+#ms-tap-widget .ms-tap-lf-reqs {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+}
+
+#ms-tap-widget .ms-tap-lf-req {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-lf-reqs > * + * {
+  border-top: 1px solid var(--border);
+}
+
+/* The [why] box of an unmatched result sits INSIDE the table, directly under its row, with the same accent bar the
+   assisted-filing boxes use (no connector line — see the note above). */
+#ms-tap-widget .ms-tap-lf-why-row {
+  box-shadow: inset 3px 0 0 var(--accent);
+  border-top: 1px solid var(--accent-line);
+}
+
+#ms-tap-widget .ms-tap-lf-req-st {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+  text-align: right;
+}
+
+#ms-tap-widget .ms-tap-lf-req-name small {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-4);
+}
+
+#ms-tap-widget .ms-tap-lf-chip-res {
+  display: inline-block;
+  margin: 1px 3px 1px 0;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--green-dim);
+  background: var(--green-dim);
+  color: var(--green);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+#ms-tap-widget .ms-tap-lf-grp {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+}
+
+#ms-tap-widget .ms-tap-lf-grp-open {
+  box-shadow: inset 3px 0 0 var(--accent);
+  border-color: var(--accent-line);
+}
+
+#ms-tap-widget .ms-tap-lf-grp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+#ms-tap-widget .ms-tap-lf-grp-name {
+  font-weight: 600;
+  color: var(--text-1);
+  flex: 0 0 auto;
+}
+
+#ms-tap-widget .ms-tap-lf-grp-state {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--amber-ink);
+}
+
+#ms-tap-widget .ms-tap-lf-grp-row .ms-tap-lf-ok {
+  flex: 1 1 auto;
+}
+
+#ms-tap-widget .ms-tap-lf-grp-row .ms-tap-lf-chip {
+  margin-left: auto;
+}
+
+#ms-tap-widget .ms-tap-lf-why {
+  padding: 7px 9px 9px;
+  border-top: 1px solid var(--accent-line);
+  background: var(--accent-dim);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-1);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+#ms-tap-widget .ms-tap-lf-grp-report {
+  border-color: var(--amber-line);
+}
+
+#ms-tap-widget .ms-tap-lf-why-report {
+  border-top: 0;
+  background: var(--amber-dim);
+}
+
+#ms-tap-widget .ms-tap-lf-res {
+  margin: 0;
+  padding-left: 16px;
+}
+
+#ms-tap-widget .ms-tap-lf-sub-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+#ms-tap-widget .ms-tap-lf-cmt {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+#ms-tap-widget .ms-tap-lf-cmt-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-1);
+}
+
+#ms-tap-widget .ms-tap-lf-setup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+}
+
+#ms-tap-widget .ms-tap-lf-chip {
+  appearance: none;
+  flex: 0 0 auto;
+  cursor: pointer;
+  font: 600 11px/1.5 var(--sans);
+  padding: 0 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--amber-line);
+  background: var(--amber-dim);
+  color: var(--amber-ink);
+}
+
+#ms-tap-widget .ms-tap-lf-chip:hover {
+  filter: brightness(0.95);
+}
+
+#ms-tap-widget .ms-tap-lf-chip-open {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+#ms-tap-widget .ms-tap-lf-chip-act {
+  border-color: var(--accent-line);
+  background: var(--bg-elev);
+  color: var(--accent);
+}
+
+#ms-tap-widget .ms-tap-lf-chip-quiet {
+  border-color: var(--border-hi);
+  background: var(--bg-mid);
+  color: var(--text-3);
+}
+
+/* "Set up this result" form (2026-10-04) */
+#ms-tap-widget .ms-tap-lf-su {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+}
+
+#ms-tap-widget .ms-tap-lf-su-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-1);
+  cursor: pointer;
+}
+
+#ms-tap-widget .ms-tap-lf-su-opt input {
+  margin-top: 2px;
+}
+
+#ms-tap-widget .ms-tap-lf-su-select {
+  max-width: 100%;
+  font: 11.5px var(--sans);
+}
+
+#ms-tap-widget .ms-tap-lf-su-go {
+  margin-top: 4px;
+}
+
+#ms-tap-widget .ms-tap-lf-su-msg {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}

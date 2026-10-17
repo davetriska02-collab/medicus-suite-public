@@ -1,0 +1,1484 @@
+// Medicus Suite — Routine-Rx reassign macro tests
+// Run with: node test-routine-rx-macro.js
+//
+// routine-rx-button.js (content-scripts/triage-lens/routine-rx-button.js) had
+// NO behavioural test — asymmetric with lab-file-button.js, which has
+// test-lab-file-macro.js. Unlike lab-file-button.js, routine-rx-button.js is a
+// single unconditional IIFE with no `module.exports` Node hook (it reaches
+// straight for `window`/`document`/`chrome` at load time), and per the task
+// this file must NOT be modified to add one. So this test extracts the pure
+// DOM-driving functions (findByText / collectByText / sharesPanel /
+// findAssignInput / findRoutingControl / findActionAnchor / runMacro)
+// VERBATIM from the source via `vm`, the same "extract, don't reimplement"
+// technique test-pincer-parity.js uses for content.js/visualiser-core.js. The
+// extracted code runs against a small fake DOM (mirroring test-lab-file-macro.js's
+// El/Root style, but with a real (if tiny) CSS-selector matcher — routine-rx's
+// selectors include attribute/class/compound forms lab-file's regex-per-selector
+// approach doesn't need to handle: `[role="radio"]`, `.radio`, `[id^="select-item-"]`,
+// `[class*="label"]`, `li[role="option"]`, comma lists).
+//
+// Two free identifiers the real code hard-codes long timeouts on — `waitFor`
+// (assign/option/commit budgets) and the per-keystroke `typeText` — are NOT
+// extracted from source; they are not caller-injectable in the real macro (unlike
+// lab-file-button.js's fileAllNormal, which takes waitForFn as an option), so this
+// test supplies fast test-double replacements with the SAME poll/resolve and
+// char-by-char/dispatch contract, just short-timed, so the suite runs in
+// milliseconds instead of the real worst case. `toast` / `highlight` /
+// `saveCfg` / `renderButton` (UI/storage side effects, not extracted — they live
+// in the "UI: floating button" section this test doesn't pull in) are stubbed as
+// recorders so runMacro's abort/manual/confirm/auto paths can be observed without
+// building the full floating-button UI. `requestConfirm` is extracted (default
+// wraps window.confirm); the sandbox also supplies a wrapper so a slice that
+// omits it still resolves.
+//
+// Safety behaviours pinned here:
+//   • findActionAnchor gates on ALL THREE conditions (routing control present +
+//     visible, "More actions" sharing the same panel, not inside a dialog) —
+//     missing any one means the button (and therefore the whole macro surface)
+//     never appears.
+//   • runMacro's happy path clicks in strict order: radio → assign input →
+//     (skip typing if the team option is already visible after Assign-to is
+//     opened; otherwise type the team char-by-char) → team option → wait for
+//     commit to ENABLE → commit per commitMode.
+//   • commitMode 'manual' highlights the commit button and clicks nothing;
+//     'confirm' clicks only after requestConfirm() (default wraps
+//     window.confirm) returns true, and a cancelled confirm clicks nothing;
+//     'auto' clicks the commit itself (no confirm on an exact match).
+//   • Every abort path (no radio, assign input never appears, team option not
+//     in the list, commit stays disabled) fails safe: it never reaches the
+//     commit click.
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+let passed = 0;
+let failed = 0;
+function check(cond, msg) {
+  if (cond) {
+    console.log(`  OK  ${msg}`);
+    passed++;
+  } else {
+    console.error(`  FAIL  ${msg}`);
+    failed++;
+  }
+}
+
+// ── Extract the pure DOM-driving functions from routine-rx-button.js ──────────
+// (no production file modified — this is read-only source slicing, same
+// technique as test-pincer-parity.js's extraction of content.js/visualiser-core.js)
+
+const SRC_PATH = path.join(__dirname, 'content-scripts', 'triage-lens', 'routine-rx-button.js');
+const CSS_PATH = path.join(__dirname, 'content-scripts', 'triage-lens', 'routine-rx-button.css');
+// Production on Windows is CRLF; slice needles are LF `\n\n …` sequences.
+const SRC = fs.readFileSync(SRC_PATH, 'utf8').replace(/\r\n/g, '\n');
+const CSS_SRC = fs.readFileSync(CSS_PATH, 'utf8').replace(/\r\n/g, '\n');
+
+function slice(startNeedle, endNeedle) {
+  const s = SRC.indexOf(startNeedle);
+  if (s < 0) throw new Error('extraction start needle not found (source changed?): ' + startNeedle);
+  const e = SRC.indexOf(endNeedle, s);
+  if (e < 0) throw new Error('extraction end needle not found (source changed?): ' + endNeedle);
+  return SRC.slice(s, e);
+}
+
+const EXTRACTED = [
+  // var DC = window.DomContracts;
+  slice('var DC = window.DomContracts;', '\n'),
+  // config: STORE_KEY / DEFAULTS / cfg (loadCfg/saveCfg deliberately excluded —
+  // they touch chrome.storage and are stubbed separately below)
+  slice("var STORE_KEY = 'triagelens.routineRx';", '\n\n  function loadCfg'),
+  // norm / visible / isEnabled / textOf / findByText / collectByText / sharesPanel
+  slice('function norm(s) {', '\n\n  function waitFor(fn, timeout, interval) {'),
+  // realClick / setNativeValue (waitFor and typeText deliberately excluded — see
+  // file header: both get fast test-double replacements)
+  slice('function realClick(el) {', '// The "Assign to" picker (Medicus'),
+  // findAssignInput
+  slice('function findAssignInput(', '\n\n  // ---- the macro'),
+  // commitAndAudit / highlightAndAudit (recordAudit itself is NOT extracted —
+  // audit persistence is covered by test-routine-rx-audit.js; here a sandbox
+  // spy stands in so the macro paths can call it)
+  slice('function commitAndAudit(', '\n\n  // ---- DOM helpers'),
+  // running / requestConfirm / abort / runMacro
+  slice('var running = false;', '\n\n  // ---- UI: floating button'),
+  // isPrescriptionOverviewPath / findCommitButton / findRoutingControl / findActionAnchor
+  slice('function isPrescriptionOverviewPath(', '\n\n  // The anchor the host is currently parented to.'),
+].join('\n\n');
+
+check(/function runMacro/.test(EXTRACTED), 'extraction: runMacro source captured');
+check(/function findActionAnchor/.test(EXTRACTED), 'extraction: findActionAnchor source captured');
+check(/function findRoutingControl/.test(EXTRACTED), 'extraction: findRoutingControl source captured');
+check(/function isPrescriptionOverviewPath/.test(EXTRACTED), 'extraction: isPrescriptionOverviewPath source captured');
+check(/function findCommitButton/.test(EXTRACTED), 'extraction: findCommitButton source captured');
+check(/function sharesPanel/.test(EXTRACTED), 'extraction: sharesPanel source captured');
+check(/function radioControl/.test(EXTRACTED), 'extraction: radioControl source captured');
+check(/function activateRadio/.test(EXTRACTED), 'extraction: activateRadio source captured');
+check(/function foldTeam/.test(EXTRACTED), 'extraction: foldTeam source captured');
+check(
+  !/function waitFor\(/.test(EXTRACTED),
+  'extraction: real long-timeout waitFor NOT pulled in (fast double supplied instead)'
+);
+check(
+  !/function typeText\(/.test(EXTRACTED),
+  'extraction: real per-keystroke typeText NOT pulled in (fast double supplied instead)'
+);
+
+// ── Production source locks (CSS + JS) ───────────────────────────────────────
+check(!SRC.includes('⚡') && !CSS_SRC.includes('⚡'), 'source lock: production CSS/JS has no ⚡');
+check(!/#0d6e5e/i.test(SRC) && !/#0d6e5e/i.test(CSS_SRC), 'source lock: production CSS/JS has no #0d6e5e');
+check(
+  SRC.indexOf('Send to routine list') !== -1,
+  'source lock: button copy includes Send to routine list'
+);
+check(
+  /interval\s*=\s*interval\s*\|\|\s*50/.test(SRC) || /waitFor\([^;]{0,240},\s*50\s*\)/.test(SRC),
+  'source lock: waitFor default interval is 50 or callers pass 50'
+);
+check(
+  !/\bmethod\s*[:=]\s*['"]POST['"]/i.test(SRC) && !/\bPOST\b/.test(SRC),
+  'source lock W8: no method POST in routine-rx-button.js'
+);
+check(
+  !/viewContext=homepage/.test(SRC) && !/masterAssignee/.test(SRC) && !/data-ch-staff/.test(SRC),
+  'source lock W8: not the Privacy Officer frozen homepage+staff-stamp GET (Dave 2026-09-15)'
+);
+check(
+  !/\/tasks\/data\/[^'"\s]+\/task-list/.test(SRC),
+  'source lock W8: does not GET a task-list — it drives the overview DOM'
+);
+check(
+  /makes NO network calls/.test(SRC),
+  'source lock W8: header still states this file makes no network calls'
+);
+check(
+  /function radioControl\(/.test(SRC) && /activateRadio\(/.test(SRC),
+  'source lock: Vue radio walk-up helpers exist (step 1 must not click a nested span)'
+);
+check(
+  /Issue 1 approved item/.test(SRC),
+  'source lock: abort copy names Issue 1 if the routing radio did not switch'
+);
+check(
+  SRC.includes("document.addEventListener('click', onDocHostClick, true)"),
+  'source lock: host clicks bind on document capture (Vue clones drop per-node listeners)'
+);
+check(
+  SRC.includes("'Send to routine list'") && SRC.includes("'Send to routine requests'"),
+  'source lock: commit match accepts both Send to routine list and Send to routine requests'
+);
+check(/skipTeamPick/.test(SRC), 'source lock: non-routine path can skip Assign-to when commit is already enabled');
+
+// ── Tiny CSS-selector engine for the fake DOM ──────────────────────────────────
+// routine-rx-button.js's selectors go beyond lab-file-button.js's simple
+// tag/.class/[attr="v"] set: comma lists, `[id^="v"]` prefix, `[class*="v"]`
+// substring, and compound `li[role="option"]`. Descendant combinators are never
+// used in this file's querySelectorAll calls, so a single-compound-per-clause
+// matcher (no combinator support needed) is sufficient.
+function parseSimpleSelector(sel) {
+  const attrs = [];
+  const attrRe = /\[([a-zA-Z-]+)(?:([~^$*|]?=)"([^"]*)")?\]/g;
+  let m;
+  while ((m = attrRe.exec(sel))) attrs.push({ name: m[1], op: m[2], value: m[3] });
+  let rest = sel.replace(attrRe, '');
+  const classes = [];
+  const classRe = /\.([\w-]+)/g;
+  while ((m = classRe.exec(rest))) classes.push(m[1]);
+  rest = rest.replace(classRe, '').trim();
+  return { tag: rest ? rest.toLowerCase() : null, classes, attrs };
+}
+function elementMatchesSimple(elx, parts) {
+  if (parts.tag && elx.tag !== parts.tag) return false;
+  for (const c of parts.classes) if (!elx.classes.includes(c)) return false;
+  for (const a of parts.attrs) {
+    const val = elx.getAttribute(a.name);
+    if (val === null || val === undefined) return false;
+    if (a.op === undefined) continue; // presence-only
+    if (a.op === '=' && val !== a.value) return false;
+    if (a.op === '^=' && val.indexOf(a.value) !== 0) return false;
+    if (a.op === '*=' && val.indexOf(a.value) === -1) return false;
+    if (a.op === '$=' && val.slice(-a.value.length) !== a.value) return false;
+  }
+  return true;
+}
+function elementMatches(elx, selectorList) {
+  return selectorList
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .some((s) => elementMatchesSimple(elx, parseSimpleSelector(s)));
+}
+
+// ── Fake DOM ─────────────────────────────────────────────────────────────────
+let CLICKS = [];
+class FakeEl {
+  constructor(tag, opts) {
+    opts = opts || {};
+    this.tag = tag.toLowerCase();
+    this.classes = opts.classes || [];
+    this.attrs = opts.attrs || {};
+    this.textContent = opts.text || '';
+    this.value = opts.value !== undefined ? opts.value : '';
+    this.disabled = !!opts.disabled;
+    this.hiddenEl = !!opts.hidden;
+    this.label = opts.label || opts.text || '';
+    this.children = [];
+    this.parentElement = null;
+    this.onClickFn = opts.onClick || null;
+    this.checked = !!opts.checked;
+  }
+  appendChild(child) {
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+  get tagName() {
+    return (this.tag || '').toUpperCase();
+  }
+  get type() {
+    return this.attrs.type || '';
+  }
+  get htmlFor() {
+    return this.attrs.for || '';
+  }
+  get classList() {
+    return { contains: (c) => this.classes.includes(c) };
+  }
+  getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null;
+  }
+  setAttribute(name, val) {
+    this.attrs[name] = String(val);
+  }
+  get offsetParent() {
+    return this.hiddenEl ? null : {};
+  }
+  getClientRects() {
+    return this.hiddenEl ? [] : [{}];
+  }
+  contains(other) {
+    let n = other;
+    while (n) {
+      if (n === this) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
+  closest(sel) {
+    let n = this;
+    while (n) {
+      if (n.tag && elementMatches(n, sel)) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+  matches(sel) {
+    return elementMatches(this, sel);
+  }
+  querySelectorAll(sel) {
+    return collectDescendants(this, sel);
+  }
+  querySelector(sel) {
+    return collectDescendants(this, sel)[0] || null;
+  }
+  click() {
+    CLICKS.push(this.label || this.textContent);
+    if (typeof this.onClickFn === 'function') this.onClickFn();
+  }
+  focus() {}
+  dispatchEvent() {}
+}
+function collectDescendants(root, sel) {
+  const out = [];
+  (function walk(node) {
+    for (const c of node.children) {
+      if (elementMatches(c, sel)) out.push(c);
+      walk(c);
+    }
+  })(root);
+  return out;
+}
+function el(tag, opts) {
+  return new FakeEl(tag, opts);
+}
+function buildRoot(elements) {
+  const root = new FakeEl('document-root');
+  elements.forEach((e) => root.appendChild(e));
+  return root;
+}
+// Wrap `inner` in `times` plain <div> ancestors — used to push a node's shared
+// root beyond sharesPanel's depth cap (default 12), so a fixture can model
+// "truly a different panel" rather than "merely a different immediate parent"
+// (everything in a real page ultimately shares <body>, so the depth cap is
+// what makes sharesPanel meaningful — see routine-rx-button.js sharesPanel).
+function wrapDeep(inner, times) {
+  let node = inner;
+  for (let i = 0; i < times; i++) {
+    const wrapper = el('div', {});
+    wrapper.appendChild(node);
+    node = wrapper;
+  }
+  return node;
+}
+
+// ── Fixture-derived screens ─────────────────────────────────────────────────
+// Mirrors fixtures/medicus/routine-rx-*.html: a "More actions" button, the
+// routing label, the assign-to input, and (once revealed) the team option list
+// + commit button. The team option and commit button are added dynamically by
+// the test to model Medicus's live/async picker, matching
+// fixtures/medicus/routine-rx-assignee-option.html's `<li id="select-item-1"
+// role="option">`.
+function fullScreen(overrides) {
+  overrides = overrides || {};
+  const els = [
+    el('button', { text: 'More actions', label: 'MoreActions' }),
+    el('label', { text: 'Save & send to routine requests task list', label: 'RoutingRadio' }),
+  ];
+  if (!overrides.omitAssignInput) {
+    els.push(el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' }));
+  }
+  if (overrides.teamOptionText) {
+    els.push(
+      el('li', {
+        attrs: { id: 'select-item-1', role: 'option' },
+        text: overrides.teamOptionText,
+        label: 'TeamOption',
+      })
+    );
+  }
+  const commitDisabled = overrides.commitDisabled !== false; // disabled until team chosen, by default
+  els.push(
+    el('button', {
+      text: 'Send to routine list',
+      label: 'CommitBtn',
+      disabled: overrides.commitInitiallyDisabled !== false,
+    })
+  );
+  return els;
+}
+
+// Fast test doubles for the two hard-coded-long-timeout helpers. Same
+// poll-then-resolve(null) / char-by-char-set-then-dispatch contract as the real
+// functions, just capped short so the suite runs fast (see file header).
+const WAITFOR_TIMEOUTS = []; // records the RAW requested timeout per waitFor call, for the per-query-budget assertions
+const WAITFOR_INTERVALS = []; // records the RAW requested interval (undefined if omitted)
+function fastWaitFor(fn, timeout, interval) {
+  WAITFOR_TIMEOUTS.push(timeout);
+  WAITFOR_INTERVALS.push(interval);
+  timeout = Math.min(timeout || 5000, 200);
+  interval = Math.min(interval || 50, 15);
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    (function poll() {
+      let v;
+      try {
+        v = fn();
+      } catch (e) {
+        v = null;
+      }
+      if (v) return resolve(v);
+      if (Date.now() - t0 >= timeout) return resolve(null);
+      setTimeout(poll, interval);
+    })();
+  });
+}
+const TYPED_KEYSTROKES = []; // records progressive built-so-far values per typeText call, for the char-by-char assertion
+let TYPE_TEXT_CALLS = 0;
+function fastTypeText(elx, text) {
+  TYPE_TEXT_CALLS += 1;
+  TYPED_KEYSTROKES.length = 0;
+  return new Promise((resolve) => {
+    let i = 0;
+    let built = '';
+    (function step() {
+      if (i >= text.length) return resolve();
+      built += text[i++];
+      elx.value = built;
+      TYPED_KEYSTROKES.push(built);
+      setTimeout(step, 2);
+    })();
+  });
+}
+
+// ── Build the vm sandbox and run the extracted source once ────────────────────
+const DomContracts = require(path.join(__dirname, 'shared', 'dom-contracts.js'));
+
+let CONFIRM_RETURN = true;
+const TOASTS = [];
+const HIGHLIGHTED = [];
+
+function makeSandbox(rootEl, pathname) {
+  CLICKS = [];
+  TOASTS.length = 0;
+  HIGHLIGHTED.length = 0;
+  WAITFOR_TIMEOUTS.length = 0;
+  WAITFOR_INTERVALS.length = 0;
+  TYPED_KEYSTROKES.length = 0;
+  TYPE_TEXT_CALLS = 0;
+  const sandbox = {
+    console,
+    setTimeout,
+    Date,
+    Promise,
+    Object,
+    Array,
+    String,
+    JSON,
+    document: rootEl,
+    location: { pathname: pathname || '/tasks/data/prescription-requests/overview/abc-123' },
+    window: {
+      DomContracts,
+      confirm: (msg) => {
+        TOASTS.push({ kind: 'confirm-prompt', msg });
+        return CONFIRM_RETURN;
+      },
+    },
+    // realClick's synthetic-event constructors — Node has none of these; the
+    // real function already wraps each `new MouseEvent(...)` in its own
+    // try/catch and falls through to `el.click()` regardless, but we supply
+    // trivial stand-ins for cleanliness rather than relying on a swallowed
+    // ReferenceError.
+    MouseEvent: function (type, opts) {
+      this.type = type;
+      Object.assign(this, opts || {});
+    },
+    Event: function (type, opts) {
+      this.type = type;
+      Object.assign(this, opts || {});
+    },
+    // Fast test doubles (see file header) — supplied as free identifiers so
+    // runMacro's unqualified `waitFor(...)` / `typeText(...)` calls resolve to
+    // these instead of the real long-timeout versions.
+    waitFor: fastWaitFor,
+    typeText: fastTypeText,
+    // UI/storage side effects stubbed as recorders — not part of the safety
+    // logic under test, and their real definitions live outside the extracted
+    // slice (see file header).
+    toast: (msg, kind) => TOASTS.push({ kind, msg }),
+    highlight: (elx) => HIGHLIGHTED.push(elx),
+    setStep: () => {},
+    // spy for the audit sink the commit/abort paths call (see extraction note)
+    recordAudit: () => {},
+    saveCfg: () => {},
+    renderButton: () => {},
+    setBusy: () => {},
+  };
+  // Default requestConfirm wraps window.confirm (production does the same
+  // until UI boot replaces it with an in-host bar). Assigned after the
+  // object exists so it always hits the current sandbox.window.confirm —
+  // tests that overwrite window.confirm still flow through here if the
+  // extracted source does not define its own requestConfirm.
+  sandbox.requestConfirm = (msg) => Promise.resolve(sandbox.window.confirm(msg));
+  vm.createContext(sandbox);
+  vm.runInContext(EXTRACTED, sandbox);
+  vm.runInContext(
+    [
+      'this.runMacro = runMacro;',
+      'this.findRoutingControl = findRoutingControl;',
+      'this.findActionAnchor = findActionAnchor;',
+      'this.sharesPanel = sharesPanel;',
+      'this.findByText = findByText;',
+      'this.collectByText = collectByText;',
+      'this.findAssignInput = findAssignInput;',
+      'this.optionControl = optionControl;',
+      'this.looksLikeAssigneeName = looksLikeAssigneeName;',
+      'this.collectAssigneeOptions = collectAssigneeOptions;',
+      'this.searchQueriesFor = searchQueriesFor;',
+      'this.foldTeam = foldTeam;',
+      'this.radioControl = radioControl;',
+      'this.isRadioOn = isRadioOn;',
+      'this.activateRadio = activateRadio;',
+      'this.cfg = cfg;',
+    ].join('\n'),
+    sandbox
+  );
+  return sandbox;
+}
+
+// Sanity-check the extraction actually produced callable functions before
+// building the real test scenarios on top of it.
+{
+  const sb = makeSandbox(buildRoot([]), '/x');
+  check(typeof sb.runMacro === 'function', 'sandbox: runMacro is callable after extraction');
+  check(typeof sb.findRoutingControl === 'function', 'sandbox: findRoutingControl is callable');
+  check(typeof sb.radioControl === 'function', 'sandbox: radioControl is callable');
+  check(typeof sb.activateRadio === 'function', 'sandbox: activateRadio is callable');
+  check(typeof sb.foldTeam === 'function', 'sandbox: foldTeam is callable');
+  check(
+    sb.foldTeam('Prescribing / Meds Management') === sb.foldTeam('Prescribing/Meds Management'),
+    'foldTeam: spaces around / are the same name'
+  );
+  check(
+    sb.foldTeam('Prescribing / Meds Management') !== sb.foldTeam('Prescribing / Med Management'),
+    'foldTeam: Med vs Meds stays a different name'
+  );
+  check(
+    sb.searchQueriesFor('Prescribing / Meds Management')[1] === 'Prescribing/Meds Management',
+    'searchQueriesFor: types a no-space-around-slash form after the leading token'
+  );
+  check(typeof sb.optionControl === 'function', 'sandbox: optionControl is callable');
+  {
+    const opt = el('li', { attrs: { id: 'select-item-1', role: 'option' }, label: 'TeamOption' });
+    const span = el('span', { text: 'Prescribing / Meds Management', label: 'OptSpan' });
+    opt.appendChild(span);
+    buildRoot([opt]);
+    check(sb.optionControl(span) === opt, 'optionControl: walks from the inner span to role=option');
+  }
+  {
+    const decoy = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'DecoyAssign' });
+    const decoyWrap = el('div', {});
+    decoyWrap.appendChild(decoy);
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const panel = el('div', {});
+    panel.appendChild(radio);
+    panel.appendChild(assign);
+    const root = buildRoot([wrapDeep(decoyWrap, 13), panel]);
+    const sbNear = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(
+      sbNear.findAssignInput(radio) === assign,
+      'findAssignInput: prefers the picker in the routing panel over a distant Assign-to'
+    );
+  }
+  {
+    const clinical = el('li', {
+      attrs: { role: 'option' },
+      text: 'Clinical History : Reason for exam: : right shoulder pain ?GH OA',
+      label: 'ClinicalOpt',
+    });
+    check(
+      sb.looksLikeAssigneeName(clinical) === false,
+      'looksLikeAssigneeName: Clinical History / Reason for exam is not a team'
+    );
+    const teamOpt = el('li', {
+      attrs: { id: 'select-item-1', role: 'option' },
+      text: 'Prescribing / Meds Management',
+      label: 'TeamOption',
+    });
+    check(sb.looksLikeAssigneeName(teamOpt) === true, 'looksLikeAssigneeName: a short team label is accepted');
+  }
+  check(typeof sb.findActionAnchor === 'function', 'sandbox: findActionAnchor is callable');
+  check(typeof sb.sharesPanel === 'function', 'sandbox: sharesPanel is callable');
+}
+
+(async () => {
+  // ═══════════════════════════════════════════════════════════════════════
+  // findActionAnchor placement gates
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- findActionAnchor: placement gates ---');
+
+  {
+    // Happy path: routing control present + visible, "More actions" shares the
+    // same panel → anchor found.
+    const more = el('button', { text: 'More actions', label: 'MoreActions' });
+    const routing = el('label', { text: 'Save & send to routine requests task list', label: 'RoutingRadio' });
+    const panel = el('div', { classes: ['rx-form'] });
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    const anchor = sb.findActionAnchor();
+    check(anchor === more.parentElement, 'gate pass: routing control + shared-panel More actions → anchor returned');
+  }
+
+  {
+    // Gate 1: wrong URL (not a prescription overview) → null, even with a perfect DOM
+    const more = el('button', { text: 'More actions' });
+    const routing = el('label', { text: 'Save & send to routine requests task list' });
+    const panel = el('div', {});
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/tasks/data/appointments/overview/abc-123');
+    check(sb.findActionAnchor() === null, 'gate 1: non-prescription URL → null anchor');
+  }
+
+  {
+    const more = el('button', { text: 'More actions', label: 'MoreActionsNR' });
+    const routing = el('label', { text: 'Save & send to routine requests task list', label: 'RoutingRadioNR' });
+    const panel = el('div', { classes: ['rx-form'] });
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sbData = makeSandbox(
+      root,
+      '/e38a9f/tasks/data/prescription_request_task_non_routine/overview/abc-123'
+    );
+    check(
+      sbData.findActionAnchor() === more.parentElement,
+      'gate 1: /tasks/data/ non-routine slug is a prescription overview'
+    );
+    const sbBare = makeSandbox(root, '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123');
+    check(
+      sbBare.findActionAnchor() === more.parentElement,
+      'gate 1: /tasks/ non-routine overview (no /data/) still places the pill'
+    );
+    const sbHyphen = makeSandbox(root, '/e38a9f/tasks/prescription-request-task-non-routine/overview/abc-123');
+    check(
+      sbHyphen.findActionAnchor() === more.parentElement,
+      'gate 1: hyphenated non-routine overview slug is claimed'
+    );
+  }
+
+  {
+    const more = el('button', { text: 'More actions', label: 'MoreActionsAnd' });
+    const routing = el('label', { text: 'Save and send to routine requests task list', label: 'RoutingAnd' });
+    const panel = el('div', { classes: ['rx-form'] });
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123');
+    check(
+      sb.findRoutingControl() === routing,
+      'routing: "Save and send…" (and, not ampersand) is accepted'
+    );
+    check(sb.findActionAnchor() === more.parentElement, 'routing: and-spelling still places the pill');
+  }
+
+  {
+    const more = el('button', { text: 'More actions', label: 'MoreActionsShort' });
+    const routing = el('label', { text: 'Send to routine requests task list', label: 'RoutingShort' });
+    const panel = el('div', { classes: ['rx-form'] });
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/e38a9f/tasks/data/prescription_request_task_non_routine/overview/abc-123');
+    check(
+      sb.findRoutingControl() === routing,
+      'routing: short "Send to routine requests task list" is accepted'
+    );
+  }
+
+  {
+    // Gate 2: routing control absent → null, even with "More actions" present
+    const more = el('button', { text: 'More actions' });
+    const root = buildRoot([more]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.findActionAnchor() === null, 'gate 2: routing control absent → null anchor');
+  }
+
+  {
+    // Gate 2: routing control present but NOT VISIBLE → null
+    const more = el('button', { text: 'More actions' });
+    const routing = el('label', {
+      text: 'Save & send to routine requests task list',
+      hidden: true,
+    });
+    const panel = el('div', {});
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.findActionAnchor() === null, 'gate 2: routing control present but hidden → null anchor');
+  }
+
+  {
+    // Gate 3: "More actions" exists but in a DIFFERENT panel (not sharing an
+    // ancestor within sharesPanel's depth cap) — must not be picked. Everything
+    // ultimately shares <body>/document, so the decoy is wrapped deep enough
+    // that its shared ancestor with the routing control falls beyond the cap —
+    // otherwise the depth check is a no-op (see wrapDeep).
+    const more = el('button', { text: 'More actions' });
+    const otherPanel = el('div', { classes: ['other-drawer'] });
+    otherPanel.appendChild(more);
+    const deepOtherPanel = wrapDeep(otherPanel, 13);
+    const routing = el('label', { text: 'Save & send to routine requests task list' });
+    const routingPanel = el('div', { classes: ['rx-form'] });
+    routingPanel.appendChild(routing);
+    const root = buildRoot([deepOtherPanel, routingPanel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.findActionAnchor() === null, "gate 3: More actions in a separate panel (doesn't share) → null anchor");
+  }
+
+  {
+    // Gate 3: "More actions" is inside a dialog → excluded even though it
+    // otherwise shares the panel with the routing control.
+    const dialog = el('div', { attrs: { role: 'dialog' } });
+    const more = el('button', { text: 'More actions' });
+    dialog.appendChild(more);
+    const routing = el('label', { text: 'Save & send to routine requests task list' });
+    const panel = el('div', {});
+    panel.appendChild(dialog);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.findActionAnchor() === null, 'gate 3: More actions inside [role="dialog"] → excluded, null anchor');
+  }
+
+  {
+    // Two "More actions" candidates: one in an unrelated overlay drawer (must be
+    // skipped), one sharing the routing panel (must be picked). Confirms the
+    // function chooses by context, not "first match". The decoy is pushed
+    // beyond sharesPanel's depth cap (see wrapDeep) so it's genuinely a
+    // separate panel, not just a different immediate parent.
+    const decoyMore = el('button', { text: 'More actions', label: 'DecoyMore' });
+    const decoyPanel = el('div', { classes: ['appointment-drawer'] });
+    decoyPanel.appendChild(decoyMore);
+    const deepDecoyPanel = wrapDeep(decoyPanel, 13);
+
+    const realMore = el('button', { text: 'More actions', label: 'RealMore' });
+    const routing = el('label', { text: 'Save & send to routine requests task list' });
+    const rxPanel = el('div', { classes: ['rx-form'] });
+    rxPanel.appendChild(realMore);
+    rxPanel.appendChild(routing);
+
+    const root = buildRoot([deepDecoyPanel, rxPanel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    const anchor = sb.findActionAnchor();
+    check(
+      anchor === realMore.parentElement,
+      'gate 3: chooses the More actions sharing the routing panel, not the decoy'
+    );
+  }
+
+  {
+    // Legacy DOM variant (fixtures/medicus/routine-rx-routing-control-legacy.html):
+    // routing option rendered as a bare <div>, not a label/[role=radio]/.radio —
+    // the narrow pass must fall back to the wide div/span sweep.
+    const more = el('button', { text: 'More actions' });
+    const routing = el('div', { classes: ['routing-option'], text: 'Save & send to routine requests task list' });
+    const panel = el('div', { classes: ['rx-form'] });
+    panel.appendChild(more);
+    panel.appendChild(routing);
+    const root = buildRoot([panel]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(
+      sb.findRoutingControl() === routing,
+      'legacy variant: findRoutingControl falls back to the wide div/span sweep'
+    );
+    check(
+      sb.findActionAnchor() === more.parentElement,
+      'legacy variant: findActionAnchor still resolves via the fallback'
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // runMacro: happy path
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- runMacro: happy path (confirm mode, OK) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign]);
+    // Option is already in the fake DOM once Assign-to is clicked — skip-type
+    // must select it without typing. (Char-by-char is pinned separately below.)
+    assign.onClickFn = () => {
+      if (!option.parentElement) root.appendChild(option);
+      if (!commit.parentElement) root.appendChild(commit);
+    };
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = true;
+
+    await sb.runMacro(teamName, 'confirm');
+
+    check(CLICKS[0] === 'Radio', 'happy path: step 1 clicks the routing radio first');
+    check(CLICKS.indexOf('AssignInput') > CLICKS.indexOf('Radio'), 'happy path: assign input clicked after the radio');
+    check(
+      CLICKS.indexOf('TeamOption') > CLICKS.indexOf('AssignInput'),
+      'happy path: team option clicked after the assign input'
+    );
+    check(
+      CLICKS.indexOf('CommitBtn') > CLICKS.indexOf('TeamOption'),
+      'happy path: commit clicked LAST, after the team option'
+    );
+    const q0 = sb.searchQueriesFor(teamName)[0];
+    check(q0 === 'Prescribing', 'happy path: safe leading token ("Prescribing") is the first search query');
+    check(
+      WAITFOR_TIMEOUTS.indexOf(400) !== -1 && WAITFOR_TIMEOUTS.indexOf(3500) === -1,
+      'happy path: skip-type short wait used; the long option budget is never requested'
+    );
+    check(
+      TYPE_TEXT_CALLS === 0 || TYPED_KEYSTROKES.length === 0,
+      'happy path: typeText was not required (option already visible after assign click)'
+    );
+    check(sb.cfg.lastTeam === teamName, 'happy path: cfg.lastTeam updated to the sent team');
+    check(
+      TOASTS.some((t) => t.kind === 'confirm-prompt' && t.msg.includes(teamName)),
+      'happy path: confirm dialog names the destination team'
+    );
+    check(
+      TOASTS.some(
+        (t) => t.kind === 'ok' && /Clicked .Send to routine list./.test(t.msg) && /Check the task/.test(t.msg)
+      ),
+      'happy path: the commit toast reports the CLICK and asks the user to verify — never claims "Sent" (audit R10)'
+    );
+  }
+
+  console.log('\n--- skip typing when the option is already visible ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+
+    await sb.runMacro(teamName, 'auto');
+
+    check(TYPE_TEXT_CALLS === 0, 'skip typing when the option is already visible');
+    check(TYPED_KEYSTROKES.length === 0, 'skip typing: zero TYPED_KEYSTROKES (typeText never started)');
+    check(
+      WAITFOR_TIMEOUTS.some((t, i) => t === 400 && WAITFOR_INTERVALS[i] === 50),
+      'skip typing: matchOption is waited for briefly (400ms @ 50ms) BEFORE any typeText'
+    );
+    check(CLICKS.indexOf('TeamOption') !== -1, 'skip typing: the already-visible team option is still clicked');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'skip typing: commit is clicked after the visible option');
+  }
+
+  console.log('\n--- slash spacing: configured “ / ” matches picker “/” as exact ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const configured = 'Prescribing / Meds Management';
+    const option = el('li', {
+      attrs: { id: 'select-item-1', role: 'option' },
+      text: 'Prescribing/Meds Management',
+      label: 'TeamOption',
+    });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = true;
+    let confirmInvoked = false;
+    sb.window.confirm = function (msg) {
+      confirmInvoked = true;
+      return true;
+    };
+    await sb.runMacro(configured, 'auto');
+    check(CLICKS.indexOf('TeamOption') !== -1, 'slash spacing: the no-space picker option is selected');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'slash spacing: auto mode commits (folded match counts as exact)');
+    check(confirmInvoked === false, 'slash spacing: auto mode does not confirm a slash-spacing-only difference');
+  }
+
+  console.log('\n--- Clinical History [role=option] is not the assignee list ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const clinical = el('li', {
+      attrs: { role: 'option' },
+      text: 'Clinical History : Reason for exam: : right shoulder pain ?GH OA',
+      label: 'ClinicalOpt',
+    });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, clinical, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro(teamName, 'auto');
+    check(CLICKS.indexOf('ClinicalOpt') === -1, 'clinical history option is never clicked');
+    check(CLICKS.indexOf('TeamOption') !== -1, 'the real team option is clicked even when clinical history options are on screen');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'clinical-history decoy: still reaches commit');
+  }
+
+  console.log('\n--- abort does not quote Clinical History as a team ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const clinical = el('li', {
+      attrs: { role: 'option' },
+      text: 'Clinical History : Reason for exam: : right shoulder pain ?GH OA',
+      label: 'ClinicalOpt',
+    });
+    const root = buildRoot([radio, assign, clinical]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(CLICKS.indexOf('ClinicalOpt') === -1, 'abort (clinical decoy): does not click the exam-reason option');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /isn.t in the assignee list/.test(t.msg) && !/reason for exam/.test(t.msg)),
+      'abort (clinical decoy): error does not quote Clinical History / Reason for exam as a team'
+    );
+  }
+
+  console.log('\n--- Med vs Meds is not the same team ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const option = el('li', {
+      attrs: { id: 'select-item-1', role: 'option' },
+      text: 'Prescribing / Med Management',
+      label: 'WrongTeam',
+    });
+    const root = buildRoot([radio, assign, option]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(CLICKS.indexOf('WrongTeam') === -1, 'Med vs Meds: does not click the differently-spelled team');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'Med vs Meds: does not commit');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /isn.t in the assignee list/.test(t.msg) && /med management/.test(t.msg)),
+      'Med vs Meds: abort names the on-screen option so the spelling difference is visible'
+    );
+  }
+
+  console.log('\n--- runMacro: types char-by-char when the option is not yet visible ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const root = buildRoot([radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = true;
+    const teamName = 'Prescribing / Meds Management';
+    // Do not put the option in the DOM until typeText starts — skip-type's
+    // short wait must miss, then char-by-char typing is what surfaces it.
+    const origType = sb.typeText;
+    let revealed = false;
+    sb.typeText = function (elx, text, delay) {
+      if (!revealed) {
+        revealed = true;
+        root.appendChild(
+          el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' })
+        );
+        root.appendChild(el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false }));
+      }
+      return origType(elx, text, delay);
+    };
+
+    await sb.runMacro(teamName, 'auto');
+
+    const q0 = sb.searchQueriesFor(teamName)[0];
+    check(TYPE_TEXT_CALLS >= 1, 'type-reveal: typeText ran because the option was not visible yet');
+    check(
+      TYPED_KEYSTROKES.length === q0.length,
+      'type-reveal: typed the search query char-by-char (one step per character)'
+    );
+    check(
+      TYPED_KEYSTROKES[TYPED_KEYSTROKES.length - 1] === q0,
+      'type-reveal: final typed value is the safe leading token'
+    );
+    check(assign.value === q0, 'type-reveal: assign input value ends up as the typed search query');
+    check(CLICKS.indexOf('TeamOption') !== -1, 'type-reveal: the team option is clicked after typing');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'type-reveal: commit is clicked after the typed option');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // step 3: query ladder — falls back to the full name when the safe leading
+  // token surfaces nothing (the v3.159.x fix: what we TYPE is decoupled from
+  // what we MATCH, so a picker whose live search only returns on the complete
+  // string still selects the team instead of aborting "isn't in the list").
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- runMacro: falls back to the full-name query when the token surfaces nothing ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const root = buildRoot([radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = true;
+    const teamName = 'Prescribing / Meds Management';
+
+    // The picker only returns the team for the FULL-name query — the leading
+    // token ("Prescribing") yields nothing. Models a picker whose live search
+    // only matches on the complete team string, so the fallback query is what
+    // must reveal (and select) it.
+    let added = false;
+    const iv = setInterval(() => {
+      if (!added && assign.value === teamName) {
+        added = true;
+        root.appendChild(
+          el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' })
+        );
+        root.appendChild(el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false }));
+        clearInterval(iv);
+      }
+    }, 2);
+
+    await sb.runMacro(teamName, 'auto');
+    clearInterval(iv);
+
+    check(CLICKS.indexOf('TeamOption') !== -1, 'full-name fallback: the team option is eventually selected');
+    check(
+      WAITFOR_TIMEOUTS.indexOf(400) !== -1 &&
+        WAITFOR_TIMEOUTS.indexOf(800) !== -1 &&
+        WAITFOR_TIMEOUTS.indexOf(3500) !== -1 &&
+        WAITFOR_TIMEOUTS.indexOf(400) < WAITFOR_TIMEOUTS.indexOf(800) &&
+        WAITFOR_TIMEOUTS.indexOf(800) < WAITFOR_TIMEOUTS.indexOf(3500),
+      'full-name fallback: skip-type 400ms, then token 800ms, only the final query the full 3500ms'
+    );
+    check(
+      CLICKS.indexOf('CommitBtn') !== -1,
+      'full-name fallback: commit is clicked after the fallback query succeeds'
+    );
+    check(assign.value === teamName, 'full-name fallback: the full team name was typed on the fallback query');
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /Clicked .Send to routine list./.test(t.msg)),
+      'full-name fallback: the commit toast is shown (click-reported, not completion-claimed)'
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // commitMode variants
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- commitMode: manual (highlights, never clicks) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+
+    await sb.runMacro(teamName, 'manual');
+
+    check(CLICKS.indexOf('CommitBtn') === -1, 'manual mode: commit is never clicked');
+    check(HIGHLIGHTED.indexOf(commit) !== -1, 'manual mode: the commit button is highlighted for the clinician');
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /Ready/.test(t.msg)),
+      'manual mode: a "ready" toast is shown instead of a sent confirmation'
+    );
+  }
+
+  console.log('\n--- commitMode: confirm, cancelled (clicks nothing) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = false;
+
+    await sb.runMacro(teamName, 'confirm');
+
+    check(CLICKS.indexOf('CommitBtn') === -1, 'confirm cancelled: commit is never clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'warn' && /Cancelled/.test(t.msg)),
+      'confirm cancelled: a "cancelled, nothing sent" toast is shown'
+    );
+    CONFIRM_RETURN = true; // reset for subsequent scenarios
+  }
+
+  console.log('\n--- commitMode: auto (clicks commit without asking) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+
+    let confirmCalled = false;
+    sb.window.confirm = () => {
+      confirmCalled = true;
+      return true;
+    };
+
+    await sb.runMacro(teamName, 'auto');
+
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'auto mode: commit IS clicked');
+    check(!confirmCalled, 'auto mode: window.confirm is never invoked');
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /Clicked .Send to routine list./.test(t.msg)),
+      'auto mode: the commit toast is shown (click-reported, not completion-claimed)'
+    );
+  }
+
+  console.log('\n--- auto mode with a PARTIAL team match downgrades to confirm (audit R8) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    // Configured team is a PREFIX of the only rendered option — a contains
+    // match, not exact. Auto mode must not commit without a human reading it.
+    const option = el('li', {
+      attrs: { id: 'select-item-1', role: 'option' },
+      text: 'Prescribing / Meds Management',
+      label: 'TeamOption',
+    });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+
+    let confirmMsg = null;
+    sb.window.confirm = (msg) => {
+      confirmMsg = msg;
+      return false; // clinician declines
+    };
+    await sb.runMacro('Prescribing', 'auto');
+    check(confirmMsg !== null, 'auto + partial match: window.confirm IS invoked (no unconfirmed commit)');
+    check(
+      !!confirmMsg && /Prescribing \/ Meds Management/.test(confirmMsg) && /not an exact match/.test(confirmMsg),
+      'auto + partial match: the confirm names the REAL option text and says it was not exact'
+    );
+    check(CLICKS.indexOf('CommitBtn') === -1, 'auto + partial match declined: commit is never clicked');
+  }
+
+  console.log('\n--- commit button is matched EXACT-only (audit R8) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    // Only a SUPERSTRING of the commit label exists — the substring fallback
+    // must never commit-click it.
+    const wrongCommit = el('button', {
+      text: 'Send to routine list and close task',
+      label: 'WrongCommitBtn',
+      disabled: false,
+    });
+    const root = buildRoot([radio, assign, option, wrongCommit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro(teamName, 'auto');
+    check(CLICKS.indexOf('WrongCommitBtn') === -1, 'exact-only commit: a superstring-labelled button is never clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'err'),
+      'exact-only commit: the macro aborts with an error toast instead'
+    );
+  }
+
+  console.log('\n--- commit button: "Send to routine requests" (non-routine wording) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine requests', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123');
+    await sb.runMacro(teamName, 'auto');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'alt commit label: "Send to routine requests" is clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /Clicked .Send to routine list./.test(t.msg)),
+      'alt commit label: still reports the click (does not claim Sent)'
+    );
+  }
+
+  console.log('\n--- skip-team-pick: no Assign-to, enabled commit (non-routine inbox dest) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, commit]);
+    const sb = makeSandbox(
+      root,
+      '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123'
+    );
+    CONFIRM_RETURN = true;
+    await sb.runMacro('Prescribing / Meds Management', 'confirm');
+    check(CLICKS.indexOf('AssignInput') === -1, 'skip-team-pick: never invents an assignee');
+    check(CLICKS[0] === 'Radio', 'skip-team-pick: routing radio is clicked first');
+    check(CLICKS.indexOf('CommitBtn') !== -1, 'skip-team-pick: the already-enabled commit is clicked');
+    check(
+      TOASTS.some(
+        (t) =>
+          t.kind === 'confirm-prompt' &&
+          /^Send this prescription to the routine requests list\?/.test(t.msg) &&
+          /no team will be selected/.test(t.msg)
+      ),
+      'skip-team-pick: confirm names the routine list, not a made-up team'
+    );
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /Clicked .Send to routine list./.test(t.msg)),
+      'skip-team-pick: commit toast reports the click'
+    );
+    check(
+      TOASTS.some((t) => t.kind === 'ok' && /no team was selected/.test(t.msg)),
+      'skip-team-pick: commit toast says no team was selected (does not name the configured team as the dest)'
+    );
+    check(
+      !TOASTS.some((t) => t.kind === 'ok' && /for .Prescribing/.test(t.msg)),
+      'skip-team-pick: commit toast never claims the configured team was picked'
+    );
+    CONFIRM_RETURN = true;
+  }
+
+  console.log('\n--- skip-team-pick: AUTO mode still confirms (no team was picked, so a human reads the dest) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, commit]);
+    const sb = makeSandbox(root, '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123');
+    CONFIRM_RETURN = false;
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(
+      TOASTS.some((t) => t.kind === 'confirm-prompt' && /no team will be selected/.test(t.msg)),
+      'skip-team-pick auto: a confirm prompt is shown and says no team will be selected'
+    );
+    check(CLICKS.indexOf('CommitBtn') === -1, 'skip-team-pick auto: declined confirm → commit is NOT clicked');
+    CONFIRM_RETURN = true;
+  }
+
+  console.log('\n--- skip-team-pick: fail CLOSED when an "Assign to" label is visible but the input was missed ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    // Medicus renamed the input's aria-label so findAssignInput misses it,
+    // but the control's own label is still on screen — a pre-filled assignee
+    // is why the commit is already enabled. Sending as-is would route the
+    // task to that assignee, not the configured team.
+    const assignLabel = el('label', { text: 'Assign to', label: 'AssignLabel' });
+    // (the input itself is modelled as not locatable — findAssignInput's
+    // label fallback would otherwise still reach a visible sibling input)
+    const assign = el('input', { attrs: { 'aria-label': 'Choose a colleague' }, label: 'AssignInput', hidden: true });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+    const root = buildRoot([radio, assignLabel, assign, commit]);
+    const sb = makeSandbox(root, '/e38a9f/tasks/prescription_request_task_non_routine/overview/abc-123');
+    CONFIRM_RETURN = true;
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'assign-label-visible: commit is NOT clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /Found an .Assign to. control/.test(t.msg)),
+      'assign-label-visible: aborts with an explicit reason'
+    );
+    check(!TOASTS.some((t) => t.kind === 'confirm-prompt'), 'assign-label-visible: no confirm is offered');
+    CONFIRM_RETURN = true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Vue Next Steps radio — nested span, Issue 1 default (clinician-reported)
+  // After authorising, Next Steps is on "Issue 1 approved item". The routine
+  // option's visible text lives in a nested span; Vue listens on the
+  // [role=radio] wrapper (or a hidden input). Clicking the span is a no-op.
+  // Assign-to stays hidden until the wrapper is actually selected.
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- Vue radio: nested span inside [role=radio], Issue 1 default ---');
+  {
+    const issue = el('div', {
+      attrs: { role: 'radio', 'aria-checked': 'true' },
+      text: 'Issue 1 approved item',
+      label: 'Issue1',
+    });
+    const radio = el('div', {
+      attrs: { role: 'radio', 'aria-checked': 'false' },
+      classes: ['m-radio'],
+      label: 'Radio',
+    });
+    const span = el('span', {
+      text: 'Save & send to routine requests task list',
+      label: 'RadioSpan',
+    });
+    radio.appendChild(span);
+    const assign = el('input', {
+      attrs: { 'aria-label': 'Assign to' },
+      label: 'AssignInput',
+      hidden: true,
+    });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+
+    // Vue listens on the wrapper, not the inner text. FakeEl clicks do not
+    // bubble, which is the live failure mode (inner visual / .self handler).
+    radio.onClickFn = () => {
+      radio.attrs['aria-checked'] = 'true';
+      issue.attrs['aria-checked'] = 'false';
+      assign.hiddenEl = false;
+    };
+    assign.onClickFn = () => {
+      if (!option.parentElement) assign.parentElement.appendChild(option);
+      if (!commit.parentElement) assign.parentElement.appendChild(commit);
+    };
+
+    const root = buildRoot([issue, radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.radioControl(span) === radio, 'vue radio: radioControl walks from the inner span to [role=radio]');
+    check(!sb.isRadioOn(radio), 'vue radio: routine option starts unselected');
+    check(sb.isRadioOn(issue), 'vue radio: Issue 1 starts selected');
+
+    CONFIRM_RETURN = true;
+    await sb.runMacro(teamName, 'confirm');
+
+    check(CLICKS[0] === 'Radio', 'vue radio: step 1 clicks the [role=radio] wrapper, not the inner span');
+    check(CLICKS.indexOf('RadioSpan') === -1, 'vue radio: does not click the inner text span');
+    check(radio.getAttribute('aria-checked') === 'true', 'vue radio: routine option is selected after step 1');
+    check(issue.getAttribute('aria-checked') === 'false', 'vue radio: Issue 1 is no longer selected');
+    check(
+      CLICKS.indexOf('AssignInput') > CLICKS.indexOf('Radio'),
+      'vue radio: Assign-to is revealed and clicked after the radio switches'
+    );
+    check(CLICKS.indexOf('CommitBtn') > CLICKS.indexOf('TeamOption'), 'vue radio: confirm-OK reaches the commit');
+  }
+
+  console.log('\n--- Vue radio: hidden native input inside the label ---');
+  {
+    const issue = el('label', { text: 'Issue 1 approved item', label: 'Issue1' });
+    const wrap = el('label', { label: 'RadioWrap' });
+    const input = el('input', { attrs: { type: 'radio' }, label: 'Radio' });
+    const span = el('span', { text: 'Save & send to routine requests task list', label: 'RadioSpan' });
+    wrap.appendChild(input);
+    wrap.appendChild(span);
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput', hidden: true });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false });
+
+    input.onClickFn = () => {
+      input.checked = true;
+      assign.hiddenEl = false;
+    };
+    assign.onClickFn = () => {
+      if (!option.parentElement) assign.parentElement.appendChild(option);
+      if (!commit.parentElement) assign.parentElement.appendChild(commit);
+    };
+
+    const root = buildRoot([issue, wrap, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    check(sb.radioControl(span) === input, 'native input: radioControl walks from the span to input[type=radio]');
+
+    CONFIRM_RETURN = true;
+    await sb.runMacro(teamName, 'confirm');
+
+    check(CLICKS[0] === 'Radio', 'native input: step 1 clicks the hidden radio input, not the span');
+    check(input.checked === true, 'native input: the radio is checked after step 1');
+    check(CLICKS.indexOf('AssignInput') > CLICKS.indexOf('Radio'), 'native input: Assign-to is revealed after check');
+    check(CLICKS.indexOf('CommitBtn') > -1, 'native input: confirm-OK reaches the commit');
+  }
+
+  console.log('\n--- abort: Issue 1 stays selected (radio click did not take) ---');
+  {
+    const issue = el('div', {
+      attrs: { role: 'radio', 'aria-checked': 'true' },
+      text: 'Issue 1 approved item',
+      label: 'Issue1',
+    });
+    const radio = el('div', {
+      attrs: { role: 'radio', 'aria-checked': 'false' },
+      label: 'Radio',
+    });
+    const span = el('span', {
+      text: 'Save & send to routine requests task list',
+      label: 'RadioSpan',
+    });
+    radio.appendChild(span);
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput', hidden: true });
+    const root = buildRoot([issue, radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(CLICKS.indexOf('AssignInput') === -1, 'abort (Issue 1 stuck): Assign-to is never opened');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'abort (Issue 1 stuck): commit is never clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /Issue 1 approved item/.test(t.msg)),
+      'abort (Issue 1 stuck): toast names the option that is still selected'
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // abort paths — every one must fail safe: never reach the commit click
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n--- abort: routing radio absent ---');
+  {
+    const root = buildRoot([]); // no radio at all
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    check(CLICKS.length === 0, 'abort (no radio): clicks nothing at all');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /Save & send to routine/.test(t.msg)),
+      'abort (no radio): toasts an error naming the missing routing control'
+    );
+  }
+
+  console.log('\n--- abort: assign input never appears (timeout) ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const root = buildRoot([radio]); // radio only — no assign input ever added
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    const t0 = Date.now();
+    await sb.runMacro('Prescribing / Meds Management', 'auto');
+    const elapsed = Date.now() - t0;
+    check(
+      CLICKS.length === 1 && CLICKS[0] === 'Radio',
+      'abort (no assign input): only the radio was clicked, nothing further'
+    );
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /Assign to/.test(t.msg)),
+      'abort (no assign input): toasts an error naming the missing "Assign to" picker'
+    );
+    check(elapsed < 2000, `abort (no assign input): resolves quickly via the fast waitFor double (took ${elapsed}ms)`);
+  }
+
+  console.log('\n--- abort: team option not in the assignee list ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    // Deliberately no matching <li id="select-item-*" role="option"> — the team
+    // name typed does not exist in the picker's results.
+    const root = buildRoot([radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro('Nonexistent Team', 'auto');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'abort (team not in list): commit is never clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /isn.t in the assignee list/.test(t.msg)),
+      'abort (team not in list): toasts an error naming the team and the picker'
+    );
+  }
+
+  console.log('\n--- abort: commit stays disabled after selection ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    // Commit button present but NEVER becomes enabled (models Medicus not
+    // registering the assignee, e.g. a stale/partial selection).
+    const commit = el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: true });
+    const root = buildRoot([radio, assign, option, commit]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro(teamName, 'auto');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'abort (commit disabled): commit is never clicked while disabled');
+    check(CLICKS.indexOf('TeamOption') !== -1, 'abort (commit disabled): the team option WAS selected (got that far)');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /stayed disabled/.test(t.msg)),
+      'abort (commit disabled): toasts an error explaining the button stayed disabled'
+    );
+  }
+
+  console.log('\n--- abort: commit button absent entirely ---');
+  {
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { 'aria-label': 'Assign to' }, label: 'AssignInput' });
+    const teamName = 'Prescribing / Meds Management';
+    const option = el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' });
+    // No "Send to routine list" button anywhere on screen.
+    const root = buildRoot([radio, assign, option]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    await sb.runMacro(teamName, 'auto');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'abort (no commit control): nothing is clicked for the commit step');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /couldn.t find the .Send to routine list. button/.test(t.msg)),
+      'abort (no commit control): toasts an error naming the missing commit control'
+    );
+  }
+
+  {
+    // 2026-08-23 review fix: the mid-run navigation guard (audit M7) called
+    // `fail(team, mode, msg)`, which does not exist — the helper is
+    // `abort(msg, team, mode)`. Under 'use strict' the guard threw a
+    // ReferenceError, so the commit was correctly skipped but the clinician got
+    // NO toast and NO audit line, and the rejection went unhandled. The commit
+    // must stay unclicked AND the abort must be announced.
+    const radio = el('label', { text: 'Save & send to routine requests task list', label: 'Radio' });
+    const assign = el('input', { attrs: { placeholder: 'Assign to' }, label: 'AssignInput' });
+    const root = buildRoot([radio, assign]);
+    const sb = makeSandbox(root, '/tasks/data/prescription-requests/overview/abc-123');
+    CONFIRM_RETURN = true;
+
+    const teamName = 'Prescribing / Meds Management';
+    // SPA swaps tasks while the picker round-trips — change path as soon as
+    // Assign-to is opened so skip-type vs type-reveal timing cannot beat the
+    // post-confirm navigation guard.
+    assign.onClickFn = () => {
+      root.appendChild(
+        el('li', { attrs: { id: 'select-item-1', role: 'option' }, text: teamName, label: 'TeamOption' })
+      );
+      root.appendChild(el('button', { text: 'Send to routine list', label: 'CommitBtn', disabled: false }));
+      sb.location.pathname = '/tasks/data/prescription-requests/overview/SOMEONE-ELSE';
+    };
+
+    let threw = null;
+    await sb.runMacro(teamName, 'confirm').catch((e) => {
+      threw = e;
+    });
+
+    check(threw === null, 'mid-run navigation: the guard does not throw (no undefined helper)');
+    check(CLICKS.indexOf('CommitBtn') === -1, 'mid-run navigation: the commit button is never clicked');
+    check(
+      TOASTS.some((t) => t.kind === 'err' && /Task changed mid-run/.test(t.msg)),
+      'mid-run navigation: the clinician is told the task changed and nothing was clicked'
+    );
+  }
+
+  console.log(`\n--- Results: ${passed} passed, ${failed} failed ---\n`);
+  if (failed > 0) process.exit(1);
+})();

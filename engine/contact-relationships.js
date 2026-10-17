@@ -1,0 +1,1379 @@
+// engine/contact-relationships.js — Canonical relationship vocabulary, inversion, free-text matching
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+//
+// Pure engine for the Contacts linking tool (docs: see the Contacts Management build plan).
+// Replaces Medicus's free-text `patientContactRelationship` field with a fixed, 32-entry
+// canonical vocabulary (rules/contact-relationships.json) built from base relationships plus
+// three orthogonal modifiers (Ex-, Step-, Half-), each valid only on specific tiers.
+//
+// SCOPE NOTE: this is the PURE data/inversion/free-text-matching core only. No content-script
+// wiring, no DOM, no fetch — see engine/contact-match.js (candidate scoring) and
+// engine/contact-tree.js (in-memory family-tree structure) for the other two pure modules that
+// sit alongside this one.
+//
+// rules/contact-relationships.json is READ-ONLY from this module's point of view.
+//
+// Dual-mode export: Node `require` AND browser global (`window.ContactRelationships`), same
+// pattern as engine/reception-match.js.
+//
+// ── GENDER-INVERSION NOTE ──────────────────────────────────────────────────────────────────────
+// `reciprocal` in the JSON is one of: a plain string (unambiguous — "partner"→"partner"), an
+// { m, f } object keyed by the INDEX PATIENT's gender bucket (not the candidate's — the forward
+// label already encodes the candidate's implied role), or null (the Care tier — no relationship
+// has a natural reciprocal, so no reverse link is ever auto-suggested for those). When the index
+// patient's gender bucket can't be resolved to 'm'/'f', invertRelationship() returns
+// `ambiguous: true` rather than guessing — the caller MUST surface the computed reverse label as
+// an editable, reviewable line before firing any write. This is a deliberate extension of the
+// product's "no smart-defaulting, explicit decision every time" rule to gender-ambiguous
+// inversion, not an oversight.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+(function (global) {
+  'use strict';
+
+  // ── Load rules/contact-relationships.json — read-only ────────────────────────────────────────
+  // Node: require() resolves the real JSON synchronously at load time. Browser: require() doesn't
+  // exist in a content-script context, so this falls through to an empty-arrays placeholder here
+  // — the REAL data arrives later via an async fetch (content-scripts/contacts-api.js fetches
+  // rules/contact-relationships.json via chrome.runtime.getURL and sets
+  // global.ContactRelationshipsData once it resolves). dataOf() below re-checks that global on
+  // EVERY call rather than caching it once, so the browser path picks up the real data as soon as
+  // it lands, without this module needing to know when that happens.
+  function loadDefaultData() {
+    if (typeof require === 'function') {
+      try {
+        // eslint-disable-next-line global-require
+        return require('../rules/contact-relationships.json');
+      } catch (e) {
+        /* not resolvable under this module system/path — fall through to browser hook */
+      }
+    }
+    return { tiers: [], modifiers: [], relationships: [] };
+  }
+
+  const DEFAULT_DATA = loadDefaultData();
+
+  function dataOf(data) {
+    if (data && Array.isArray(data.relationships)) return data;
+    if (
+      typeof global !== 'undefined' &&
+      global.ContactRelationshipsData &&
+      Array.isArray(global.ContactRelationshipsData.relationships)
+    ) {
+      return global.ContactRelationshipsData;
+    }
+    return DEFAULT_DATA;
+  }
+
+  // ── Basic lookups ─────────────────────────────────────────────────────────────────────────────
+
+  function getRelationship(id, data) {
+    const d = dataOf(data);
+    if (!id) return null;
+    return d.relationships.find((r) => r.id === id) || null;
+  }
+
+  function getModifiers(data) {
+    return dataOf(data).modifiers || [];
+  }
+
+  function validModifiersForBase(baseId, data) {
+    const rel = getRelationship(baseId, data);
+    if (!rel) return [];
+    return getModifiers(data)
+      .filter((m) => Array.isArray(m.appliesToTiers) && m.appliesToTiers.includes(rel.tier))
+      .map((m) => m.id);
+  }
+
+  function getModifierLabel(modifierId, data) {
+    const m = getModifiers(data).find((mm) => mm.id === modifierId);
+    return m ? m.label : '';
+  }
+
+  // formatLabel(baseId, modifierId) -> "Step-mother", "Ex-husband", "Brother" (no modifier)
+  function formatLabel(baseId, modifierId, data) {
+    const rel = getRelationship(baseId, data);
+    if (!rel) return '';
+    if (!modifierId) return rel.label;
+    const validIds = validModifiersForBase(baseId, data);
+    if (!validIds.includes(modifierId)) return rel.label; // invalid modifier for this base — ignore rather than error
+    const modLabel = getModifierLabel(modifierId, data); // e.g. "Step-", "Ex-", "Half-"
+    return `${modLabel}${rel.label.charAt(0).toLowerCase()}${rel.label.slice(1)}`;
+  }
+
+  // ── Gender bucket resolution ──────────────────────────────────────────────────────────────────
+  // Medicus's own genderIdentity strings observed: "Female", "Male" (title case). Maps anything
+  // else (null, "Non-binary", unrecognised) to null — never guessed.
+  function genderBucket(genderIdentity) {
+    const g = String(genderIdentity || '')
+      .trim()
+      .toLowerCase();
+    if (g === 'female' || g === 'f') return 'f';
+    if (g === 'male' || g === 'm') return 'm';
+    return null;
+  }
+
+  // ── Inversion ─────────────────────────────────────────────────────────────────────────────────
+  // invertRelationship({ baseId, modifierId, indexGender }) -> { baseId, modifierId, ambiguous }
+  // `indexGender` is the INDEX patient's own genderIdentity string (or a pre-resolved 'm'/'f'/null
+  // bucket — genderBucket() is idempotent on already-bucketed input since 'm'/'f' pass through).
+  function invertRelationship({ baseId, modifierId, indexGender } = {}, data) {
+    const rel = getRelationship(baseId, data);
+    if (!rel || rel.reciprocal == null) {
+      return { baseId: null, modifierId: null, ambiguous: true };
+    }
+    let reverseBaseId;
+    if (typeof rel.reciprocal === 'string') {
+      reverseBaseId = rel.reciprocal;
+    } else {
+      const bucket = genderBucket(indexGender);
+      if (!bucket || !rel.reciprocal[bucket]) {
+        return { baseId: null, modifierId: null, ambiguous: true };
+      }
+      reverseBaseId = rel.reciprocal[bucket];
+    }
+    // Modifiers carry across the inversion unchanged (Step-mother -> Step-son/Step-daughter).
+    return { baseId: reverseBaseId, modifierId: modifierId || null, ambiguous: false };
+  }
+
+  // ── Composition via a shared hub ─────────────────────────────────────────────────────────────
+  // composeViaHub(xEdge, bEdge, xGenderIdentity) -> { baseId, modifierId: null } | null
+  // Given X's relationship to a shared hub patient H (xEdge, e.g. baseId "mother" — X is H's
+  // mother) and a SECOND person B's relationship to that SAME hub H (bEdge, e.g. baseId "daughter"
+  // — B is H's daughter), compose X's relationship to B (e.g. "grandmother" — X is B's
+  // grandmother). Used by the Contacts canvas's family-cycling composition step: when cycling
+  // lands on B's own canvas, B's hub A's OTHER already-confirmed relatives can be pre-filled with a
+  // relationship computed relative to B, not just copied from A's own labels for them.
+  //
+  // Deliberately narrow: only the two cases that are structurally UNCONDITIONAL given unmodified
+  // parent/child/partner hops — no modifier ambiguity, no risk of the hop already independently
+  // meaning something else. Returns null for everything outside that set, INCLUDING:
+  //   - either hop carrying a Step-/Half-/Ex- modifier at all (checked here, not left to the
+  //     caller — composing through an already-uncertain relationship compounds the uncertainty
+  //     rather than resolving it)
+  //   - sibling via one shared parent (can't tell full- vs half- from a single hop — this
+  //     vocabulary's Half- modifier makes that a real distinction, not cosmetic)
+  //   - step-parent/step-child via a partner hop (the partner could already independently BE that
+  //     child's own biological/legal parent — an ordinary intact family — with nothing in the edges
+  //     to rule that out)
+  // See the parked composition memory (project_contacts_relationship_composition_future_phase, this
+  // repo's Claude Code memory store) for the full reasoning and what's scoped for later — sibling
+  // and step-parent composition are meant to follow, surfaced with an explicit full/half or
+  // step/bio prompt rather than a silent guess, once this narrower set is live and proven.
+  //
+  // xGenderIdentity is a soft hint (same status as everywhere else in this file — never a hard
+  // filter) only needed for the partner-hop-through-X case, where the composed word depends on X's
+  // own gender rather than being determined by xEdge.baseId itself (husband/wife resolve on their
+  // own; partner/civil-partner don't carry gender in the word).
+  const HUB_PARENT_BASE_IDS = ['mother', 'father'];
+  const HUB_CHILD_BASE_IDS = ['son', 'daughter'];
+  const HUB_PARTNER_BASE_IDS = ['husband', 'wife', 'partner', 'civil-partner'];
+
+  function composeViaHub(xEdge, bEdge, xGenderIdentity) {
+    if (!xEdge || !bEdge || xEdge.modifierId || bEdge.modifierId) return null;
+    const xToHub = xEdge.baseId;
+    const bToHub = bEdge.baseId;
+
+    // X is H's parent, B is H's child -> X is B's grandparent.
+    if (HUB_PARENT_BASE_IDS.includes(xToHub) && HUB_CHILD_BASE_IDS.includes(bToHub)) {
+      return { baseId: xToHub === 'mother' ? 'grandmother' : 'grandfather', modifierId: null };
+    }
+    // X is H's child, B is H's parent -> X is B's grandchild.
+    if (HUB_CHILD_BASE_IDS.includes(xToHub) && HUB_PARENT_BASE_IDS.includes(bToHub)) {
+      return { baseId: xToHub === 'son' ? 'grandson' : 'granddaughter', modifierId: null };
+    }
+    // X is H's parent, B is H's (unmodified) partner -> X is B's parent-in-law. Note: when bToHub
+    // is the gender-neutral 'partner'/'civil-partner' (not 'husband'/'wife'), "-in-law" is being
+    // used colloquially here, not in its strict UK-legal sense (an in-law relationship in law
+    // requires marriage/civil partnership) — deliberately accepted rather than inventing a
+    // "partner-in-law" id that doesn't exist anywhere in rules/contact-relationships.json's
+    // vocabulary; the canvas confirm panel always shows this as an editable, human-reviewed
+    // suggestion, never a silent write, so the imprecision is caught there if it matters to the GP.
+    if (HUB_PARENT_BASE_IDS.includes(xToHub) && HUB_PARTNER_BASE_IDS.includes(bToHub)) {
+      return { baseId: xToHub === 'mother' ? 'mother-in-law' : 'father-in-law', modifierId: null };
+    }
+    // X is H's (unmodified) partner, B is H's parent -> X is B's child-in-law (same colloquial-vs-
+    // legal caveat as above for the gender-neutral partner/civil-partner case). husband/wife resolve
+    // on their own; partner/civil-partner need the gender hint, and fall through to null (never
+    // guessed) when it's unavailable or unrecognised.
+    if (HUB_PARTNER_BASE_IDS.includes(xToHub) && HUB_PARENT_BASE_IDS.includes(bToHub)) {
+      if (xToHub === 'husband') return { baseId: 'son-in-law', modifierId: null };
+      if (xToHub === 'wife') return { baseId: 'daughter-in-law', modifierId: null };
+      const bucket = genderBucket(xGenderIdentity);
+      if (bucket === 'm') return { baseId: 'son-in-law', modifierId: null };
+      if (bucket === 'f') return { baseId: 'daughter-in-law', modifierId: null };
+      return null;
+    }
+    return null;
+  }
+
+  // ── Free-text normalisation (colours column-1 manual-contact cards) ──────────────────────────
+  // ALIAS_TERMS — CSO review NOT required (relationship semantics, not clinical content) but
+  // still coverage-tested: every relationship id except 'other' must have a non-empty entry
+  // (test-contact-relationships.js), and every alias key must correspond to a real shipped id.
+  // A missing alias means a manual contact's free text simply doesn't get coloured/categorised —
+  // the failure mode is "falls back to 'needs review'", never a wrong category. That invariant is
+  // ENFORCED, not just asserted: normaliseFreeText below fails closed on possessive constructions
+  // (isPossessiveConstruction) and only ever matches an alias against the WHOLE remaining text
+  // (matchWholeText). Both guards exist because the earlier any-word scan broke the invariant in
+  // practice — "Son's wife" came back as a confident {baseId:'wife', confidence:0.85}, which is a
+  // WRONG category on a field that gets pre-filled into a real record write, not a missing one.
+  const ALIAS_TERMS = {
+    husband: ['husband', 'hubby'],
+    wife: ['wife'],
+    partner: ['partner', 'other half', 'boyfriend', 'girlfriend', 'oh', 'significant other'],
+    'civil-partner': ['civil partner', 'civil partnership'],
+
+    mother: ['mother', 'mum', 'mom', 'mam', 'ma'],
+    father: ['father', 'dad', 'pa', 'papa'],
+    son: ['son'],
+    daughter: ['daughter'],
+
+    brother: ['brother', 'bro'],
+    sister: ['sister', 'sis'],
+
+    grandmother: ['grandmother', 'grandma', 'granny', 'nan', 'nanny', 'nana'],
+    grandfather: ['grandfather', 'grandad', 'granddad', 'grandpa', 'pop', 'pops'],
+    grandson: ['grandson'],
+    granddaughter: ['granddaughter'],
+
+    aunt: ['aunt', 'auntie', 'aunty'],
+    uncle: ['uncle'],
+    niece: ['niece'],
+    nephew: ['nephew'],
+    cousin: ['cousin'],
+
+    'mother-in-law': ['mother in law', 'mother-in-law'],
+    'father-in-law': ['father in law', 'father-in-law'],
+    'son-in-law': ['son in law', 'son-in-law'],
+    'daughter-in-law': ['daughter in law', 'daughter-in-law'],
+    'brother-in-law': ['brother in law', 'brother-in-law'],
+    'sister-in-law': ['sister in law', 'sister-in-law'],
+
+    'legal-guardian': ['legal guardian', 'guardian'],
+    'foster-carer': ['foster carer', 'foster parent', 'foster mother', 'foster father'],
+    carer: ['carer', 'caregiver', 'care giver'],
+    'care-home-staff': ['care home', 'care home staff', 'nursing home', 'nursing home staff'],
+
+    friend: ['friend'],
+    neighbour: ['neighbour', 'neighbor'],
+  };
+
+  const MODIFIER_WORD_RE = {
+    step: /\bstep[- ]?/i,
+    half: /\bhalf[- ]?/i,
+    ex: /\bex[- ]?/i,
+  };
+
+  function normaliseText(s) {
+    return String(s == null ? '' : s)
+      .toLowerCase()
+      .replace(/[’']/g, '')
+      .replace(/[^a-z0-9\s-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Every word that names a relationship — canonical labels plus every shipped alias. Built from
+  // the LIVE data on each call rather than frozen at module load, since the browser path swaps the
+  // real data in asynchronously (see dataOf). 'other' is skipped deliberately: it's the free-text
+  // escape hatch, not a relationship word, so "Other" must never make a phrase look possessive.
+  function relationshipTerms(d) {
+    const terms = new Set();
+    for (const rel of d.relationships) {
+      if (rel.id === 'other') continue;
+      terms.add(normaliseText(rel.label));
+      for (const a of ALIAS_TERMS[rel.id] || []) terms.add(normaliseText(a));
+    }
+    return terms;
+  }
+
+  // isPossessiveConstruction("sons wife") -> true. A possessive names a THIRD party's relative
+  // ("Son's wife", "Mother's carer", "Daughter's friend"), so the relationship word sitting in the
+  // text is the WRONG answer for this contact, not a partial one — the old any-word alias scan
+  // returned {baseId:'wife', confidence:0.85} for "Son's wife" and would have pre-filled that onto
+  // a real record write. Composition is deliberately NOT attempted here: it would need the hub's
+  // identity and gender, and composeViaHub above only composes the hops that are structurally
+  // unconditional and refuses everything else — so this just fails closed to needs-review.
+  // normaliseText has already stripped the apostrophe by the time this runs, so "Son's wife" and
+  // "Sons wife" both arrive as "sons wife"; the shape detected is therefore a relationship-term-
+  // plus-s token FOLLOWED BY at least one more token. A trailing "…s" with nothing after it (a
+  // bare "Sons") is not a possessive and falls through to the ordinary no-match path.
+  function isPossessiveConstruction(raw, d) {
+    const tokens = raw.split(' ').filter(Boolean);
+    if (tokens.length < 2) return false;
+    const terms = relationshipTerms(d);
+    for (let i = 0; i < tokens.length - 1; i++) {
+      const t = tokens[i];
+      if (t.length > 1 && t.charAt(t.length - 1) === 's' && terms.has(t.slice(0, -1))) return true;
+    }
+    return false;
+  }
+
+  // matchWholeText(remainder, modifierId, d) -> a result for an exact WHOLE-STRING match of
+  // `remainder` against a canonical label (confidence 1) or a shipped alias (0.85), else null.
+  // Whole-string, never a per-word scan: an alias that merely APPEARS somewhere inside a longer
+  // phrase says nothing reliable about what that phrase means as a whole ("Carer for his mother"
+  // is not a mother), and a confidently wrong category here lands on a real record write.
+  function matchWholeText(remainder, modifierId, d) {
+    if (!remainder) return null;
+    const build = (relId, confidence) => {
+      const validModIds = validModifiersForBase(relId, d);
+      return {
+        baseId: relId,
+        modifierId: modifierId && validModIds.includes(modifierId) ? modifierId : null,
+        confidence,
+      };
+    };
+    // Exact canonical label match first (highest confidence).
+    for (const rel of d.relationships) {
+      if (normaliseText(rel.label) === remainder) return build(rel.id, 1);
+    }
+    // Alias match.
+    for (const rel of d.relationships) {
+      const aliases = ALIAS_TERMS[rel.id];
+      if (!aliases) continue;
+      if (aliases.some((a) => normaliseText(a) === remainder)) return build(rel.id, 0.85);
+    }
+    return null;
+  }
+
+  // normaliseFreeText(text) -> { baseId, modifierId, confidence } | null
+  // confidence: 1 = exact canonical label match, 0.85 = alias match, null result = no match at all
+  // (caller should route unmatched text to the "needs review" holding area, never guess a slot).
+  function normaliseFreeText(text, data) {
+    const d = dataOf(data);
+    const raw = normaliseText(text);
+    if (!raw) return null;
+
+    // Fail closed on someone else's relative before attempting any match at all.
+    if (isPossessiveConstruction(raw, d)) return null;
+
+    // Match the WHOLE text first, BEFORE any modifier stripping. Order matters: several shipped
+    // aliases are multi-word phrases that contain a modifier word, and stripping first destroys
+    // them — "other half" (a partner alias) lost its "half" to the Half- stripper, leaving "other",
+    // which then exact-matched the unrelated "Other" label at confidence 1. Matching intact first
+    // is what makes those aliases reachable at all.
+    const direct = matchWholeText(raw, null, d);
+    if (direct) return direct;
+
+    // No whole-text match — strip a modifier word/prefix and re-match the remainder. EVERY
+    // applicable modifier is tried rather than breaking on the first whose word merely appears, so
+    // a phrase containing a modifier word without being modified by it can still resolve. Only one
+    // modifier is ever applied to the result — Step/Half are mutually exclusive by tier design.
+    for (const [modId, re] of Object.entries(MODIFIER_WORD_RE)) {
+      if (!getModifiers(d).some((m) => m.id === modId)) continue;
+      if (!re.test(raw)) continue;
+      const match = matchWholeText(raw.replace(re, '').trim(), modId, d);
+      if (match) return match;
+    }
+
+    return null;
+  }
+
+  // isDeceasedRelationshipText(text) -> boolean
+  // Display-only signal, deliberately NOT part of normaliseFreeText's baseId/modifierId parsing —
+  // "deceased" isn't a variant of a relationship the way Step-/Half-/Ex- are (it applies equally
+  // to any relationship, so treating it as a same-kind modifier would be a category error), and
+  // Medicus's own canonical vocabulary has no such concept to write back to. It's also NOT sourced
+  // from Medicus's own `isDeceased` flag on the candidate's record (confirmed via HAR 2026-07-27:
+  // a deceased patient is deducted the same way any inactive-after-grace-period patient is, so
+  // `patient-details` 403s before that flag is ever reachable) — free text is the only reliable
+  // signal available here. Matches the GP's own stated convention ("(RIP)") plus common variants,
+  // word-bounded so it can't fire on an unrelated word that happens to contain the letters.
+  const DECEASED_TEXT_RE = /\b(rip|deceased|dec'd|passed away)\b/i;
+  function isDeceasedRelationshipText(text) {
+    return DECEASED_TEXT_RE.test(String(text || ''));
+  }
+
+  // isUkMobileNumber(phoneNumber) -> boolean — a UK mobile number by format, regardless of how
+  // it's punctuated/spaced or whether it's written with a leading 0 or the +44/44/0044 country
+  // code. UK-specific: Ofcom's own numbering plan reserves the 07 range exclusively for mobile
+  // (and pager) numbers, so a number matching this shape is never legitimately a landline —
+  // unlike isDeceasedRelationshipText, this isn't inferring from free text a human wrote, it's a
+  // structural fact about the number itself. Used to flag a number stored under the WRONG type
+  // (e.g. a mobile-shaped number filed as "Home") — confirmed live as a real, recurring data-entry
+  // pattern in GP2GP-imported records, same family of issue as the phone-note mismatch
+  // extractPreferredPhoneNote already surfaces.
+  function isUkMobileNumber(phoneNumber) {
+    let digits = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (!digits) return false;
+    if (digits.startsWith('00')) digits = digits.slice(2); // 00 international prefix
+    if (digits.startsWith('44')) digits = '0' + digits.slice(2); // +44/44 country code -> leading 0
+    return /^07\d{9}$/.test(digits);
+  }
+
+  // ── Contact-info extraction (shared between the wizard widget and the canvas) ────────────────
+  // Pure extractors over a patient-details response's OWN registered phone/email (not a manual
+  // contact's — the patient's own patientContactInformationSection) — used to show comparison
+  // evidence (e.g. "does this manual entry's phone match the patient's own registered number")
+  // in both the merge panel and the reverse-manual-match removal prompt.
+
+  function extractPreferredEmail(patientDetails) {
+    const emails =
+      (patientDetails &&
+        patientDetails.patientContactInformationSection &&
+        patientDetails.patientContactInformationSection.patientEmailAddresses) ||
+      [];
+    if (!emails.length) return null;
+    const preferred = emails.find((e) => e.preferredEmailAddress);
+    return (preferred || emails[0]).emailAddress || null;
+  }
+
+  function findPreferredPhoneEntry(patientDetails) {
+    const phones =
+      (patientDetails &&
+        patientDetails.patientContactInformationSection &&
+        patientDetails.patientContactInformationSection.patientTelephoneNumbers) ||
+      [];
+    if (!phones.length) return null;
+    return phones.find((p) => p.preferredTelephoneNumberForSms) || phones[0];
+  }
+
+  function extractPreferredPhone(patientDetails) {
+    const entry = findPreferredPhoneEntry(patientDetails);
+    return (entry && entry.telephoneNumber) || null;
+  }
+
+  // extractPreferredPhoneNote(patientDetails) -> string | null
+  // Confirmed live (HAR capture, 2026-07-25): patient-details' own patientTelephoneNumbers[]
+  // entries carry a free-text `notes` field (the same one editable via Medicus's own "Add/Edit
+  // Phone Number" form) — e.g. "practice phone number", or in the GP2GP-import cases this was
+  // built to catch, "mum's mobile" on what would otherwise look like the patient's own number.
+  // Surfaced as a prominent warning wherever a candidate's phone is shown before merging/linking,
+  // since a note here is exactly the kind of signal that a number doesn't really belong to the
+  // patient it's recorded against. No equivalent field exists on email addresses in this API.
+  function extractPreferredPhoneNote(patientDetails) {
+    const entry = findPreferredPhoneEntry(patientDetails);
+    return (entry && entry.notes) || null;
+  }
+
+  // extractPreferredPhoneId(patientDetails) -> string | null
+  // The SAME preferred entry as extractPreferredPhone/extractPreferredPhoneNote (never a
+  // different one — a caller that shows the note as a warning and then offers to edit it must be
+  // editing the number the warning is actually about). Used by the canvas to know which
+  // telephoneNumberId to send to ContactsApi.getEditTelephoneNumber/changeTelephoneNumber.
+  function extractPreferredPhoneId(patientDetails) {
+    const entry = findPreferredPhoneEntry(patientDetails);
+    return (entry && entry.telephoneNumberId) || null;
+  }
+
+  // ── Patient name quality checks (hub patient only) — a colleague's own request, 2026-09-16 ──────────
+  // PDS (the national Patient Demographic Service) regularly overwrites a correct name with data
+  // that reads as technically valid but is either pointless clutter or actively wrong. Detection
+  // confirmed live via HAR 124-persdetails.har (patient-details' own fullOfficialName/
+  // preferredGivenName/formerNames); the write side (ContactsApi.changePreferredName/
+  // changeOfficialName/createFormerName/deleteFormerName) confirmed via a second HAR session,
+  // same day (125-editpreferredname.har through 128-deleteformername.har) — see contacts-api.js's
+  // own comments on those four functions for the exact request/response shapes.
+
+  function nameTokens(s) {
+    return String(s || '')
+      .split(/\s+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+  }
+
+  // isRedundantPreferredName(givenName, preferredGivenName) -> boolean
+  // True ONLY when the preferred name equals the official FIRST name specifically — e.g. givenName
+  // "Test", preferredGivenName "Test" (a colleague's own screenshot: Medicus renders this as a harmless
+  // but pointless "Preferred name: Test" line). a colleague's own correction, 2026-09-16: a preferred
+  // name equal to a MIDDLE name is NOT redundant — "John Arthur Smith" going by "Arthur" is a
+  // genuine, useful preferred-name entry, because Medicus only shows first + last name by default
+  // and "Arthur" would otherwise never appear. This is why the check now takes the CONFIRMED
+  // separated givenName field (ContactsApi.getEditOfficialName) rather than whole-word-matching
+  // against the combined fullOfficialName string the way the first version of this function did —
+  // that string can't distinguish "matches the first name" from "matches a middle name" at all.
+  function isRedundantPreferredName(givenName, preferredGivenName) {
+    const pref = String(preferredGivenName || '').trim();
+    const given = String(givenName || '').trim();
+    if (!pref || !given) return false;
+    return pref.toLowerCase() === given.toLowerCase();
+  }
+
+  // Narrow on purpose (a colleague's own choice) — exact word "Baby" or "Infant", not a broader
+  // newborn-placeholder set, to keep false positives low on a first pass. Matched as a whole
+  // token, never a substring, so a genuine name that merely contains these letters never matches.
+  const PLACEHOLDER_NAME_WORD_RE = /^(baby|infant)$/i;
+
+  // findPlaceholderNameToken(fullOfficialName) -> string | null
+  // Returns the matched placeholder word (for display in the warning), or null. This is the
+  // "malign" pattern a colleague described: a hospital birth record keeps re-supplying "Baby Smith" /
+  // "Infant Jones" over PDS, silently overwriting a name the child has actually been given.
+  function findPlaceholderNameToken(fullOfficialName) {
+    const hit = nameTokens(fullOfficialName).find((t) => PLACEHOLDER_NAME_WORD_RE.test(t));
+    return hit || null;
+  }
+
+  // isSplitFirstName(givenName, middleNames) -> boolean
+  // True when givenName itself contains more than one word AND middleNames is empty — the exact
+  // pattern a colleague described: "John" middle "Arthur" surname "Smith" mis-recorded as givenName
+  // "John Arthur", middleNames "". This can stop the patient logging in, since the patient-facing
+  // website expects the name split the same way Medicus itself records it. Needs the SEPARATED
+  // fields (ContactsApi.getEditOfficialName) — patient-details' own fullOfficialName is one
+  // combined display string and cannot tell a genuine two-word first name (rare but real, e.g.
+  // "Mary Jane") from this mis-split; that is why this check takes those fields as its own
+  // argument rather than being folded into fullOfficialName parsing like the other two checks.
+  function isSplitFirstName(givenName, middleNames) {
+    if (String(middleNames || '').trim()) return false;
+    return nameTokens(givenName).length > 1;
+  }
+
+  // isAllCapsWord(word) -> boolean. a colleague's own request, 2026-09-16: "MR Andrew Smith" and
+  // "Mr ANDREW Smith" are both GP2GP/PDS import artifacts, not a deliberate style choice — nobody
+  // is genuinely named in all capitals. Checked on the word's LETTERS only (strips anything else
+  // first), so a hyphenated word like "SMITH-JONES" is still caught as a whole. Requires at least
+  // 2 letters so a genuine middle-name initial ("D") is never flagged — a single letter has no
+  // "wrong" case to have.
+  function isAllCapsWord(word) {
+    const letters = String(word || '').replace(/[^A-Za-z]/g, '');
+    return letters.length >= 2 && letters === letters.toUpperCase();
+  }
+
+  // titleCaseNameWord(word) -> string. The SUGGESTED fix for one all-caps word — capitalises the
+  // first letter and every letter after a hyphen/apostrophe/space (so "SMITH-JONES" -> "Smith-
+  // Jones", "O'BRIEN" -> "O'Brien"), with one special case: a "Mc" prefix capitalises the letter
+  // straight after it too ("MCDONALD" -> "McDonald"), a common and essentially unambiguous UK
+  // convention. Deliberately does NOT special-case "Mac" the same way — Mack/Macy/Macdonald/
+  // MacDonald genuinely vary in real use, and guessing which the patient actually spells it as
+  // would be exactly the kind of invented certainty this codebase avoids; "MACDONALD" becomes the
+  // still-valid "Macdonald", not a guess at "MacDonald". This is a SUGGESTION shown to the user
+  // before it writes anywhere (see fixCapitalisation's own comment), never applied blind.
+  function titleCaseNameWord(word) {
+    const w = String(word || '');
+    if (!w) return w;
+    const lower = w.toLowerCase();
+    const mc = /^mc([a-z].*)$/.exec(lower);
+    if (mc) return 'Mc' + mc[1].charAt(0).toUpperCase() + mc[1].slice(1);
+    return lower.replace(/(^|[-'\s])([a-z])/g, (m, sep, ch) => sep + ch.toUpperCase());
+  }
+
+  // findWeirdCapitalisationFields(officialNameFields) -> [{ key, label, value, suggested }]
+  // Checks prefix/givenName/middleNames/familyName (each may itself be several words) for any
+  // all-caps word, one entry per AFFECTED field, with a fully re-cased suggestion for that field
+  // (every word re-cased, not just the offending one — idempotent on words that were already
+  // fine). `suffix` is deliberately excluded — post-nominals and generational suffixes are
+  // legitimately all-caps or mixed-case in ways this function has no business "fixing" (a Roman
+  // numeral "III", or letters after a name like "OBE", is correct as written, not a data-entry
+  // artifact).
+  const CAPS_CHECK_FIELDS = [
+    { key: 'prefix', label: 'title' },
+    { key: 'givenName', label: 'first name' },
+    { key: 'middleNames', label: 'middle name' },
+    { key: 'familyName', label: 'last name' },
+  ];
+  function findWeirdCapitalisationFields(officialNameFields) {
+    const f = officialNameFields || {};
+    const out = [];
+    for (const { key, label } of CAPS_CHECK_FIELDS) {
+      const value = f[key] || '';
+      if (!nameTokens(value).some(isAllCapsWord)) continue;
+      out.push({
+        key,
+        label,
+        value,
+        suggested: nameTokens(value).map(titleCaseNameWord).join(' '),
+      });
+    }
+    return out;
+  }
+
+  // isInitialNameToken(word) -> boolean. A single letter, optionally followed by a period
+  // ("D", "D.", "T") — the PDS/GP2GP "initial instead of the full word" shape a colleague's own
+  // shorter-former-name example actually is. A multi-letter shortening ("John"/"Johnny",
+  // "Rob"/"Robert") is a real historical name, not a degraded copy, and must never match.
+  function isInitialNameToken(word) {
+    return /^[A-Za-z]\.?$/.test(String(word || '').trim());
+  }
+
+  // isShorterVersionOfName(formerNameStr, currentNameStr) -> boolean
+  // a colleague's own example, 2026-09-16: former name "Test D Test" against current official name "Test
+  // Dave Test" — same word count, one word an INITIAL ("D" / "D.") of the same-position current
+  // word ("Dave"), every other word identical. That pattern means the "former" name isn't a
+  // different historical name at all, just a degraded (initialised) copy of the current one —
+  // worth flagging as probably safe to delete rather than kept as if it were real history. Word
+  // COUNT must match exactly, and EVERY differing word must be an initial of the same-position
+  // current word — a former name with any genuinely different, missing or extra word (a real old
+  // name), or a multi-letter shortening of a real given name (John→Johnny, Rob→Robert), never
+  // matches. At least one word must actually be shorter, so a byte-for-byte duplicate is not
+  // reported here (that would be a different, not-yet-built check).
+  function isShorterVersionOfName(formerNameStr, currentNameStr) {
+    const formerWords = nameTokens(formerNameStr);
+    const currentWords = nameTokens(currentNameStr);
+    if (!formerWords.length || formerWords.length !== currentWords.length) return false;
+    let anyShorter = false;
+    for (let i = 0; i < formerWords.length; i++) {
+      const f = formerWords[i];
+      const c = currentWords[i];
+      if (f.toLowerCase() === c.toLowerCase()) continue;
+      const initial = f.replace(/\.$/, '').toLowerCase();
+      const current = c.toLowerCase();
+      if (isInitialNameToken(f) && initial.length < current.length && current.startsWith(initial)) {
+        anyShorter = true;
+        continue;
+      }
+      return false;
+    }
+    return anyShorter;
+  }
+
+  // payloadPatientMatches(payload, expectedPatientId) -> boolean
+  // Fail-closed identity check for the name-edit GET payloads (getEditOfficialName /
+  // getEditPreferredName / getEditFormerName all confirm they return `patientId`). A missing
+  // id on either side is not a match — the canvas must refuse the write rather than assume
+  // the GET landed on the hub patient.
+  function payloadPatientMatches(payload, expectedPatientId) {
+    if (!payload || expectedPatientId == null || expectedPatientId === '') return false;
+    if (payload.patientId == null || payload.patientId === '') return false;
+    return String(payload.patientId) === String(expectedPatientId);
+  }
+
+  // checkPatientNameQuality(patientDetailsSection, officialNameFields) -> [{ type, detail, ... }]
+  // One entry per issue found (0-3 may fire together). officialNameFields is OPTIONAL — the
+  // separated {givenName, middleNames} from ContactsApi.getEditOfficialName; when omitted, only
+  // the placeholder-name check runs. The redundant-preferred-name and split-first-name checks BOTH
+  // need officialNameFields and are skipped (not approximated) without it — redundant-preferred
+  // used to run off the combined fullOfficialName string, but that could not tell a match against
+  // the first name apart from a match against a middle name (see isRedundantPreferredName's own
+  // comment for why that distinction matters), so it was moved onto the same confirmed-fields
+  // requirement split-first-name already had rather than keep a string heuristic that risked
+  // exactly the false positive a colleague flagged. formerNames is only present on the placeholder-name
+  // issue — it's the candidate list ({nameId, name}) a human should check for the name that keeps
+  // getting overwritten, not a suggestion this code has any confidence is THE right one
+  // (formerNameType covers more than birth names — e.g. "Maiden name" — so every entry is shown,
+  // not filtered to a guessed type); nameId is what a caller needs to fetch the separated fields
+  // (ContactsApi.getEditFormerName) before adopting one as the current name.
+  // suggestedGivenName/suggestedMiddleNames on the split-name issue are the mechanical split (first
+  // word vs the rest) for a caller to prefill an edit form with — never applied automatically.
+  // The weird-capitalisation check (also officialNameFields-gated) lists every AFFECTED field with
+  // a re-cased suggestion (findWeirdCapitalisationFields's own comment). The former-name-shorter-
+  // version check runs unconditionally (fullOfficialName + formerNames only, no extra fetch) and
+  // is independent of every other issue here — it fires even when the CURRENT name is fine, since
+  // it is about a specific former-name entry being redundant clutter, not about the current name.
+  function checkPatientNameQuality(patientDetailsSection, officialNameFields) {
+    const d = patientDetailsSection || {};
+    const fullName = d.fullOfficialName || '';
+    const preferred = d.preferredGivenName || '';
+    const formerNames = Array.isArray(d.formerNames) ? d.formerNames : [];
+    const issues = [];
+
+    if (officialNameFields && isRedundantPreferredName(officialNameFields.givenName, preferred)) {
+      issues.push({
+        type: 'redundant-preferred-name',
+        detail: `Preferred name "${preferred}" is the same as the official first name "${officialNameFields.givenName}" — Medicus will still show it as a separate line, but it tells the reader nothing new.`,
+      });
+    }
+
+    const placeholderToken = findPlaceholderNameToken(fullName);
+    if (placeholderToken) {
+      issues.push({
+        type: 'placeholder-birth-name',
+        detail: `Official name "${fullName}" looks like a hospital birth-registration placeholder ("${placeholderToken}"), not the name this patient actually has.`,
+        formerNames: formerNames.filter((f) => f && f.name).map((f) => ({ nameId: f.nameId, name: f.name })),
+      });
+    }
+
+    if (officialNameFields && isSplitFirstName(officialNameFields.givenName, officialNameFields.middleNames)) {
+      const tokens = nameTokens(officialNameFields.givenName);
+      issues.push({
+        type: 'split-first-name',
+        detail: `Given name "${officialNameFields.givenName}" looks like two names run together, with no middle name recorded — this can stop the patient logging in, since the website expects the name split the same way Medicus records it.`,
+        suggestedGivenName: tokens[0],
+        suggestedMiddleNames: tokens.slice(1).join(' '),
+      });
+    }
+
+    if (officialNameFields) {
+      const capsFields = findWeirdCapitalisationFields(officialNameFields);
+      if (capsFields.length) {
+        issues.push({
+          type: 'weird-capitalisation',
+          detail: `The ${capsFields.map((f) => `${f.label} ("${f.value}")`).join(' and ')} on this record ${capsFields.length === 1 ? 'looks' : 'look'} like ${capsFields.length === 1 ? "it's" : "they're"} in the wrong case — an import artifact, not a real spelling choice.`,
+          fields: capsFields,
+        });
+      }
+    }
+
+    const shorterFormerNames = formerNames.filter((f) => f && f.name && isShorterVersionOfName(f.name, fullName));
+    if (shorterFormerNames.length) {
+      issues.push({
+        type: 'former-name-shorter-version',
+        detail: `${shorterFormerNames.length === 1 ? 'A former name is' : `${shorterFormerNames.length} former names are`} recorded that ${shorterFormerNames.length === 1 ? 'is' : 'are'} just a shorter version of the current official name "${fullName}" — not a different historical name, just a worse copy of this one.`,
+        formerNames: shorterFormerNames.map((f) => ({ nameId: f.nameId, name: f.name })),
+      });
+    }
+
+    return issues;
+  }
+
+  // resolveMiddleNamesConflict(currentMiddleNames, formerMiddleNames) -> { conflict, options, defaultChoice }
+  // a colleague's own request, 2026-09-16, from a live test: adopting a former name as the current
+  // official name (the placeholder-birth-name fix) must not silently REGRESS a materially better
+  // middle name already on record — his own example had current middleNames "Dave" and the former
+  // entry's middleNames "D" (just an initial); a straight full-replace from the former entry would
+  // have thrown away the good value while correctly fixing the placeholder FIRST name. Compares
+  // the two middle-name values SEPARATELY from the rest of the write (prefix/givenName/familyName/
+  // suffix are not in question — only middleNames is ever a plausible source of two independently
+  // "valid-looking" values); when they genuinely differ (case/whitespace-insensitive compare),
+  // returns both as named options rather than silently taking the former entry's value, with the
+  // LONGER (trimmed character count) one as the default choice — "more complete" as a proxy for
+  // "more likely correct", never a guess at which is semantically right. A tie defaults to keeping
+  // the current value (the least disruptive default). No conflict at all (including both blank) is
+  // reported with an empty options list — nothing for a caller to choose between.
+  function resolveMiddleNamesConflict(currentMiddleNames, formerMiddleNames) {
+    const current = String(currentMiddleNames || '').trim();
+    const former = String(formerMiddleNames || '').trim();
+    if (current.toLowerCase() === former.toLowerCase()) {
+      return { conflict: false, options: [], defaultChoice: 'current' };
+    }
+    return {
+      conflict: true,
+      options: [
+        { key: 'current', value: current },
+        { key: 'former', value: former },
+      ],
+      defaultChoice: former.length > current.length ? 'former' : 'current',
+    };
+  }
+
+  // formatOfficialName({prefix, givenName, middleNames, familyName, suffix}) -> string
+  // Same space-joined, blank-parts-skipped concatenation Medicus itself produces (confirmed by
+  // comparing getEditOfficialName's separated fields against that same patient's fullOfficialName
+  // in HAR 126-editgivenname.har: "Ms" + "Test" + "Dave" + "Test" -> "Ms Test Dave Test"). Used to
+  // show the ACTUAL resulting name in a confirm prompt when a middle-name choice has changed what
+  // will be written — the former-name entry's own pre-reconstructed `name` string is only correct
+  // when nothing in the write differs from it.
+  function formatOfficialName(fields) {
+    const f = fields || {};
+    return [f.prefix, f.givenName, f.middleNames, f.familyName, f.suffix]
+      .map((s) => String(s || '').trim())
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  // ── Duplicate-address detection (hub patient only) ───────────────────────────────────────────
+  // A known PDS (Patient Demographic Service) data-quality pattern: the same real-world address
+  // gets recorded on a patient's own record more than once, formatted slightly differently each
+  // time — an exact re-send, one copy gaining an extra locality-ish token the other lacks (e.g.
+  // "London" present on one but not the other), or the same text simply split across a different
+  // number of address lines (one system's "Flat 1, 26 High Street" as a single line vs another's
+  // "Flat 1" / "26 High Street" as two separate lines). DETECTION ONLY — no write/merge action is
+  // built on this yet, pending a HAR capture of Medicus's own address-edit/delete endpoint (this
+  // codebase never codes a write endpoint from a guess, see e.g. extractPreferredPhoneId's own
+  // history — HAR-before-writes is a hard rule here, not just a preference).
+
+  const ADDRESS_LINE_FIELDS = ['line1', 'line2', 'line3', 'locality', 'administrativeArea'];
+
+  function normaliseAddressText(s) {
+    return String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function normalisePostcode(s) {
+    return String(s || '')
+      .toUpperCase()
+      .replace(/\s+/g, '');
+  }
+
+  // addressTokens(address) — flattens every address-LINE-ish field (line1/2/3, locality,
+  // administrativeArea — postalCode and country are handled separately, see
+  // isLikelyDuplicateAddress) into a bag of words, SPLIT into three token classes.
+  // Flattening is what makes a field-boundary difference stop mattering: "Flat 1, 26 High Street"
+  // as a single line1, vs "Flat 1" / "26 High Street" as two separate lines, produce the IDENTICAL
+  // tokens either way. The class split matters for a different reason — see
+  // isLikelyDuplicateAddress's own comment on why a differing NUMBER or UNIT LETTER can never be
+  // treated the same as a differing WORD.
+  //   - numbers: any token CONTAINING a digit (not merely /^\d+$/) — "26", "1a", "3b" are all
+  //     house/flat designators, and an alphanumeric one distinguishes two real addresses exactly as
+  //     strongly as a bare numeric one does. Kept as an ORDERED sequence, not a set.
+  //   - units: a lone letter token — "Flat A" / "Flat B", the other way a unit inside a single
+  //     building gets written. Also an ordered sequence.
+  //   - words: everything else, as a Set — the only class scored fuzzily.
+  function addressTokens(address) {
+    const text = ADDRESS_LINE_FIELDS.map((f) => (address && address[f]) || '').join(' ');
+    const all = normaliseAddressText(text).split(' ').filter(Boolean);
+    const isNumberish = (t) => /\d/.test(t);
+    const isUnitLetter = (t) => /^[a-z]$/.test(t);
+    return {
+      numbers: all.filter(isNumberish),
+      units: all.filter(isUnitLetter),
+      words: new Set(all.filter((t) => !isNumberish(t) && !isUnitLetter(t))),
+    };
+  }
+
+  function sequencesEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function tokenOverlap(setA, setB) {
+    if (!setA.size || !setB.size) return 0;
+    let inter = 0;
+    for (const t of setA) if (setB.has(t)) inter++;
+    const union = setA.size + setB.size - inter;
+    return union > 0 ? inter / union : 0;
+  }
+
+  // How much of the WORD-token overlap (Jaccard) two addresses need, once their postcodes already
+  // agree and their numeric tokens match exactly, to be treated as the same place recorded twice —
+  // tuned to comfortably catch "one extra locality token" (e.g. 4 shared words + 1 extra = 4/5 =
+  // 0.8) while still requiring most of the text to genuinely overlap, not just a couple of common
+  // words like "high street".
+  const DUPLICATE_TOKEN_THRESHOLD = 0.7;
+
+  // isLikelyDuplicateAddress(a, b) -> boolean. Deliberately conservative — a merge eventually built
+  // on this deletes a real address record, so a missed duplicate is a far smaller problem than a
+  // false one:
+  //   - BOTH addresses must have a postcode, and it must match once normalised (whitespace/case
+  //     only) — never grouped on text similarity alone, since a genuinely different address a few
+  //     doors down could otherwise share most of its words with this one.
+  //   - Either postcode missing/blank -> never a duplicate (too uncertain to risk it).
+  //   - The two addresses' NUMBER-class tokens (house/flat designators) must match EXACTLY — the
+  //     same tokens in the same ORDER, not merely the same set — and so must their UNIT-letter
+  //     tokens. Found live while testing this: with a short address (5-7 words total), a single
+  //     differing word barely moves a pure Jaccard score, so "Flat 1" vs "Flat 2" at the same
+  //     postcode was scoring high enough to falsely match. A number is what actually distinguishes
+  //     one real address from its next-door neighbour or a different flat in the same building —
+  //     unlike a stray extra WORD (e.g. "London"), a differing NUMBER is never safe to treat as
+  //     noise, so it's checked separately and strictly rather than folded into the same fuzzy score.
+  //     Three further false-positive classes, each verified by execution, are why that check is now
+  //     as WIDE (what counts as a designator) and as STRICT (how they're compared) as it is:
+  //       * an ALPHANUMERIC designator is still a designator — under the old /^\d+$/ test "Flat 1a"
+  //         vs "Flat 1b" put "1a"/"1b" into the fuzzy word bag, where they diluted away to a match.
+  //         Any token containing a digit is number-class now.
+  //       * a SET comparison ignores WHICH number went where — "12 High Street, Flat 3" vs
+  //         "3 High Street, Flat 12" both reduce to {3, 12} and matched. The ordered sequence is
+  //         compared instead. The cost is deliberate and fail-closed: two copies of one address
+  //         that genuinely reorder their lines so the numbers swap positions are now missed rather
+  //         than risked, and a missed duplicate is the far smaller problem here.
+  //       * a lone LETTER is the other way a unit inside one building is written — "Flat A" vs
+  //         "Flat B" in a long address diluted to 0.75, over the 0.7 threshold, and matched. Unit
+  //         letters are their own class and must agree exactly; agreeing on both sides is of course
+  //         not a difference and never blocks a match.
+  //   - Only once numbers and unit letters match exactly does the rest of the address text (word
+  //     tokens) need to overlap heavily.
+  function isLikelyDuplicateAddress(a, b) {
+    if (!a || !b) return false;
+    const pcA = normalisePostcode(a.postalCode);
+    const pcB = normalisePostcode(b.postalCode);
+    if (!pcA || !pcB || pcA !== pcB) return false;
+    const ta = addressTokens(a);
+    const tb = addressTokens(b);
+    if (!sequencesEqual(ta.numbers, tb.numbers)) return false;
+    if (!sequencesEqual(ta.units, tb.units)) return false;
+    return tokenOverlap(ta.words, tb.words) >= DUPLICATE_TOKEN_THRESHOLD;
+  }
+
+  // findDuplicateAddressGroups(patientAddresses) -> [[i, j, ...], ...]
+  //   patientAddresses: [{ addressId, address: {...} }] — a SINGLE patient's own
+  //   patientAddressSection.patientAddresses array, exactly the shape already read elsewhere in
+  //   this codebase (see contacts-canvas.js's indexAddress/formatAddressLine). "Only within the hub
+  //   patient" is a CALLER decision, not this function's — it just groups whatever list it's given,
+  //   so the canvas only ever calls it with the index patient's own addresses, never a linked
+  //   contact's.
+  // Groups by ARRAY INDEX (never assumes an addressId is present, though a real merge action would
+  // need one). Each group is anchored to its first (lowest-index) member — every other member is
+  // pairwise-likely-duplicate of that anchor, not necessarily of each other. That's a deliberate
+  // simplification: a merge action only ever needs "these look like the same place", not a formal
+  // transitive-equivalence guarantee across a 3+-address group.
+  function findDuplicateAddressGroups(patientAddresses) {
+    const list = Array.isArray(patientAddresses) ? patientAddresses : [];
+    const groups = [];
+    const grouped = new Set();
+    for (let i = 0; i < list.length; i++) {
+      if (grouped.has(i)) continue;
+      const group = [i];
+      for (let j = i + 1; j < list.length; j++) {
+        if (grouped.has(j)) continue;
+        if (isLikelyDuplicateAddress(list[i] && list[i].address, list[j] && list[j].address)) {
+          group.push(j);
+        }
+      }
+      if (group.length > 1) {
+        group.forEach((idx) => grouped.add(idx));
+        groups.push(group);
+      }
+    }
+    return groups;
+  }
+
+  // chooseAddressToKeep(entries) -> index into `entries` to KEEP once a duplicate group is
+  // confirmed for merging — every OTHER entry is a delete candidate. entries:
+  // [{ address, isCorrespondenceAddress }], same order as the caller's own duplicate-group
+  // indexes; this only ever returns a POSITION within this array — the caller maps it back to
+  // whichever addressId that corresponds to. Confirmed via HAR capture 2026-07-30 that
+  // isCorrespondenceAddress exists (only reachable per-address via getEditAddress, not present on
+  // patientAddressSection.patientAddresses[] itself) and is worth protecting: deleting the wrong
+  // duplicate would lose that designation, a real mistake, not a cosmetic one.
+  // Tie-break order, each a genuine reason to prefer one duplicate over another, never an arbitrary
+  // pick:
+  //   1. Whichever IS the patient's correspondence address — protected above all else.
+  //   2. Whichever has the MOST complete address data (fewest empty fields) — keeps the record
+  //      carrying more information, not less.
+  //   3. The first one in the given order — a final deterministic tiebreak, never random/unstable.
+  function chooseAddressToKeep(entries) {
+    if (!Array.isArray(entries) || !entries.length) return -1;
+    const correspondenceIdx = entries.findIndex((e) => e && e.isCorrespondenceAddress);
+    if (correspondenceIdx !== -1) return correspondenceIdx;
+    const completenessFields = ADDRESS_LINE_FIELDS.concat(['postalCode']);
+    let bestIdx = 0;
+    let bestCompleteness = -1;
+    entries.forEach((e, i) => {
+      const addr = (e && e.address) || {};
+      const completeness = completenessFields.filter((f) => String(addr[f] || '').trim()).length;
+      if (completeness > bestCompleteness) {
+        bestCompleteness = completeness;
+        bestIdx = i;
+      }
+    });
+    return bestIdx;
+  }
+
+  // ── Duplicate phone/email detection (within ONE patient's own record) ──────────────────────────
+  // Same shape as findDuplicateAddressGroups/chooseAddressToKeep above — "only within the hub
+  // patient" is a CALLER decision, not these functions', they just group whatever list they're
+  // given. Requested 2026-08-20 alongside the "non-identical duplicates" example: "020 7946
+  // 0123" recorded as one entry, "7946 0123" (the same number with the area code dropped — a
+  // real, recurring GP2GP-import pattern, not a hypothetical) recorded as another.
+  //
+  // isLikelyDuplicatePhone: digit-only comparison (normalisePhoneDigits, already used elsewhere in
+  // this file for exact-match comparisons) PLUS a suffix check for the area-code-dropped case — a
+  // shorter number is a duplicate of a longer one if its digits are an exact trailing SUFFIX of the
+  // longer one's digits. This naturally covers a dropped UK trunk prefix ("0"), a dropped area code
+  // ("020"), or a country code used on one side and not the other ("+44 20 …") without needing to
+  // special-case any of them individually — all of those are just extra leading digits in front of
+  // the same core subscriber number. Gated on the SHORTER number being at least
+  // PHONE_DUPLICATE_MIN_SUFFIX_LENGTH digits, specifically to keep the false-positive risk
+  // negligible: a real UK subscriber number (the part after the area code) is 6-8 digits, so a
+  // 7-digit floor means two GENUINELY different numbers matching by coincidence is astronomically
+  // unlikely, while a short shared suffix (a handful of digits) would not be safe evidence on its
+  // own.
+  const PHONE_DUPLICATE_MIN_SUFFIX_LENGTH = 7;
+  function isLikelyDuplicatePhone(a, b) {
+    const da = normalisePhoneDigits(a);
+    const db = normalisePhoneDigits(b);
+    if (!da || !db) return false;
+    if (da === db) return true;
+    const shorter = da.length <= db.length ? da : db;
+    const longer = da.length <= db.length ? db : da;
+    if (shorter.length < PHONE_DUPLICATE_MIN_SUFFIX_LENGTH) return false;
+    return longer.endsWith(shorter);
+  }
+
+  // findDuplicatePhoneGroups(patientTelephoneNumbers) -> [[i, j, ...], ...]
+  //   patientTelephoneNumbers: a SINGLE patient's own patientContactInformationSection.
+  //   patientTelephoneNumbers array (confirmed shape: {telephoneNumberId, telephoneNumberType,
+  //   telephoneNumber, preferredTelephoneNumberForSms, notes}).
+  // Groups by ARRAY INDEX, anchored to the first (lowest-index) member — same deliberate
+  // simplification as findDuplicateAddressGroups: a delete action only ever needs "these look like
+  // the same number", not a formal transitive-equivalence guarantee across a 3+-entry group.
+  function findDuplicatePhoneGroups(patientTelephoneNumbers) {
+    const list = Array.isArray(patientTelephoneNumbers) ? patientTelephoneNumbers : [];
+    const groups = [];
+    const grouped = new Set();
+    for (let i = 0; i < list.length; i++) {
+      if (grouped.has(i)) continue;
+      const group = [i];
+      for (let j = i + 1; j < list.length; j++) {
+        if (grouped.has(j)) continue;
+        if (isLikelyDuplicatePhone(list[i] && list[i].telephoneNumber, list[j] && list[j].telephoneNumber)) {
+          group.push(j);
+        }
+      }
+      if (group.length > 1) {
+        group.forEach((idx) => grouped.add(idx));
+        groups.push(group);
+      }
+    }
+    return groups;
+  }
+
+  // choosePhoneToKeep(entries) -> index into `entries` to KEEP once a duplicate group is confirmed
+  // for deletion — every OTHER entry is a delete candidate. entries: the SAME group's own
+  // patientTelephoneNumbers objects, same order as the caller's own duplicate-group indexes.
+  // Tie-break order:
+  //   1. Whichever is preferredTelephoneNumberForSms — protected, same reasoning as
+  //      chooseAddressToKeep's correspondence-address check: losing the SMS-preferred flag would be
+  //      a real functional loss, not a cosmetic one.
+  //   2. Whichever has the MORE COMPLETE digit string (the longer one) — this is what actually
+  //      distinguishes "020 7946 0123" (keep) from "7946 0123" (delete) in the motivating example:
+  //      the fuller number carries strictly more information (the area code), never less.
+  //   3. The first one in the given order — a final deterministic tiebreak, never random/unstable.
+  function choosePhoneToKeep(entries) {
+    if (!Array.isArray(entries) || !entries.length) return -1;
+    const preferredIdx = entries.findIndex((e) => e && e.preferredTelephoneNumberForSms);
+    if (preferredIdx !== -1) return preferredIdx;
+    let bestIdx = 0;
+    let bestLength = normalisePhoneDigits(entries[0] && entries[0].telephoneNumber).length;
+    for (let i = 1; i < entries.length; i++) {
+      const len = normalisePhoneDigits(entries[i] && entries[i].telephoneNumber).length;
+      if (len > bestLength) {
+        bestLength = len;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  // isLikelyDuplicateEmail: case-insensitive, whitespace-trimmed exact match ONLY. Deliberately NOT
+  // provider-specific normalisation (Gmail's dot-insensitivity or "+work" plus-addressing, etc.) —
+  // that would be guessing at a pattern never confirmed for this population, the same "no ad hoc
+  // synonym pairs" discipline this file already applies elsewhere (see emailOwnerHint's own
+  // comment). Case/whitespace differences ARE a confirmed real "non-identical duplicate" shape
+  // (mail servers treat the local part as effectively case-insensitive in practice, whatever the
+  // spec technically permits) — extend to a provider-specific rule only after a real example is
+  // seen, not ahead of one.
+  function isLikelyDuplicateEmail(a, b) {
+    const na = String(a == null ? '' : a)
+      .trim()
+      .toLowerCase();
+    const nb = String(b == null ? '' : b)
+      .trim()
+      .toLowerCase();
+    if (!na || !nb) return false;
+    return na === nb;
+  }
+
+  // findDuplicateEmailGroups(patientEmailAddresses) -> [[i, j, ...], ...]
+  //   patientEmailAddresses: a SINGLE patient's own patientContactInformationSection.
+  //   patientEmailAddresses array (confirmed shape: {emailAddressId, emailAddressType,
+  //   emailAddress, isInvalidEmailAddress, preferredEmailAddress}).
+  function findDuplicateEmailGroups(patientEmailAddresses) {
+    const list = Array.isArray(patientEmailAddresses) ? patientEmailAddresses : [];
+    const groups = [];
+    const grouped = new Set();
+    for (let i = 0; i < list.length; i++) {
+      if (grouped.has(i)) continue;
+      const group = [i];
+      for (let j = i + 1; j < list.length; j++) {
+        if (grouped.has(j)) continue;
+        if (isLikelyDuplicateEmail(list[i] && list[i].emailAddress, list[j] && list[j].emailAddress)) {
+          group.push(j);
+        }
+      }
+      if (group.length > 1) {
+        group.forEach((idx) => grouped.add(idx));
+        groups.push(group);
+      }
+    }
+    return groups;
+  }
+
+  // chooseEmailToKeep(entries) -> index into `entries` to KEEP. Tie-break order: whichever is
+  // preferredEmailAddress (protected, same reasoning as choosePhoneToKeep's SMS-preferred check),
+  // else the first in the given order — unlike phone, a case/whitespace-only duplicate carries no
+  // "more complete" dimension to prefer between, so there is no second tie-break to make.
+  function chooseEmailToKeep(entries) {
+    if (!Array.isArray(entries) || !entries.length) return -1;
+    const preferredIdx = entries.findIndex((e) => e && e.preferredEmailAddress);
+    return preferredIdx !== -1 ? preferredIdx : 0;
+  }
+
+  // buildChangeAddressBody({addressId, address, description, accessNotes, isCorrespondenceAddress})
+  // -> the exact POST /patient/address/change-address body (confirmed via HAR capture 2026-07-30:
+  // setting an existing address as the patient's correspondence address). A full-replace write,
+  // not a patch — every field must be sent back, not just the one actually changing.
+  //
+  // Live-tested finding, straight from the user: Medicus's OWN UI for this action makes the GP
+  // re-search and re-select the whole address from scratch via an OS Places lookup, even when
+  // nothing about the address itself is changing — purely a quirk of that particular screen, not a
+  // requirement of this endpoint. The captured search results carry EXACTLY the same
+  // line1/line2/line3/locality/administrativeArea/postalCode/country/pafAddressKey shape this body
+  // needs, and the endpoint doesn't care whether that shape came from a fresh OS Places lookup or
+  // from an address already on file — so a caller that already knows the address (every caller in
+  // this codebase does, from patientAddressSection) can build this directly, no search needed.
+  // pafAddressKey stayed null in the captured flow despite going through OS Places, so it's always
+  // sent null here too, never guessed at.
+  function buildChangeAddressBody({ addressId, address, description, accessNotes, isCorrespondenceAddress } = {}) {
+    const a = address || {};
+    return {
+      address: {
+        line1: a.line1 || null,
+        line2: a.line2 || null,
+        line3: a.line3 || null,
+        locality: a.locality || null,
+        administrativeArea: a.administrativeArea || null,
+        postalCode: a.postalCode || null,
+        country: a.country || 'GBR',
+        pafAddressKey: null,
+      },
+      description: description || null,
+      accessNotes: accessNotes || null,
+      id: addressId || null,
+      isCorrespondenceAddress: !!isCorrespondenceAddress,
+    };
+  }
+
+  // ── Shared contact-info detection (patient vs a linked contact) ─────────────────────────────
+  // A patient sharing a non-Home phone or a non-Home email with one of their own linked contacts
+  // is a known data-quality/confidentiality signal in this GP population — most often a child's
+  // record wrongly carrying a parent's own mobile/email (see this file's own sourceNotes on why
+  // phone/email are capped low in scoreCandidate: "children's records sometimes wrongly carry a
+  // parent's own contact details"). This surfaces that same underlying problem directly rather
+  // than just discounting it during matching: a message meant privately for the patient (results,
+  // an appointment reminder, safeguarding-sensitive contact) could otherwise silently reach the
+  // linked contact instead. "Home" is excluded from BOTH the phone and email checks (a shared
+  // household landline or a shared household inbox is normal, not suspicious) — confirmed live
+  // that email DOES carry a type field here (`patientEmailAddresses[].emailAddressType`, e.g.
+  // "Personal"/"Home"/"Work"), correcting an earlier assumption in this file that email had no
+  // type at all; a same-record example the user found (one record's copy filed as Home, the
+  // other's as Work) wasn't being excluded before this fix even though the phone side already had
+  // the equivalent carve-out.
+  //
+  // Detection only — never resolves whose number/email it "really" is. Two hints travel alongside
+  // a match instead, so the GP can judge that themselves, straight from the user's own framing:
+  // "it is often clear from the email itself who it belongs to, or from the patient's age that
+  // they don't have their own mobile phone." Ages are the caller's job to show (this module has no
+  // access to a "now" — see candidateAgeFromDob in contacts-canvas.js); emailOwnerHint is the
+  // email-address half of that same idea, offered here since it's pure text comparison.
+
+  function normalisePhoneDigits(p) {
+    return String(p || '').replace(/[^0-9]/g, '');
+  }
+
+  function isHomeType(type) {
+    return (
+      String(type || '')
+        .trim()
+        .toLowerCase() === 'home'
+    );
+  }
+
+  // emailOwnerHint(email, nameA, nameB) -> 'a' | 'b' | null — which of two names the email's local
+  // part (before @) looks more like it belongs to. NOT a simple "does any token match" check —
+  // found live while testing this: a parent and child sharing a surname (the ordinary case) both
+  // "match" on the surname token alone, which would neutralise the hint in exactly the situation
+  // it exists for. Instead scores each name by what FRACTION of its own tokens appear in the
+  // local part (e.g. "sarah.jones82" -> {sarah, jones} matches ALL of "Sarah Jones"'s tokens but
+  // only HALF of "Ethan Jones"'s, correctly favouring the fuller match) and hints whichever score
+  // is strictly higher — a tie (including 0 vs 0, or an equally partial match on both sides, e.g.
+  // "sarah@..." against two different Sarahs) returns null rather than guessing. Trailing digits
+  // are stripped from each local-part token first (e.g. "jones82" -> "jones"), the single most
+  // common real-world email pattern, without trying to be cleverer than that.
+  function emailOwnerHint(email, nameA, nameB) {
+    const local = String(email || '').split('@')[0];
+    const localTokens = new Set(
+      normaliseText(local)
+        .split(' ')
+        .map((t) => t.replace(/\d+$/, ''))
+        .filter((t) => t.length > 1)
+    );
+    if (!localTokens.size) return null;
+    const coverage = (name) => {
+      const tokens = normaliseText(name)
+        .split(' ')
+        .filter((t) => t.length > 1);
+      if (!tokens.length) return 0;
+      return tokens.filter((t) => localTokens.has(t)).length / tokens.length;
+    };
+    const aScore = coverage(nameA);
+    const bScore = coverage(nameB);
+    if (aScore === bScore) return null;
+    return aScore > bScore ? 'a' : 'b';
+  }
+
+  // findSharedContactInfo(patient, contact) -> { phones: [string], emails: [{email, ownerHint}] } | null
+  //   patient/contact: { name, phones: [{telephoneNumber, telephoneNumberType}],
+  //                       emails: [{emailAddress, emailAddressType}] }
+  //   — the same shapes already read elsewhere in this codebase (patientContactInformationSection's
+  //   patientTelephoneNumbers[]/patientEmailAddresses[]) — emails are full entry objects, not bare
+  //   strings, specifically so the Home-type exclusion below has something to check.
+  // Returns null when nothing is shared (the common case), not an empty-arrays object, so a caller
+  // can just check truthiness.
+  function findSharedContactInfo(patient, contact) {
+    if (!patient || !contact) return null;
+    const patientPhones = (patient.phones || []).filter((p) => p && !isHomeType(p.telephoneNumberType));
+    const contactPhones = (contact.phones || []).filter((p) => p && !isHomeType(p.telephoneNumberType));
+    const sharedPhones = [];
+    for (const pp of patientPhones) {
+      const ppDigits = normalisePhoneDigits(pp.telephoneNumber);
+      if (!ppDigits) continue;
+      if (sharedPhones.includes(pp.telephoneNumber)) continue;
+      if (contactPhones.some((cp) => normalisePhoneDigits(cp.telephoneNumber) === ppDigits)) {
+        sharedPhones.push(pp.telephoneNumber);
+      }
+    }
+    const patientEmails = (patient.emails || []).filter((e) => e && e.emailAddress && !isHomeType(e.emailAddressType));
+    const contactEmails = (contact.emails || []).filter((e) => e && e.emailAddress && !isHomeType(e.emailAddressType));
+    const sharedEmails = [];
+    for (const pe of patientEmails) {
+      const peNorm = String(pe.emailAddress).trim().toLowerCase();
+      if (!peNorm) continue;
+      if (sharedEmails.some((s) => s.email === pe.emailAddress)) continue;
+      if (contactEmails.some((ce) => String(ce.emailAddress).trim().toLowerCase() === peNorm)) {
+        sharedEmails.push({
+          email: pe.emailAddress,
+          ownerHint: emailOwnerHint(pe.emailAddress, patient.name, contact.name),
+        });
+      }
+    }
+    if (!sharedPhones.length && !sharedEmails.length) return null;
+    return { phones: sharedPhones, emails: sharedEmails };
+  }
+
+  // ── Existing-link detection (shared between the wizard widget and the canvas) ────────────────
+  // Pure functions over a patient-details response — safety-critical duplicate-prevention logic
+  // that must not drift between the two UI surfaces that both create real Medicus links, so it
+  // lives here (unit-tested) rather than being duplicated in each content script.
+
+  // findExistingReciprocal(indexPatientDetails, candidatePatientId) -> the "Listed as Contact For"
+  // entry (if any) proving the candidate ALREADY lists the index patient as one of their own
+  // contacts. Checking this before offering a reverse link matters because POST link-patient has
+  // no idempotency guard of its own — firing it again creates a genuine duplicate relationship on
+  // the candidate's record, not an update.
+  function findExistingReciprocal(indexPatientDetails, candidatePatientId) {
+    const list =
+      (indexPatientDetails &&
+        indexPatientDetails.patientLinkedContactsSection &&
+        indexPatientDetails.patientLinkedContactsSection.patientContacts) ||
+      [];
+    return list.find((c) => c.linkedPatientId === candidatePatientId) || null;
+  }
+
+  // findExistingForwardLink(indexPatientDetails, candidatePatientId) -> an entry from the index
+  // patient's OWN patientContactsSection that's already a REAL link to this candidate
+  // (patientContactPatientId set, not a manual entry). Confirmed live: POST link-patient rejects a
+  // duplicate with a 400 ("Patient Contact already exists.") rather than silently no-op'ing —
+  // checking this first lets a caller skip the redundant write instead of erroring out.
+  function findExistingForwardLink(indexPatientDetails, candidatePatientId) {
+    const list =
+      (indexPatientDetails &&
+        indexPatientDetails.patientContactsSection &&
+        indexPatientDetails.patientContactsSection.patientContacts) ||
+      [];
+    return list.find((c) => c.patientContactPatientId === candidatePatientId) || null;
+  }
+
+  // suggestForwardFromReciprocal(reciprocalEntry, candidateGenderIdentity) -> { baseId, modifierId } | null
+  // When the candidate already lists the index patient as their own contact (e.g. "Mother"), that's
+  // a stronger signal for what the FORWARD relationship should default to than any manual entry's
+  // own free text — invert the already-established relationship using the CANDIDATE's own gender
+  // (they're the one whose son/daughter-type label depends on it, since the relationship was
+  // recorded from their side).
+  function suggestForwardFromReciprocal(reciprocalEntry, candidateGenderIdentity, data) {
+    if (!reciprocalEntry) return null;
+    const guess = normaliseFreeText(reciprocalEntry.patientContactRelationship, data);
+    if (!guess) return null;
+    const inv = invertRelationship(
+      { baseId: guess.baseId, modifierId: guess.modifierId, indexGender: candidateGenderIdentity },
+      data
+    );
+    return inv.ambiguous ? null : { baseId: inv.baseId, modifierId: inv.modifierId };
+  }
+
+  // ── Medicus API payload builders ──────────────────────────────────────────────────────────────
+
+  // buildLinkPatientBody(...) -> exact POST /patient/patient-contact/link-patient body shape
+  function buildLinkPatientBody(
+    { patientId, linkPatientId, baseId, modifierId, isNextOfKin, copyCorrespondence, notes } = {},
+    data
+  ) {
+    return {
+      patientId,
+      linkPatientId,
+      patientContactRelationship: formatLabel(baseId, modifierId, data),
+      patientContactIsNextOfKin: !!isNextOfKin,
+      patientContactCopyCorrespondence: !!copyCorrespondence,
+      patientContactNotes: notes || null,
+    };
+  }
+
+  // buildManualContactBody(...) -> exact POST /patient/patient-contact/create-patient-contact body shape
+  function buildManualContactBody(
+    {
+      patientId,
+      name = {},
+      baseId,
+      modifierId,
+      phones = {},
+      email,
+      address = {},
+      isNextOfKin,
+      copyCorrespondence,
+      notes,
+    } = {},
+    data
+  ) {
+    return {
+      patientId,
+      patientContactTitle: name.title || null,
+      patientContactFirstName: name.first || '',
+      patientContactMiddleNames: name.middle || null,
+      patientContactLastName: name.last || '',
+      patientContactRelationship: formatLabel(baseId, modifierId, data),
+      patientContactHomePhoneNumber: phones.home || null,
+      patientContactMobileNumber: phones.mobile || null,
+      patientContactWorkPhoneNumber: phones.work || null,
+      patientContactEmailAddress: email || null,
+      patientContactAddress: {
+        line1: address.line1 || '',
+        line2: address.line2 || '',
+        line3: address.line3 || '',
+        locality: address.locality || '',
+        administrativeArea: address.administrativeArea || '',
+        postalCode: address.postalCode || '',
+        country: address.country || 'GBR',
+      },
+      patientContactIsNextOfKin: !!isNextOfKin,
+      patientContactNotes: notes || null,
+      patientContactCopyCorrespondence: !!copyCorrespondence,
+    };
+  }
+
+  const api = {
+    getRelationship,
+    getModifiers,
+    validModifiersForBase,
+    formatLabel,
+    genderBucket,
+    invertRelationship,
+    composeViaHub,
+    normaliseFreeText,
+    isDeceasedRelationshipText,
+    isUkMobileNumber,
+    isLikelyDuplicateAddress,
+    findDuplicateAddressGroups,
+    chooseAddressToKeep,
+    isLikelyDuplicatePhone,
+    findDuplicatePhoneGroups,
+    choosePhoneToKeep,
+    isLikelyDuplicateEmail,
+    findDuplicateEmailGroups,
+    chooseEmailToKeep,
+    buildChangeAddressBody,
+    emailOwnerHint,
+    findSharedContactInfo,
+    ALIAS_TERMS,
+    findExistingReciprocal,
+    findExistingForwardLink,
+    suggestForwardFromReciprocal,
+    extractPreferredEmail,
+    extractPreferredPhone,
+    extractPreferredPhoneNote,
+    extractPreferredPhoneId,
+    isRedundantPreferredName,
+    findPlaceholderNameToken,
+    isSplitFirstName,
+    isAllCapsWord,
+    titleCaseNameWord,
+    findWeirdCapitalisationFields,
+    isShorterVersionOfName,
+    isInitialNameToken,
+    payloadPatientMatches,
+    checkPatientNameQuality,
+    resolveMiddleNamesConflict,
+    formatOfficialName,
+    buildLinkPatientBody,
+    buildManualContactBody,
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  } else if (global) {
+    global.ContactRelationships = api;
+  }
+})(typeof window !== 'undefined' ? window : typeof globalThis !== 'undefined' ? globalThis : null);

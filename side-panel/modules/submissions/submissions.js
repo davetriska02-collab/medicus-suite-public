@@ -1,0 +1,1245 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — Submissions Tracker module v1.0
+// Lifted from standalone extension; MWChart re-implemented for side panel context.
+
+'use strict';
+
+import { loadUiState, saveUiState } from '../shared/ui-state.js';
+import { freshnessHtml, attachFreshnessTicker } from '../shared/freshness.js';
+import { downloadCsv } from '../shared/export-util.js';
+import {
+  DEFAULT_SUB_THRESHOLDS,
+  getRagLevel,
+  windowTaskList,
+  ledgerSeriesForDay,
+  ledgerCountsForDays,
+  ledgerDayWatched,
+  demandBaseline,
+  baselineLine,
+} from './submissions-core.js';
+import { recordTaskLists } from './submissions-ledger.js';
+
+// ── Task types ────────────────────────────────────────────────────────────────
+
+// F8: Practice code format guard — same 4–8 hex-char pattern as practice-code.js.
+// Validated before interpolating into fetch URLs to prevent requests to unexpected
+// hosts. Definition mirrors practice-code.js (SITE_CODE_RE / isValidPracticeCode).
+const _SITE_CODE_RE = /^[a-f0-9]{4,8}$/i;
+function _isValidPracticeCode(code) {
+  return typeof code === 'string' && _SITE_CODE_RE.test(code);
+}
+
+// Categorical data-series palette — NOT clinical status colours.
+// Drawn from the suite's canonical non-clinical data-viz ramp (--cat-1..--cat-6,
+// defined once in panel.css :root + dark, documented in TOKENS.md) so the
+// resting charts never echo the RAG amber/red — which would dilute alert
+// salience (a clinician misreads a red category as an alarm). The RAG triads
+// (--red / --amber) stay reserved exclusively for tripped thresholds. These
+// are consumed via inline `style="fill:…"`/`background:…`, where the CSS
+// variables resolve (and adapt to the active theme) — see AXIS_LABEL below.
+// The slate ramp member (--cat-5) is deliberately skipped: it is the recessive
+// hue and reads as muted/disabled here.
+const CHART_COLORS = {
+  medical: 'var(--cat-1)', // blue (was alert-red)
+  admin: 'var(--cat-2)', // teal
+  investigation: 'var(--cat-6)', // cyan
+  rxRoutine: 'var(--cat-3)', // magenta (was status-green)
+  rxNonRoutine: 'var(--cat-4)', // violet
+};
+
+const TASK_TYPES = [
+  {
+    key: 'medical',
+    label: 'Medical',
+    shortLabel: 'Medical',
+    type: 'medical_patient_request_task',
+    color: CHART_COLORS.medical,
+  },
+  { key: 'admin', label: 'Admin', shortLabel: 'Admin', type: 'admin_patient_request_task', color: CHART_COLORS.admin },
+  {
+    key: 'investigation',
+    label: 'Invest',
+    shortLabel: 'Invest',
+    type: 'review_investigation_results_task',
+    color: CHART_COLORS.investigation,
+  },
+  {
+    key: 'rxRoutine',
+    label: 'Routine Rx',
+    shortLabel: 'Rx rtn',
+    type: 'prescription_request_task_routine',
+    color: CHART_COLORS.rxRoutine,
+  },
+  {
+    key: 'rxNonRoutine',
+    label: 'Non-rtn Rx',
+    shortLabel: 'Rx non',
+    type: 'prescription_request_task_non_routine',
+    color: CHART_COLORS.rxNonRoutine,
+  },
+];
+
+const DEFAULTS = { practiceCode: '' };
+
+// DEFAULT_THRESHOLDS + getRagLevel live in submissions-core.js (shared with panel.js).
+const DEFAULT_THRESHOLDS = DEFAULT_SUB_THRESHOLDS;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+let state = {
+  mode: 'today',
+  primaryDate: todayISO(),
+  rangeStart: addDays(todayISO(), -6),
+  rangeEnd: todayISO(),
+  compareDate: addDays(todayISO(), -1),
+  // 'day' = the original single-day-vs-single-day compare; 'month' = FEATURE 1a's
+  // month-to-date-vs-same-span-last-month comparison. Kept separate from `mode` because
+  // the Compare tab itself has two very different sub-views.
+  compareMode: 'day',
+  monthCompare: null, // { startA, endA, startB, endB } — set when compareMode==='month'
+  data: { primary: null, compare: null },
+  ledger: null,
+  loading: false,
+  config: { ...DEFAULTS },
+  hiddenSeries: new Set(),
+  lastFetched: null,
+  thresholds: {},
+};
+
+let container = null;
+let pollInterval = null;
+let _lastMetricItems = null;
+let _inFlight = false;
+let _storageListener = null;
+
+// ── Init / cleanup ────────────────────────────────────────────────────────────
+
+export async function init(el) {
+  container = el;
+
+  const stored = await chrome.storage.local.get(['submissions.config', 'suite.practiceCode', 'submissions.thresholds']);
+  const practiceCode = stored['suite.practiceCode'] || stored['submissions.config']?.practiceCode || '';
+  state.config = { ...DEFAULTS, ...(stored['submissions.config'] || {}), practiceCode };
+  state.thresholds = { ...DEFAULT_THRESHOLDS, ...(stored['submissions.thresholds'] || {}) };
+
+  // Restore persisted view state (active mode, hidden chart series)
+  const savedUi = await loadUiState('submissions');
+  if (savedUi) {
+    const VALID_MODES = ['today', 'range', 'compare'];
+    if (typeof savedUi.mode === 'string' && VALID_MODES.includes(savedUi.mode)) state.mode = savedUi.mode;
+    if (Array.isArray(savedUi.hiddenSeries))
+      state.hiddenSeries = new Set(savedUi.hiddenSeries.filter((k) => typeof k === 'string'));
+  }
+
+  renderShell();
+  await fetchAndRender();
+
+  pollInterval = setInterval(() => {
+    if (state.mode === 'today' && document.visibilityState === 'visible') fetchAndRender(false);
+  }, 60000);
+
+  _storageListener = (changes, area) => {
+    if (area === 'local' && changes['submissions.thresholds'] && container) {
+      state.thresholds = { ...DEFAULT_THRESHOLDS, ...(changes['submissions.thresholds'].newValue || {}) };
+      renderAll();
+    }
+  };
+  chrome.storage.onChanged.addListener(_storageListener);
+  const stopFresh = attachFreshnessTicker(container);
+
+  return () => {
+    clearInterval(pollInterval);
+    chrome.storage.onChanged.removeListener(_storageListener);
+    _storageListener = null;
+    stopFresh();
+    container = null;
+  };
+}
+
+// ── Shell HTML ────────────────────────────────────────────────────────────────
+
+function renderShell() {
+  if (!container) return;
+  container.innerHTML = `
+    <div class="module-wrap sub-module">
+      <div class="sub-header">
+        <div>
+          <div class="mod-eyebrow">Submissions Tracker</div>
+          <h1 class="mod-title" id="subTitle">Today</h1>
+          <div class="mod-subtitle" id="subSubtitle">Inbound request volume — counts work received, not items submitted</div>
+        </div>
+        <div class="header-right">
+          <button id="subCsvBtn" class="ghost-btn hidden">&#x2193; CSV</button>
+          <button id="subRefreshBtn" class="ghost-btn"><svg class="ghost-btn-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Refresh</button>
+          <button id="subSettingsBtn" class="icon-btn" title="Settings" aria-label="Submissions settings">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="mode-bar">
+        <div class="mode-tabs">
+          <button class="mode-tab${state.mode === 'today' ? ' mode-active' : ''}" data-mode="today">Today</button>
+          <button class="mode-tab${state.mode === 'range' ? ' mode-active' : ''}" data-mode="range">Range</button>
+          <button class="mode-tab${state.mode === 'compare' ? ' mode-active' : ''}" data-mode="compare">Compare</button>
+        </div>
+      </div>
+
+      <div id="modeControls" class="mode-controls-row"></div>
+      <div id="subBanner" class="banner hidden"></div>
+      <div id="subDataHealth" class="sub-data-health hidden" role="status" aria-live="polite"></div>
+      <div id="subAlertStrip" class="sub-alert-strip hidden" role="status" aria-live="assertive" aria-atomic="true"></div>
+
+      <div id="subMetrics" class="sub-metrics"></div>
+      <div id="subBaseline" class="sub-baseline hidden"></div>
+
+      <div class="chart-card">
+        <div class="chart-hdr"><span id="chart1Title">Cumulative through the day</span></div>
+        <div id="chart1" class="chart-area"></div>
+        <div id="legend1" class="legend-row"></div>
+      </div>
+
+      <div class="chart-card">
+        <div class="chart-hdr"><span id="chart2Title">Total by category</span></div>
+        <div id="chart2" class="chart-area chart-small"></div>
+      </div>
+
+      <div class="foot" id="subFoot"></div>
+    </div>
+  `;
+
+  bindShellEvents();
+  renderModeControls();
+}
+
+function bindShellEvents() {
+  container.querySelector('#subRefreshBtn')?.addEventListener('click', () => fetchAndRender(true));
+  container.querySelector('#subSettingsBtn')?.addEventListener('click', () => chrome.runtime.openOptionsPage());
+  container.querySelector('#subCsvBtn')?.addEventListener('click', downloadSubCsv);
+  container.querySelectorAll('.mode-tab').forEach((tab) => {
+    tab.addEventListener('click', () => setMode(tab.dataset.mode));
+  });
+}
+
+// ── Mode controls ─────────────────────────────────────────────────────────────
+
+function setMode(mode) {
+  state.mode = mode;
+  saveUiState('submissions', { mode: state.mode, hiddenSeries: [...state.hiddenSeries] });
+  container.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('mode-active', t.dataset.mode === mode));
+  renderModeControls();
+  fetchAndRender();
+}
+
+let _dpCallbacks = {};
+function renderModeControls() {
+  const ctr = container?.querySelector('#modeControls');
+  if (!ctr) return;
+  _dpCallbacks = {}; // reset per render; datePicker() repopulates synchronously
+  if (state.mode === 'today') {
+    ctr.innerHTML = datePicker('Date', state.primaryDate, (v) => {
+      state.primaryDate = v;
+      fetchAndRender();
+    });
+  } else if (state.mode === 'range') {
+    ctr.innerHTML =
+      datePicker('From', state.rangeStart, (v) => {
+        state.rangeStart = v;
+        fetchAndRender();
+      }) +
+      datePicker('To', state.rangeEnd, (v) => {
+        state.rangeEnd = v;
+        fetchAndRender();
+      }) +
+      `<div class="preset-row">
+        <button class="ghost-btn" data-days="6">7d</button>
+        <button class="ghost-btn" data-days="13">14d</button>
+        <button class="ghost-btn" data-days="29">30d</button>
+        <button class="ghost-btn" data-month-preset="thisMonth">This month</button>
+        <button class="ghost-btn" data-month-preset="lastMonth">Last month</button>
+      </div>`;
+    ctr.querySelectorAll('[data-days]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        state.rangeEnd = todayISO();
+        state.rangeStart = addDays(todayISO(), -parseInt(btn.dataset.days));
+        renderModeControls();
+        fetchAndRender();
+      });
+    });
+    ctr.querySelectorAll('[data-month-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const range = monthRangePreset(btn.dataset.monthPreset);
+        if (!range) return;
+        [state.rangeStart, state.rangeEnd] = range;
+        renderModeControls();
+        fetchAndRender();
+      });
+    });
+  } else if (state.compareMode === 'month') {
+    const spans = state.monthCompare || (state.monthCompare = monthToDateVsLastMonth());
+    ctr.innerHTML = `
+      <div class="dp-wrap"><span class="dp-label">This span</span><span class="dp-readonly">${formatDateShort(spans.startA)} → ${formatDateShort(spans.endA)}</span></div>
+      <div class="dp-wrap"><span class="dp-label">Prior span</span><span class="dp-readonly">${formatDateShort(spans.startB)} → ${formatDateShort(spans.endB)}</span></div>
+      <div class="preset-row">
+        <button class="ghost-btn" data-preset="dayvday">Day vs day</button>
+        <button class="ghost-btn mode-active" data-preset="monthvmonth" disabled>This month vs last month</button>
+      </div>
+      <div class="mode-note">Month to date vs same span last month — a partial current month is never compared against a full prior month.</div>
+    `;
+    ctr.querySelector('[data-preset="dayvday"]')?.addEventListener('click', () => {
+      state.compareMode = 'day';
+      renderModeControls();
+      fetchAndRender();
+    });
+  } else {
+    ctr.innerHTML =
+      datePicker('Day A', state.primaryDate, (v) => {
+        state.primaryDate = v;
+        fetchAndRender();
+      }) +
+      datePicker('Day B', state.compareDate, (v) => {
+        state.compareDate = v;
+        fetchAndRender();
+      }) +
+      `<div class="preset-row">
+        <button class="ghost-btn" data-preset="yesterday">vs yesterday</button>
+        <button class="ghost-btn" data-preset="lastweek">vs last week</button>
+        <button class="ghost-btn" data-preset="monthvmonth">This month vs last month</button>
+      </div>`;
+    ctr.querySelector('[data-preset="yesterday"]')?.addEventListener('click', () => {
+      state.primaryDate = todayISO();
+      state.compareDate = addDays(todayISO(), -1);
+      renderModeControls();
+      fetchAndRender();
+    });
+    ctr.querySelector('[data-preset="lastweek"]')?.addEventListener('click', () => {
+      state.primaryDate = todayISO();
+      state.compareDate = addDays(todayISO(), -7);
+      renderModeControls();
+      fetchAndRender();
+    });
+    ctr.querySelector('[data-preset="monthvmonth"]')?.addEventListener('click', () => {
+      state.compareMode = 'month';
+      state.monthCompare = monthToDateVsLastMonth();
+      renderModeControls();
+      fetchAndRender();
+    });
+  }
+  // Bind date pickers. Callbacks are looked up synchronously from _dpCallbacks
+  // (populated by datePicker during the innerHTML build) — no setTimeout, so a
+  // change fired immediately after render can't be dropped.
+  ctr.querySelectorAll('input[type=date]').forEach((input) => {
+    const cb = _dpCallbacks[input.id];
+    if (cb) input.addEventListener('change', () => cb(input.value));
+  });
+}
+
+function datePicker(label, value, onChange) {
+  const id = 'dp_' + Math.random().toString(36).slice(2);
+  // innerHTML can't preserve function refs, so register the callback in a map
+  // keyed by id; renderModeControls binds it after the DOM is in place.
+  _dpCallbacks[id] = onChange;
+  return `<div class="dp-wrap"><label class="dp-label" for="${id}">${label}</label><input id="${id}" type="date" value="${value}" max="${todayISO()}" /></div>`;
+}
+
+// ── Fetch ─────────────────────────────────────────────────────────────────────
+
+async function fetchAndRender(force = false) {
+  if (!container) return;
+  if (_inFlight) return;
+  _inFlight = true;
+  const refreshBtn = container.querySelector('#subRefreshBtn');
+  if (refreshBtn) refreshBtn.disabled = true;
+  try {
+    // Re-resolve practice code (auto-detect from tab, fall back to storage)
+    if (window.PracticeCode) {
+      const { code } = await window.PracticeCode.resolve();
+      if (code) state.config.practiceCode = code;
+    }
+    if (!state.config.practiceCode) {
+      setBanner('No practice code — open a Medicus tab or set it in Options.', 'info');
+      appendSetupNowBtn();
+      showSkeleton();
+      return;
+    }
+    state.loading = true;
+    showSkeleton();
+    setBanner(null);
+    updateTitles();
+    try {
+      if (state.mode === 'today') {
+        state.data = { primary: await fetchDay(state.primaryDate), compare: null };
+      } else if (state.mode === 'compare') {
+        if (state.compareMode === 'month') {
+          const spans = state.monthCompare || (state.monthCompare = monthToDateVsLastMonth());
+          const [p, c] = await Promise.all([
+            fetchRange(spans.startA, spans.endA),
+            fetchRange(spans.startB, spans.endB),
+          ]);
+          state.data = { primary: p, compare: c };
+        } else {
+          const [p, c] = await Promise.all([fetchDay(state.primaryDate), fetchDay(state.compareDate)]);
+          state.data = { primary: p, compare: c };
+        }
+      } else {
+        state.data = { primary: await fetchRange(state.rangeStart, state.rangeEnd), compare: null };
+      }
+      state.lastFetched = new Date();
+      state.loading = false;
+      renderAll();
+    } catch (err) {
+      state.loading = false;
+      setBanner(`Failed to load: ${err.message}. Check you're signed into Medicus.`);
+    }
+  } finally {
+    _inFlight = false;
+    if (refreshBtn) refreshBtn.disabled = false;
+  }
+}
+
+async function fetchDay(dateISO) {
+  return fetchWindow(dateISO, dateISO);
+}
+
+async function fetchRange(startISO, endISO) {
+  return fetchWindow(startISO, endISO);
+}
+
+// Shared fetch for both day and range modes. Responses go through
+// windowTaskList (submissions-core.js) so a server-side change to the
+// createdAt_* filter or the response envelope shows up as a visible data-health
+// warning (`result._diag`, rendered by renderDataHealth) instead of silently
+// wrong counts — see the v3.35.2 postmortem in CHANGELOG.
+//
+// The fetched lists are then merged into the persistent day ledger
+// (submissions-ledger.js) and the module RENDERS FROM THE LEDGER, not the raw
+// response: the task-list API only ever contains open tasks (completed
+// requests leave the table — confirmed by live probe, v3.153.0), so the raw
+// response undercounts "work received" as the team completes work. The ledger
+// keeps a task counted once it has been seen.
+async function fetchWindow(startISO, endISO) {
+  // F8: Validate practice code before interpolating into the fetch URL.
+  if (!_isValidPracticeCode(state.config.practiceCode)) {
+    throw new Error('Invalid practice code format — cannot fetch');
+  }
+  const result = {};
+  const diag = { filterIgnored: false, dropped: 0, truncated: false };
+  await Promise.all(
+    TASK_TYPES.map(async (tt) => {
+      const url = `https://${state.config.practiceCode}.api.england.medicus.health/tasks/data/${tt.type}/task-list?createdAt_startDate=${startISO}&createdAt_endDate=${endISO}`;
+      const r = await fetch(url, { credentials: 'include' });
+      if (!r.ok) throw new Error(`${tt.label} HTTP ${r.status}`);
+      const d = await r.json();
+      const w = windowTaskList(d, startISO, endISO);
+      result[tt.key] = w.tasks;
+      if (w.filterIgnored) {
+        diag.filterIgnored = true;
+        diag.dropped += w.dropped;
+      }
+      if (w.truncated) diag.truncated = true;
+    })
+  );
+  try {
+    state.ledger = await recordTaskLists(result);
+  } catch (_) {
+    // Storage failure — render falls back to the live (open-tasks-only) view.
+    state.ledger = null;
+  }
+  result._diag = diag;
+  return result;
+}
+
+// ── Aggregation ───────────────────────────────────────────────────────────────
+
+function buildHourlyCumulative(dayData) {
+  const series = {};
+  for (const tt of TASK_TYPES) {
+    const hourly = new Array(24).fill(0);
+    (dayData[tt.key] || []).forEach((task) => {
+      const t = parseTime(task.createdAt);
+      if (t !== null) hourly[t]++;
+    });
+    let acc = 0;
+    const cum = hourly.map((n) => (acc += n));
+    series[tt.key] = { total: acc, hourly, cumulative: cum };
+  }
+  return series;
+}
+
+function buildDailyTotals(rangeData, startISO, endISO) {
+  const days = [];
+  let cur = startISO;
+  while (cur <= endISO) {
+    days.push(cur);
+    cur = addDays(cur, 1);
+  }
+  const byDay = {};
+  for (const day of days) {
+    byDay[day] = {};
+    for (const tt of TASK_TYPES) byDay[day][tt.key] = 0;
+  }
+  for (const tt of TASK_TYPES) {
+    (rangeData[tt.key] || []).forEach((task) => {
+      const day = parseDate(task.createdAt);
+      if (day && byDay[day]) byDay[day][tt.key]++;
+    });
+  }
+  return { days, byDay };
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────────
+
+function downloadSubCsv() {
+  if (!_lastMetricItems || !_lastMetricItems.length) return;
+  const dateStr =
+    state.mode === 'range'
+      ? `${state.rangeStart}-to-${state.rangeEnd}`
+      : state.mode === 'compare'
+        ? state.compareMode === 'month' && state.monthCompare
+          ? `${state.monthCompare.startA}-to-${state.monthCompare.endA}-vs-${state.monthCompare.startB}-to-${state.monthCompare.endB}`
+          : `${state.primaryDate}-vs-${state.compareDate}`
+        : state.primaryDate;
+  const header = ['Category', 'Count'];
+  const rows = _lastMetricItems.map((m) => [m.label, m.value]);
+  downloadCsv(`submissions-${dateStr}.csv`, header, rows);
+}
+
+// ── Render all ────────────────────────────────────────────────────────────────
+
+function renderAll() {
+  if (!container) return;
+  updateTitles();
+  renderDataHealth();
+  if (state.mode === 'today') renderToday();
+  else if (state.mode === 'compare') renderCompare();
+  else renderRange();
+  const foot = container.querySelector('#subFoot');
+  if (foot) foot.innerHTML = state.lastFetched ? freshnessHtml(state.lastFetched) : '';
+  const csvBtn = container.querySelector('#subCsvBtn');
+  if (csvBtn) csvBtn.classList.toggle('hidden', !_lastMetricItems || _lastMetricItems.length === 0);
+}
+
+function updateTitles() {
+  const t = container?.querySelector('#subTitle');
+  const s = container?.querySelector('#subSubtitle');
+  if (!t || !s) return;
+  if (state.mode === 'today') {
+    t.textContent = state.primaryDate === todayISO() ? 'Today' : formatDate(state.primaryDate);
+    s.textContent =
+      state.primaryDate === todayISO()
+        ? 'Inbound request volume — counts work received, not items submitted'
+        : 'Inbound request volume through that day';
+  } else if (state.mode === 'compare') {
+    if (state.compareMode === 'month' && state.monthCompare) {
+      const { startA, endA, startB, endB } = state.monthCompare;
+      t.textContent = 'Month to date vs last month';
+      s.textContent = `${formatDateShort(startA)}–${formatDateShort(endA)} vs ${formatDateShort(startB)}–${formatDateShort(endB)} · month to date, not a full-month total`;
+    } else {
+      t.textContent = 'Day vs day';
+      s.textContent = `${formatDateShort(state.primaryDate)} vs ${formatDateShort(state.compareDate)}`;
+    }
+  } else {
+    t.textContent = 'Range';
+    const days = daysBetween(state.rangeStart, state.rangeEnd) + 1;
+    s.textContent = `${formatDateShort(state.rangeStart)} → ${formatDateShort(state.rangeEnd)} · ${days}d`;
+  }
+}
+
+// Chart series for one day: from the ledger (remembers completed tasks) when
+// available, else derived from the live open-tasks-only fetch.
+function daySeries(dateISO, liveDayData) {
+  if (state.ledger)
+    return ledgerSeriesForDay(
+      state.ledger,
+      dateISO,
+      TASK_TYPES.map((tt) => tt.key)
+    );
+  return buildHourlyCumulative(liveDayData || {});
+}
+
+function renderToday() {
+  const day = state.data.primary;
+  if (!day) return;
+  const series = daySeries(state.primaryDate, day);
+  renderMetrics(
+    TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, value: series[tt.key].total, color: tt.color }))
+  );
+  renderBaselineLine();
+  const t = container.querySelector('#chart1Title');
+  if (t) t.textContent = 'Cumulative through the day';
+  MWChart.line({
+    container: container.querySelector('#chart1'),
+    xLabels: hourLabels(),
+    series: TASK_TYPES.filter((tt) => !state.hiddenSeries.has(tt.key)).map((tt) => ({
+      key: tt.key,
+      color: tt.color,
+      label: tt.shortLabel,
+      values: series[tt.key].cumulative,
+    })),
+  });
+  renderLegend(
+    'legend1',
+    TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, color: tt.color })),
+    { toggleable: true }
+  );
+  const t2 = container.querySelector('#chart2Title');
+  if (t2) t2.textContent = 'Total by category';
+  MWChart.bar({
+    container: container.querySelector('#chart2'),
+    bars: TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, value: series[tt.key].total, color: tt.color })),
+  });
+  renderAlertStrip();
+}
+
+// Same-weekday baseline line under the metrics (Gauntlet B3 / D3): today is
+// compared cumulative-to-the-current-hour; a viewed PAST day is compared as a
+// complete day (hour 23). Hidden entirely until the ledger holds enough
+// watched same-weekday history — no comparison invented from two points.
+function renderBaselineLine() {
+  const el = container.querySelector('#subBaseline');
+  if (!el) return;
+  const isToday = state.primaryDate === todayISO();
+  const hour = isToday ? new Date().getHours() : 23;
+  const b = demandBaseline(
+    state.ledger,
+    state.primaryDate,
+    hour,
+    TASK_TYPES.map((tt) => tt.key)
+  );
+  if (!b) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.classList.remove('hidden');
+  el.className = `sub-baseline sub-baseline--${b.band}`;
+  el.title = 'All categories combined vs this weekday’s ledger history (watched days only, same hour of day)';
+  el.textContent = baselineLine(b, isToday);
+}
+
+function renderCompare() {
+  if (state.compareMode === 'month') {
+    renderCompareMonth();
+    return;
+  }
+  const dayA = state.data.primary;
+  const dayB = state.data.compare;
+  if (!dayA || !dayB) return;
+  const sA = daySeries(state.primaryDate, dayA);
+  const sB = daySeries(state.compareDate, dayB);
+  renderMetrics(
+    TASK_TYPES.map((tt) => ({
+      key: tt.key,
+      label: tt.shortLabel,
+      value: sA[tt.key].total,
+      compareValue: sB[tt.key].total,
+      color: tt.color,
+    }))
+  );
+  const t = container.querySelector('#chart1Title');
+  if (t) t.textContent = 'Cumulative · day vs day';
+  const lineSeries = [];
+  TASK_TYPES.forEach((tt) => {
+    if (state.hiddenSeries.has(tt.key)) return;
+    lineSeries.push({
+      key: tt.key + '_a',
+      color: tt.color,
+      label: tt.shortLabel + ' A',
+      values: sA[tt.key].cumulative,
+    });
+    lineSeries.push({
+      key: tt.key + '_b',
+      color: tt.color,
+      label: tt.shortLabel + ' B',
+      values: sB[tt.key].cumulative,
+      dashed: true,
+    });
+  });
+  MWChart.line({ container: container.querySelector('#chart1'), xLabels: hourLabels(), series: lineSeries });
+  renderLegend(
+    'legend1',
+    TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, color: tt.color })),
+    { toggleable: true, extraNote: 'Solid = A · Dashed = B' }
+  );
+  const t2 = container.querySelector('#chart2Title');
+  if (t2) t2.textContent = `Totals · ${formatDateShort(state.primaryDate)} vs ${formatDateShort(state.compareDate)}`;
+  MWChart.bar({
+    container: container.querySelector('#chart2'),
+    bars: TASK_TYPES.map((tt) => ({
+      key: tt.key,
+      label: tt.shortLabel,
+      value: sA[tt.key].total,
+      compareValue: sB[tt.key].total,
+      color: tt.color,
+    })),
+  });
+  renderAlertStrip();
+}
+
+// FEATURE 1a: "This month vs last month" compare sub-mode. Ranges (not single days) come
+// in via fetchRange, one per task type per span — same shape as Range mode's data, so
+// totals are just raw task-list lengths (reconcilable against the tiles, per CLAUDE.md's
+// "every figure must remain reconcilable" convention). The hourly cumulative-through-the-day
+// chart doesn't make sense for a month span, so chart1 is replaced with a note pointing at
+// the totals/delta bar chart below, which reuses the existing grouped-bar + delta renderer.
+function renderCompareMonth() {
+  const rangeA = state.data.primary;
+  const rangeB = state.data.compare;
+  if (!rangeA || !rangeB) return;
+  const totalsA = {};
+  const totalsB = {};
+  for (const tt of TASK_TYPES) {
+    totalsA[tt.key] = (rangeA[tt.key] || []).length;
+    totalsB[tt.key] = (rangeB[tt.key] || []).length;
+  }
+  renderMetrics(
+    TASK_TYPES.map((tt) => ({
+      key: tt.key,
+      label: tt.shortLabel,
+      value: totalsA[tt.key],
+      compareValue: totalsB[tt.key],
+      color: tt.color,
+    }))
+  );
+  const t = container.querySelector('#chart1Title');
+  if (t) t.textContent = 'Month comparison';
+  MWChart.empty(
+    container.querySelector('#chart1'),
+    'Hourly trend view is not shown for month comparisons — see totals below'
+  );
+  const l1 = container.querySelector('#legend1');
+  if (l1) l1.innerHTML = '';
+  const t2 = container.querySelector('#chart2Title');
+  const { startA, endA, startB, endB } = state.monthCompare;
+  if (t2)
+    t2.textContent = `Totals · ${formatDateShort(startA)}–${formatDateShort(endA)} vs ${formatDateShort(startB)}–${formatDateShort(endB)}`;
+  MWChart.bar({
+    container: container.querySelector('#chart2'),
+    bars: TASK_TYPES.map((tt) => ({
+      key: tt.key,
+      label: tt.shortLabel,
+      value: totalsA[tt.key],
+      compareValue: totalsB[tt.key],
+      color: tt.color,
+    })),
+  });
+  renderAlertStrip();
+}
+
+function renderRange() {
+  const data = state.data.primary;
+  if (!data) return;
+  const { days, byDay: liveByDay } = buildDailyTotals(data, state.rangeStart, state.rangeEnd);
+  const byDay = state.ledger
+    ? ledgerCountsForDays(
+        state.ledger,
+        days,
+        TASK_TYPES.map((tt) => tt.key)
+      )
+    : liveByDay;
+  const totals = {};
+  for (const tt of TASK_TYPES) totals[tt.key] = days.reduce((a, d) => a + (byDay[d][tt.key] || 0), 0);
+  renderMetrics(
+    TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, value: totals[tt.key], color: tt.color }))
+  );
+  const t = container.querySelector('#chart1Title');
+  if (t) t.textContent = 'Daily submissions';
+  const stacks = days.map((day) => ({
+    day,
+    segments: TASK_TYPES.filter((tt) => !state.hiddenSeries.has(tt.key)).map((tt) => ({
+      key: tt.key,
+      value: byDay[day][tt.key] || 0,
+      color: tt.color,
+      label: tt.shortLabel,
+    })),
+  }));
+  MWChart.stacked({ container: container.querySelector('#chart1'), xLabels: days.map(formatDateShort), stacks });
+  renderLegend(
+    'legend1',
+    TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, color: tt.color })),
+    { toggleable: true }
+  );
+  const t2 = container.querySelector('#chart2Title');
+  if (t2) t2.textContent = `Totals over ${days.length} days`;
+  MWChart.bar({
+    container: container.querySelector('#chart2'),
+    bars: TASK_TYPES.map((tt) => ({ key: tt.key, label: tt.shortLabel, value: totals[tt.key], color: tt.color })),
+  });
+  renderAlertStrip();
+}
+
+// ── Metric tiles ──────────────────────────────────────────────────────────────
+
+function renderMetrics(items) {
+  _lastMetricItems = items;
+  const ctr = container?.querySelector('#subMetrics');
+  if (!ctr) return;
+  // Resting tile is neutral (no category colour on the card itself) — the only
+  // thing that paints a tile is a tripped RAG threshold (CSS [data-rag] wash +
+  // border), so the alert state owns colour outright. Category is shown by a
+  // small swatch beside the label, tying the tile to its chart series.
+  ctr.innerHTML = items
+    .map((m) => {
+      const rag = getRagLevel(m.key, m.value, state.thresholds);
+      return `
+    <div class="sub-metric${rag ? ' sub-metric--alerted' : ''}"${rag ? ` data-rag="${rag}"` : ''}>
+      ${rag ? `<div class="sub-metric-rag-dot sub-metric-rag-dot--${rag}" aria-hidden="true"></div>` : ''}
+      <div class="metric-label"><span class="metric-swatch" style="background:${m.color}" aria-hidden="true"></span>${m.label}</div>
+      <div class="metric-num${m.value === 0 ? ' zero' : ''}">${m.value}</div>
+      ${m.compareValue != null ? renderDelta(m.value, m.compareValue) : ''}
+    </div>`;
+    })
+    .join('');
+}
+
+// Data-health notice — shown when windowTaskList detected the Medicus API
+// misbehaving (date filter ignored, or a truncated/paginated response). Wrong
+// numbers presented confidently are worse than no numbers: this tells the user
+// the counts are suspect and why, instead of letting a demand undercount pass
+// as a quiet Monday.
+// Dates the current view displays — used for the ledger-coverage warning.
+function viewDates() {
+  if (state.mode === 'compare') return [state.primaryDate, state.compareDate];
+  if (state.mode === 'range') {
+    const days = [];
+    let cur = state.rangeStart;
+    while (cur <= state.rangeEnd) {
+      days.push(cur);
+      cur = addDays(cur, 1);
+    }
+    return days;
+  }
+  return [state.primaryDate];
+}
+
+function renderDataHealth() {
+  const el = container?.querySelector('#subDataHealth');
+  if (!el) return;
+  const diags = [state.data.primary?._diag, state.data.compare?._diag].filter(Boolean);
+  const filterIgnored = diags.some((d) => d.filterIgnored);
+  const truncated = diags.some((d) => d.truncated);
+  // Ledger coverage: Medicus only reports STILL-OPEN tasks for any date, so a
+  // day the suite didn't watch live shows residual open tasks, not what was
+  // received. Say so rather than present an undercount as history.
+  const unwatched = state.ledger ? viewDates().filter((d) => !ledgerDayWatched(state.ledger, d)) : [];
+  if (!filterIgnored && !truncated && unwatched.length === 0) {
+    el.className = 'sub-data-health hidden';
+    el.textContent = '';
+    return;
+  }
+  const dropped = diags.reduce((a, d) => a + (d.dropped || 0), 0);
+  const parts = [];
+  if (filterIgnored) {
+    parts.push(
+      `Medicus ignored the date filter on this request (${dropped} task${dropped === 1 ? '' : 's'} from other days excluded). ` +
+        `Counts show only tasks the API still returns for the selected period and are likely an UNDERCOUNT of work received — ` +
+        `completed items may be missing. The Medicus task-list API may have changed.`
+    );
+  }
+  if (truncated) {
+    parts.push('Medicus sent a partial page of tasks (server reports more than it returned) — counts may be low.');
+  }
+  if (unwatched.length > 0) {
+    const n = unwatched.length;
+    parts.push(
+      `${n} day${n === 1 ? '' : 's'} in this view ${n === 1 ? 'was' : 'were'} not watched live by the suite — ` +
+        `Medicus only reports still-open tasks for past dates, so ${n === 1 ? 'it shows' : 'they show'} what remains open, ` +
+        `not true received volume. Received counts build up from the day the suite starts watching.`
+    );
+  }
+  el.className = 'sub-data-health';
+  el.innerHTML =
+    `<svg class="sub-alert-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>` +
+    `<span>${filterIgnored || truncated ? 'Counts unreliable — ' : ''}${parts.join(' ')}</span>`;
+}
+
+function renderAlertStrip() {
+  const strip = container?.querySelector('#subAlertStrip');
+  if (!strip) return;
+  const redItems = [];
+  for (const tt of TASK_TYPES) {
+    const total = _lastMetricItems?.find((m) => m.key === tt.key)?.value ?? 0;
+    if (getRagLevel(tt.key, total, state.thresholds) === 'red') {
+      const t = state.thresholds[tt.key];
+      redItems.push(`${tt.label}: ${total} (red ≥ ${t.red})`);
+    }
+  }
+  if (redItems.length === 0) {
+    strip.className = 'sub-alert-strip hidden';
+    strip.textContent = '';
+    return;
+  }
+  strip.className = 'sub-alert-strip sub-alert-strip--red';
+  strip.innerHTML =
+    `<svg class="sub-alert-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>` +
+    `<span>${redItems.join(' · ')}</span>`;
+}
+
+function renderDelta(a, b) {
+  const diff = a - b;
+  const pct = b === 0 ? null : Math.round((diff / b) * 100);
+  let cls = 'flat',
+    arrow = '→';
+  if (diff > 0) {
+    cls = 'up';
+    arrow = '↑';
+  } else if (diff < 0) {
+    cls = 'dn';
+    arrow = '↓';
+  }
+  // Direction is carried by the arrow glyph (decorative for AT); colour stays
+  // neutral — for an inbound-work count "up" is neither clinically good nor bad,
+  // so spending the red/green status hues here would mislead and dilute them.
+  const text =
+    b === 0 ? `${a > 0 ? `+${a} vs 0` : 'no change'}` : `${diff > 0 ? '+' : ''}${diff} (${pct > 0 ? '+' : ''}${pct}%)`;
+  return `<div class="metric-delta ${cls}"><span class="metric-delta-arrow" aria-hidden="true">${arrow}</span>${text}</div>`;
+}
+
+function renderLegend(elId, items, { toggleable = false, extraNote = null } = {}) {
+  const el = container?.querySelector(`#${elId}`);
+  if (!el) return;
+  el.innerHTML =
+    items
+      .map((it) => {
+        const hidden = state.hiddenSeries.has(it.key);
+        // Toggleable items are real checkboxes (keyboard-reachable, state in
+        // aria-checked); non-toggleable ones are inert text.
+        const attrs = toggleable
+          ? ` role="checkbox" tabindex="0" aria-checked="${!hidden}" aria-label="${it.label} series"`
+          : '';
+        return `
+    <div class="legend-item${hidden ? ' muted' : ''}${toggleable ? ' legend-item--toggle' : ''}" data-key="${it.key}"${attrs}>
+      <span class="legend-swatch" style="background:${it.color}" aria-hidden="true"></span>
+      <span class="legend-label">${it.label}</span>
+    </div>`;
+      })
+      .join('') + (extraNote ? `<span class="legend-note">${extraNote}</span>` : '');
+  if (toggleable) {
+    const toggle = (li) => {
+      const k = li.dataset.key;
+      if (state.hiddenSeries.has(k)) state.hiddenSeries.delete(k);
+      else state.hiddenSeries.add(k);
+      saveUiState('submissions', { mode: state.mode, hiddenSeries: [...state.hiddenSeries] });
+      renderAll();
+    };
+    el.querySelectorAll('.legend-item').forEach((li) => {
+      li.addEventListener('click', () => toggle(li));
+      li.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle(li);
+        }
+      });
+    });
+  }
+}
+
+function showSkeleton() {
+  const m = container?.querySelector('#subMetrics');
+  if (m)
+    m.innerHTML = TASK_TYPES.map(
+      (tt) =>
+        `<div class="sub-metric loading-skel"><div class="metric-label">${tt.shortLabel}</div><div class="metric-num zero">—</div></div>`
+    ).join('');
+  const c1 = container?.querySelector('#chart1');
+  if (c1) MWChart.showLoading(c1, 'Fetching submissions…');
+  const c2 = container?.querySelector('#chart2');
+  if (c2) MWChart.showLoading(c2, '');
+  const l1 = container?.querySelector('#legend1');
+  if (l1) l1.innerHTML = '';
+}
+
+function setBanner(msg, kind = 'error') {
+  const b = container?.querySelector('#subBanner');
+  if (!b) return;
+  if (!msg) {
+    b.classList.add('hidden');
+    return;
+  }
+  b.textContent = msg;
+  b.className = 'banner' + (kind === 'info' ? ' info' : '');
+}
+
+function appendSetupNowBtn() {
+  const b = container?.querySelector('#subBanner');
+  if (!b) return;
+  const btn = document.createElement('button');
+  btn.className = 'ghost-btn setup-now-btn';
+  btn.textContent = 'Set up now';
+  btn.style.marginLeft = '8px';
+  btn.addEventListener('click', () => {
+    if (document.getElementById('setupHost')) {
+      document.dispatchEvent(new CustomEvent('suite:open-setup'));
+    } else {
+      chrome.tabs.create({ url: chrome.runtime.getURL('options/options.html#sect-suite') });
+    }
+  });
+  b.appendChild(btn);
+}
+
+// ── MWChart — SVG chart renderer ──────────────────────────────────────────────
+
+// SVG chrome is token-driven so it adapts to light/dark: <text> fills and
+// gridline strokes carry inline `style` with CSS custom properties (these
+// resolve through SVG inline style in Chromium), not baked hexes. Axis labels
+// are the machine voice — mono. Data colours come from the series themselves.
+const AXIS_LABEL = 'style="fill:var(--text-4);font-family:var(--mono)" font-size="8"';
+const GRID_STROKE = 'style="stroke:var(--border)" stroke-width="1"';
+let _chartSeq = 0;
+
+function svgOpen(W, H, titleText) {
+  const id = `mwc-t${++_chartSeq}`;
+  return {
+    id,
+    open: `<svg width="100%" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-labelledby="${id}" xmlns="http://www.w3.org/2000/svg"><title id="${id}">${titleText}</title>`,
+  };
+}
+
+const MWChart = {
+  showLoading(el, msg) {
+    if (!el) return;
+    el.innerHTML = `<div class="chart-loading">${msg || 'Loading…'}</div>`;
+  },
+
+  empty(el, msg) {
+    if (!el) return;
+    el.innerHTML = `<div class="chart-empty">${msg || 'No submissions in this period'}</div>`;
+  },
+
+  line({ container: el, xLabels, series, title = 'Cumulative submissions by category' }) {
+    if (!el || !series.length) {
+      MWChart.empty(el);
+      return;
+    }
+    const allVals = series.flatMap((s) => s.values);
+    if (Math.max(0, ...allVals) === 0) {
+      MWChart.empty(el);
+      return;
+    }
+    const W = el.clientWidth || 300,
+      H = 120;
+    const pad = { t: 8, r: 8, b: 24, l: 28 };
+    const cW = W - pad.l - pad.r,
+      cH = H - pad.t - pad.b;
+    const maxVal = Math.max(1, ...allVals);
+    const N = xLabels.length;
+    const xStep = cW / Math.max(1, N - 1);
+    const labelStep = Math.ceil(N / 6);
+
+    const toX = (i) => pad.l + i * xStep;
+    const toY = (v) => pad.t + cH - (v / maxVal) * cH;
+
+    let paths = '';
+    series.forEach((s) => {
+      const pts = s.values.map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
+      paths += `<polyline points="${pts}" fill="none" style="stroke:${s.color}" stroke-width="${s.dashed ? 1.5 : 2}" stroke-dasharray="${s.dashed ? '4,3' : ''}" opacity="0.9"/>`;
+    });
+
+    let xTicks = '';
+    for (let i = 0; i < N; i += labelStep) {
+      xTicks += `<text x="${toX(i).toFixed(1)}" y="${H - 4}" text-anchor="middle" ${AXIS_LABEL}>${xLabels[i]}</text>`;
+    }
+
+    let yTicks = '';
+    const steps = 3;
+    for (let i = 0; i <= steps; i++) {
+      const v = Math.round((maxVal / steps) * i);
+      const y = toY(v).toFixed(1);
+      yTicks += `<line x1="${pad.l}" y1="${y}" x2="${pad.l + cW}" y2="${y}" ${GRID_STROKE}/>`;
+      yTicks += `<text x="${pad.l - 3}" y="${y}" text-anchor="end" dominant-baseline="middle" ${AXIS_LABEL}>${v}</text>`;
+    }
+
+    const { open } = svgOpen(W, H, title);
+    el.innerHTML = `${open}${yTicks}${paths}${xTicks}</svg>`;
+  },
+
+  bar({ container: el, bars, title = 'Total submissions by category' }) {
+    if (!el || !bars.length) {
+      MWChart.empty(el);
+      return;
+    }
+    if (Math.max(0, ...bars.map((b) => Math.max(b.value, b.compareValue ?? 0))) === 0) {
+      MWChart.empty(el);
+      return;
+    }
+    const W = el.clientWidth || 300,
+      H = 80;
+    const pad = { t: 4, r: 8, b: 20, l: 8 };
+    const cW = W - pad.l - pad.r;
+    const hasCompare = bars.some((b) => b.compareValue != null);
+    const maxVal = Math.max(1, ...bars.map((b) => Math.max(b.value, b.compareValue ?? 0)));
+    const groupW = cW / bars.length;
+    const barW = hasCompare ? groupW * 0.35 : groupW * 0.6;
+    const gap = hasCompare ? 2 : 0;
+    const cH = H - pad.t - pad.b;
+
+    let rects = '';
+    bars.forEach((b, i) => {
+      const gx = pad.l + i * groupW + (groupW - (hasCompare ? barW * 2 + gap : barW)) / 2;
+      const h1 = (b.value / maxVal) * cH;
+      rects += `<rect x="${gx.toFixed(1)}" y="${(pad.t + cH - h1).toFixed(1)}" width="${barW.toFixed(1)}" height="${h1.toFixed(1)}" style="fill:${b.color}" opacity="0.9" rx="2"/>`;
+      if (hasCompare && b.compareValue != null) {
+        const h2 = (b.compareValue / maxVal) * cH;
+        rects += `<rect x="${(gx + barW + gap).toFixed(1)}" y="${(pad.t + cH - h2).toFixed(1)}" width="${barW.toFixed(1)}" height="${h2.toFixed(1)}" style="fill:${b.color}" opacity="0.4" rx="2"/>`;
+      }
+      rects += `<text x="${(gx + (hasCompare ? barW + gap / 2 : barW / 2)).toFixed(1)}" y="${H - 4}" text-anchor="middle" ${AXIS_LABEL}>${String(b.label).toUpperCase()}</text>`;
+    });
+
+    const { open } = svgOpen(W, H, title);
+    el.innerHTML = `${open}${rects}</svg>`;
+  },
+
+  stacked({ container: el, xLabels, stacks, title = 'Daily submissions by category' }) {
+    if (!el || !stacks.length) {
+      MWChart.empty(el);
+      return;
+    }
+    const totals = stacks.map((s) => s.segments.reduce((a, seg) => a + seg.value, 0));
+    if (Math.max(0, ...totals) === 0) {
+      MWChart.empty(el);
+      return;
+    }
+    const W = el.clientWidth || 300,
+      H = 110;
+    const pad = { t: 4, r: 8, b: 20, l: 28 };
+    const cW = W - pad.l - pad.r,
+      cH = H - pad.t - pad.b;
+    const maxVal = Math.max(1, ...totals);
+    const barW = Math.max(4, (cW / stacks.length) * 0.7);
+    const labelStep = Math.ceil(stacks.length / 6);
+
+    let rects = '';
+    stacks.forEach((stack, i) => {
+      const x = pad.l + (i / stacks.length) * cW + (cW / stacks.length - barW) / 2;
+      let yBase = pad.t + cH;
+      stack.segments.forEach((seg) => {
+        const h = (seg.value / maxVal) * cH;
+        yBase -= h;
+        if (h > 0)
+          rects += `<rect x="${x.toFixed(1)}" y="${yBase.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" style="fill:${seg.color}" opacity="0.9"/>`;
+      });
+      if (i % labelStep === 0) {
+        rects += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 4}" text-anchor="middle" ${AXIS_LABEL}>${xLabels[i]}</text>`;
+      }
+    });
+
+    let yTicks = '';
+    const steps = 3;
+    for (let i = 0; i <= steps; i++) {
+      const v = Math.round((maxVal / steps) * i);
+      const y = (pad.t + cH - (v / maxVal) * cH).toFixed(1);
+      yTicks += `<line x1="${pad.l}" y1="${y}" x2="${pad.l + cW}" y2="${y}" ${GRID_STROKE}/>`;
+      yTicks += `<text x="${pad.l - 3}" y="${y}" text-anchor="end" dominant-baseline="middle" ${AXIS_LABEL}>${v}</text>`;
+    }
+
+    const { open } = svgOpen(W, H, title);
+    el.innerHTML = `${open}${yTicks}${rects}</svg>`;
+  },
+};
+
+// ── Date utilities ────────────────────────────────────────────────────────────
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
+function addDays(iso, n) {
+  const d = new Date(iso + 'T12:00:00');
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+// Calendar-month range for the Range tab's "This month"/"Last month" presets (FEATURE 1a).
+// Mirrors shared/activity-api.js's preset() logic exactly, so "This month" here and
+// "This month" in Activity always resolve to the same [start,end] for the same practice.
+function monthRangePreset(name) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const start = new Date(now);
+  const end = new Date(now);
+  if (name === 'thisMonth') {
+    start.setDate(1);
+  } else if (name === 'lastMonth') {
+    // Same lastMonth overflow trap as shared/activity-api.js preset() —
+    // setDate(1) BEFORE setMonth(-1) or 31 Mar/May/Jul/Oct/Dec invert.
+    start.setDate(1);
+    start.setMonth(start.getMonth() - 1);
+    end.setDate(0); // last day of previous month
+  } else {
+    return null;
+  }
+  return [isoFromDate(start), isoFromDate(end)];
+}
+
+function isoFromDate(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// The Compare tab's "This month vs last month" preset (FEATURE 1a): month-to-date
+// (1st of this month → today) vs the SAME SPAN of the previous month (1st → same
+// day-of-month, clamped to that month's length) — a partial current month is deliberately
+// never compared against a full prior month, which would overstate the delta.
+function monthToDateVsLastMonth(todayIso = todayISO()) {
+  const d = new Date(todayIso + 'T12:00:00');
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const day = d.getDate();
+  const startA = `${y}-${pad(m + 1)}-01`;
+  const endA = todayIso;
+  const prevMonthDate = new Date(y, m - 1, 1); // JS Date rolls January back into prior December
+  const py = prevMonthDate.getFullYear();
+  const pm = prevMonthDate.getMonth();
+  const lastDayPrevMonth = new Date(py, pm + 1, 0).getDate();
+  const clampedDay = Math.min(day, lastDayPrevMonth);
+  const startB = `${py}-${pad(pm + 1)}-01`;
+  const endB = `${py}-${pad(pm + 1)}-${pad(clampedDay)}`;
+  return { startA, endA, startB, endB };
+}
+
+function daysBetween(a, b) {
+  if (!a || !b) return 0;
+  const d = Math.round((new Date(b + 'T12:00:00') - new Date(a + 'T12:00:00')) / 864e5);
+  return Number.isFinite(d) ? d : 0;
+}
+function formatDate(iso) {
+  return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+function formatDateShort(iso) {
+  return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' });
+}
+function hourLabels() {
+  return Array.from({ length: 24 }, (_, h) => `${pad(h)}`);
+}
+function parseTime(str) {
+  if (!str) return null;
+  // ISO 8601: "2024-01-15T09:30:00Z" or "...+00:00" — pull hour after T
+  const iso = str.match(/T(\d{2}):\d{2}/);
+  if (iso) return parseInt(iso[1], 10);
+  // Legacy "DD Mon YYYY HH:MM"
+  const m = str.match(/(\d{2}):(\d{2})(?!.*\d)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+function parseDate(str) {
+  if (!str) return null;
+  // ISO 8601: "2024-01-15..." — first 10 chars are YYYY-MM-DD
+  const iso = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  // Legacy "DD Mon YYYY"
+  const months = {
+    Jan: '01',
+    Feb: '02',
+    Mar: '03',
+    Apr: '04',
+    May: '05',
+    Jun: '06',
+    Jul: '07',
+    Aug: '08',
+    Sep: '09',
+    Oct: '10',
+    Nov: '11',
+    Dec: '12',
+  };
+  const m = str.match(/^(\d{2})\s(\w{3})\s(\d{4})/);
+  return m ? `${m[3]}-${months[m[2]]}-${m[1]}` : null;
+}

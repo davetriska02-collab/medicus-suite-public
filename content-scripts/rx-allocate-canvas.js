@@ -1,0 +1,3821 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved.
+// Medicus Suite — prescription-request canvas (routine and non-routine)
+//
+// Sibling of the lab / workflow canvases. Same drag / stage /
+// confirm / bulk-reassign pattern on the routine and non-routine
+// prescription-request task-lists. The large left box is UNALLOCATED
+// requests, grouped by registered GP when that is on the row. Named GP
+// is a grouping caption, never auto-placement. Send-to-usual-GP is a
+// user-initiated stage of unallocated rows only. Split equally / Top up /
+// Distribute equally stage locally — they do not write. Does not issue,
+// sign, or file a prescription.
+//
+// Writing uses LabAllocateCore.createClient (W23). This file never POSTs.
+// Confirm lists patient → destination. UI copy never claims the write
+// finished, and never claims a requester.
+'use strict';
+
+(function () {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  if (window.__msRxAllocateCanvas) return;
+  window.__msRxAllocateCanvas = true;
+
+  var C = window.RxAllocateCore;
+  if (!C) return;
+
+  var OVERLAY_ID = 'ms-rxac-overlay';
+  var LAUNCH_ID = 'ms-rxac-launch';
+  var LAUNCH_WRAP_ID = 'ms-rxac-launch-wrap';
+  var PACK_KEY = (window.PracticePacks && window.PracticePacks.KEYS.allocateCanvases) || 'suite.ui.allocateCanvases';
+  var _packOn = !window.PracticePacks || window.PracticePacks.peek(PACK_KEY);
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  var _route = null;
+  var _rows = [];
+  var _draft = C.emptyDraft();
+  var _error = null;
+  var _loading = false;
+  var _open = false;
+  var _selected = {};
+  var _lastSelectId = '';
+  var _lastGroupKey = '';
+  var _dragIds = null;
+  var _dragOriginKind = '';
+  var _ignoreClickAfterDrag = false;
+  var _copyNote = '';
+  var _overviewProgress = '';
+  var _rota = { staff: [], leave: [], loaded: false };
+  var _book = null;
+  var _absences = [];
+  var _pendingAbsence = null;
+  var _confirmClose = false;
+  var _confirmWrite = null;
+  var _writing = false;
+  var _boardGen = 0;
+  var _taskList = undefined;
+  var _staffDir = C.harvestStaffDirectory([], null);
+  var _teamDir = C.harvestTeamDirectory([], null);
+  var _dragGhost = null;
+  var _expandedChip = '';
+  var _openDests = {};
+  var _collapsed = {};
+  var _workDate = '';
+  var _splitDefaulted = false;
+  var _destKind = 'in-today';
+  var _destGroupId = '';
+  var _customMembers = [];
+  var _presets = [];
+  var _agConfig = { lastUsedBySurface: {} };
+  var _peopleSelected = {};
+  var _lastPeopleKey = '';
+  var _agsAllOpen = false;
+  var _agLoaded = false;
+  var _namingGroup = false;
+  var _scheduleAutoPick = false;
+  var _sendToUsualGpNotIn = false;
+  var _lastUsualGpPlan = null;
+  var _lastSkipped = [];
+  var _peopleDragKeys = null;
+  var _marquee = null;
+  var _bridgeCount = 0;
+  var _visiblePileIds = {};
+  var _bridgeOn = false;
+  // task id -> { repeat, acute, repeatDispensing, variableRepeat, resolvedPatientId }
+  // — from each row's own overview (data.prescriptionRequestItemsByType).
+  var _rxItemCounts = {};
+  // task id -> boolean — PATIENT-level overdue medication review, from the
+  // same overview fetch as _rxItemCounts (zero extra cost). See
+  // RxAllocateCore.overdueMedicationReviewFromPayload's own comment for the
+  // field and the known gap.
+  var _rxOverdueMedReview = {};
+  // patientId -> { repeatTotal, repeatDispensingTotal, variableRepeatTotal,
+  // overdueCount, overdueTotal } — from medication-regimen, one fetch per
+  // unique patient, lazy/on-screen-first (see loadRxMonitoringTotals).
+  var _rxRegimenTotals = {};
+  var _rxMonitoringRenderPending = false;
+
+  function fieldIsOpen(key) {
+    return _expandedChip === key || !!_openDests[key];
+  }
+
+  function toggleFieldOpen(key) {
+    if (!key) return;
+    if (_openDests[key] || _expandedChip === key) {
+      delete _openDests[key];
+      _expandedChip = _expandedChip === key ? '' : _expandedChip;
+      return;
+    }
+    _openDests[key] = true;
+    _expandedChip = key;
+  }
+
+  function openDestsFromPlan(plan) {
+    _openDests = {};
+    (plan && plan.shares ? plan.shares : []).forEach(function (s) {
+      if (s && s.key && s.count) _openDests[s.key] = true;
+    });
+  }
+
+  function calendarToday() {
+    return C.todayISO();
+  }
+
+  function workDate() {
+    return C.coerceWorkDate(_workDate, calendarToday());
+  }
+
+  function dayPhrase() {
+    return C.workDayPhrase(workDate(), calendarToday());
+  }
+
+  function workingFlag() {
+    var Strip = destStripApi();
+    if (Strip && typeof Strip.workingFlagLabel === 'function') {
+      return Strip.workingFlagLabel({ workDateISO: workDate(), calendarTodayISO: calendarToday() });
+    }
+    return 'Working today';
+  }
+
+  function destGroupName() {
+    var Core = groupsCore();
+    if (_destKind !== 'group' || !Core) return '';
+    var preset = Core.findPreset(_presets, _destGroupId);
+    return (preset && preset.name) || '';
+  }
+
+  function destFlag() {
+    var Strip = destStripApi();
+    if (Strip && typeof Strip.destFlagLabel === 'function') {
+      return Strip.destFlagLabel({
+        destKind: _destKind || 'in-today',
+        destGroupName: destGroupName(),
+        workDateISO: workDate(),
+        calendarTodayISO: calendarToday(),
+      });
+    }
+    var name = destGroupName();
+    if (name) return name;
+    return workingFlag();
+  }
+
+  function destFlagHtml(col, abs) {
+    var away = abs.state === 'away' || abs.state === 'away-pending';
+    var inToday = abs.state === 'present' && abs.reason === 'in-today';
+    if (away) return '<span class="ms-lac-chip-flag">AWAY</span>';
+    if (col.kind === 'team') return '<span class="ms-lac-chip-flag ms-lac-chip-flag-team">Team</span>';
+    if (_destKind === 'group') {
+      var group = destFlag();
+      return group ? '<span class="ms-lac-chip-flag ms-lac-chip-flag-in">' + esc(group) + '</span>' : '';
+    }
+    if (inToday) {
+      return '<span class="ms-lac-chip-flag ms-lac-chip-flag-in">' + esc(workingFlag()) + '</span>';
+    }
+    return '';
+  }
+
+  function inTodayPeople() {
+    return C.pinDestStaffIds(
+      C.workingTodayDoctors({
+        book: _book,
+        absences: _absences,
+        staffList: _rota.staff,
+        leaveList: _rota.leave,
+        dateISO: workDate(),
+      }),
+      _staffDir
+    );
+  }
+
+  function scheduleHintText() {
+    if (!_scheduleAutoPick || _destKind !== 'group') return '';
+    var Core = groupsCore();
+    if (!Core || typeof Core.scheduleAutoPickPhrase !== 'function') return '';
+    var preset = Core.findPreset(_presets, _destGroupId);
+    if (!preset) return '';
+    var Strip = destStripApi();
+    var todayLabel =
+      Strip && typeof Strip.workingTodayChipLabel === 'function'
+        ? Strip.workingTodayChipLabel({
+            inTodayCount: inTodayPeople().length,
+            workDateISO: workDate(),
+            calendarTodayISO: calendarToday(),
+          })
+        : 'Working today';
+    return Core.scheduleAutoPickPhrase(preset, new Date(), todayLabel);
+  }
+
+  function announce(text) {
+    setTimeout(function () {
+      var live = document.querySelector('#' + OVERLAY_ID + ' .ms-lac-live');
+      if (live) live.textContent = text || '';
+    }, 0);
+  }
+
+  function scrollNearEdge(e) {
+    if (!_dragIds || !_open || !e) return;
+    var nodes = [
+      document.querySelector('#' + OVERLAY_ID + ' .ms-lac-rail'),
+      document.querySelector('#' + OVERLAY_ID + ' .ms-lac-pool'),
+    ];
+    for (var i = 0; i < nodes.length; i++) {
+      var scroller = nodes[i];
+      if (!scroller) continue;
+      var rect = scroller.getBoundingClientRect();
+      if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
+        continue;
+      }
+      var edge = 56;
+      var step = 24;
+      if (e.clientY < rect.top + edge) scroller.scrollTop -= step;
+      else if (e.clientY > rect.bottom - edge) scroller.scrollTop += step;
+    }
+  }
+
+  function currentStaffId() {
+    try {
+      var raw = document.documentElement.getAttribute('data-ch-staff');
+      if (!raw) return '';
+      var bar = raw.indexOf('|');
+      var id = (bar >= 0 ? raw.slice(0, bar) : raw).trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function onTaskListData(e) {
+    var route = currentRoute() || _route;
+    if (!route || !C.inboxCountFromTaskListBridge) return;
+    var detail = e && e.detail;
+    var n = C.inboxCountFromTaskListBridge(detail, route.slug);
+    if (!n) return;
+    _bridgeCount = n;
+    _visiblePileIds = C.visiblePileIdsFromTaskListBridge ? C.visiblePileIdsFromTaskListBridge(detail, route.slug) : {};
+  }
+
+  function inboxFetchOpts(extra) {
+    return Object.assign(
+      {
+        staffId: currentStaffId(),
+      },
+      extra || {}
+    );
+  }
+
+  function mergeOptsFor(stampSearch) {
+    var opts = {};
+    if (!C.inboxAssigneeId(stampSearch) && _visiblePileIds && Object.keys(_visiblePileIds).length) {
+      opts.visibleIds = _visiblePileIds;
+    }
+    return opts;
+  }
+
+  function pileReason() {
+    return C.rxEmptyPileReason
+      ? C.rxEmptyPileReason({
+          rowCount: _rows.length,
+          unallocatedCount: visibleUnallocatedCount(),
+          destCount: splitDestinations().length,
+          bridgeCount: _bridgeCount,
+          dayPhrase: dayPhrase(),
+        })
+      : '';
+  }
+
+  function currentRoute() {
+    return C.parseRxQueueRoute(location.pathname, location.search);
+  }
+
+  function client() {
+    if (!_route) throw new Error('rx-allocate: no non-routine prescription-queue route');
+    return C.createClient(_route.apiBase);
+  }
+
+  function selectedIds() {
+    return C.selectedIdList(_selected);
+  }
+
+  function parseIdList(value) {
+    return String(value || '')
+      .split(',')
+      .filter(Boolean);
+  }
+
+  function queueTitle() {
+    return C.poolTitle({ routine: _route && _route.routine });
+  }
+
+  function currentWorkspace() {
+    return C.buildWorkspace(_rows, _draft, {
+      teams: (_teamDir && _teamDir.list) || [],
+      kind: _route && _route.kind,
+      routine: _route && _route.routine,
+    });
+  }
+
+  function absorbDirectories(rows, payload) {
+    _staffDir = C.mergeStaffDirectory(_staffDir, C.harvestStaffDirectory(rows, payload));
+    _teamDir = C.mergeTeamDirectory(_teamDir, C.harvestTeamDirectory(rows, payload));
+  }
+
+  function visibleTileOrder() {
+    var board = currentWorkspace();
+    var ids = [];
+    ((board.pool && board.pool.groups) || []).forEach(function (g) {
+      (g.tileIds || []).forEach(function (id) {
+        ids.push(id);
+      });
+    });
+    (board.clinicians || []).concat(board.teams || []).forEach(function (col) {
+      (col.tiles || []).forEach(function (t) {
+        if (t && t.id) ids.push(t.id);
+      });
+    });
+    return ids;
+  }
+
+  function applyGroupSelection(ids, key, additive, shiftKey) {
+    if (shiftKey && _lastGroupKey) {
+      var board = currentWorkspace();
+      var rangeIds = C.idsInGroupRange(board.pool.groups, _lastGroupKey, key);
+      _selected = additive ? C.addToSelection(_selected, rangeIds) : C.replaceSelection(rangeIds);
+    } else {
+      _selected = C.toggleGroupInSelection(_selected, ids, additive);
+    }
+    _lastGroupKey = key || _lastGroupKey;
+    _lastSelectId = ids[0] || _lastSelectId;
+    announce('Selected ' + selectedIds().length + ' — click a clinician field to stage them, or drag');
+    render();
+  }
+
+  function setProgress(text) {
+    _overviewProgress = text || '';
+    var node = document.getElementById('ms-lac-progress');
+    if (node) node.textContent = _overviewProgress;
+  }
+
+  // ---- Shared fetch safety (Pass A + Pass B below) ----
+  // Neither shared/lab-allocate-core.js's getJson/fetchOverview nor
+  // engine/api-client.js's SentinelApiClient carries a hang-safe timeout
+  // for these two passes' own concurrency — wrap every fetch so a stalled
+  // request can't stall a whole worker slot forever.
+  var RX_FETCH_CONCURRENCY = 5;
+  var RX_FETCH_TIMEOUT_MS = 8000;
+  var RX_CIRCUIT_BREAKER_MAX = 10;
+
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () {
+        reject(new Error('timeout after ' + ms + 'ms'));
+      }, ms);
+      promise.then(
+        function (v) {
+          clearTimeout(t);
+          resolve(v);
+        },
+        function (e) {
+          clearTimeout(t);
+          reject(e);
+        }
+      );
+    });
+  }
+
+  // Stops the whole pass after too many fetches in a row fail — protects
+  // against hammering a genuinely down endpoint rather than quietly
+  // retrying 140+ more times.
+  function makeCircuitBreaker(maxConsecutiveFails) {
+    var consecutiveFails = 0;
+    var tripped = false;
+    return {
+      isTripped: function () {
+        return tripped;
+      },
+      recordSuccess: function () {
+        consecutiveFails = 0;
+      },
+      recordFailure: function () {
+        consecutiveFails++;
+        if (consecutiveFails >= maxConsecutiveFails) tripped = true;
+      },
+    };
+  }
+
+  function runWorkerPool(items, concurrency, worker) {
+    var idx = 0;
+    function next() {
+      if (idx >= items.length) return Promise.resolve();
+      var i = idx++;
+      return Promise.resolve(worker(items[i], i)).then(next);
+    }
+    var lanes = [];
+    for (var l = 0; l < Math.min(concurrency, items.length); l++) lanes.push(next());
+    return Promise.all(lanes);
+  }
+
+  // Lab enrichRequesters (requestedBy walker) is deliberately skipped —
+  // document/workflow overviews do not carry who-ordered. Staff UUIDs still
+  // come from harvestStaffFromOverviews + the create-task form.
+  //
+  // Pass A (item counts + staff harvest): every row's own overview, fetched
+  // CONCURRENCY=5 (was a sequential for-loop capped at 12 — that cap only
+  // ever existed to bound the staff-harvest side effect's own runtime; a
+  // live 148-row timing test (2026-09-10) proved the full pool fetches in
+  // ~10s at this concurrency with zero errors, so it now runs for every
+  // row and doubles as the source for _rxItemCounts). Cancellation uses the
+  // same _boardGen the rest of loadBoard already checks — a closed/reopened
+  // overlay abandons this pass rather than writing stale results into a
+  // fresh board.
+  async function harvestStaffFromOverviews(rows) {
+    var gen = _boardGen;
+    var withUrl = (rows || []).filter(function (r) {
+      return r && r.overviewURL;
+    });
+    var patientId = '';
+    (rows || []).forEach(function (r) {
+      if (!patientId && r && r.patientId) patientId = r.patientId;
+    });
+    var breaker = makeCircuitBreaker(RX_CIRCUIT_BREAKER_MAX);
+    await runWorkerPool(withUrl, RX_FETCH_CONCURRENCY, async function (row) {
+      if (breaker.isTripped() || gen !== _boardGen) return;
+      try {
+        var payload = await withTimeout(client().fetchOverview(row.overviewURL), RX_FETCH_TIMEOUT_MS);
+        if (gen !== _boardGen) return;
+        breaker.recordSuccess();
+        absorbDirectories(null, payload);
+        var resolvedPid = row.patientId || C.pickPatientIdFromPayload(payload);
+        if (!patientId && resolvedPid) patientId = resolvedPid;
+        _rxItemCounts[row.id] = C.itemCountsFromOverviewPayload(payload, resolvedPid);
+        _rxOverdueMedReview[row.id] = C.overdueMedicationReviewFromPayload(payload);
+      } catch (_) {
+        breaker.recordFailure();
+        /* try the next overview */
+      }
+    });
+    if (gen !== _boardGen) return;
+    if (!patientId) return;
+    try {
+      var form = await client().fetchAssigneeStaff(patientId);
+      if (gen !== _boardGen) return;
+      absorbDirectories(null, form);
+    } catch (_) {
+      /* create-task form is a bonus directory, not required to stage */
+    }
+  }
+
+  // Pass B (medication-regimen totals + overdue): lazy, kicked off once
+  // Pass A has resolved every row's item counts + patientId, one fetch per
+  // UNIQUE patient (dedup — a live test showed ~1:1 task:patient, but never
+  // assume that), on-screen tiles first so the visible part of the pool
+  // fills in before the off-screen rest. Not awaited by loadBoard() — this
+  // is the slow pass (~70s for a 148-row inbox, live-timed 2026-09-10) and
+  // must not block the board becoming usable.
+  function onScreenTaskIds() {
+    var container = document.getElementById(OVERLAY_ID);
+    var onScreen = {};
+    if (!container) return onScreen;
+    var contRect = container.getBoundingClientRect();
+    container.querySelectorAll('.ms-lac-tile[data-task-id]').forEach(function (el) {
+      var r = el.getBoundingClientRect();
+      if (r.bottom > contRect.top && r.top < contRect.bottom) {
+        onScreen[el.getAttribute('data-task-id')] = true;
+      }
+    });
+    return onScreen;
+  }
+
+  function scheduleMonitoringRender() {
+    if (_rxMonitoringRenderPending) return;
+    _rxMonitoringRenderPending = true;
+    var raf =
+      typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : function (fn) {
+            setTimeout(fn, 0);
+          };
+    raf(function () {
+      _rxMonitoringRenderPending = false;
+      render();
+    });
+  }
+
+  async function loadRxMonitoringTotals(gen) {
+    var Api = window.SentinelApiClient;
+    if (!Api || typeof Api.fetchMedicationRegimen !== 'function') return;
+    var byPatient = {}; // patientId -> [taskId, ...]
+    Object.keys(_rxItemCounts).forEach(function (taskId) {
+      var pid = _rxItemCounts[taskId].resolvedPatientId;
+      if (!pid) return;
+      if (!byPatient[pid]) byPatient[pid] = [];
+      byPatient[pid].push(taskId);
+    });
+    var patientIds = Object.keys(byPatient).filter(function (pid) {
+      return !_rxRegimenTotals[pid];
+    });
+    if (!patientIds.length) return;
+    var onScreen = onScreenTaskIds();
+    patientIds.sort(function (a, b) {
+      var aOn = byPatient[a].some(function (t) {
+        return onScreen[t];
+      });
+      var bOn = byPatient[b].some(function (t) {
+        return onScreen[t];
+      });
+      if (aOn === bOn) return 0;
+      return aOn ? -1 : 1;
+    });
+    var apiBase = _route.apiBase;
+    var breaker = makeCircuitBreaker(RX_CIRCUIT_BREAKER_MAX);
+    await runWorkerPool(patientIds, RX_FETCH_CONCURRENCY, async function (pid) {
+      if (breaker.isTripped() || gen !== _boardGen) return;
+      try {
+        var regimen = await withTimeout(Api.fetchMedicationRegimen(apiBase, pid), RX_FETCH_TIMEOUT_MS);
+        breaker.recordSuccess();
+        if (gen !== _boardGen) return; // a newer board load has since started — discard
+        _rxRegimenTotals[pid] = C.regimenTotalsFromPayload(regimen);
+        scheduleMonitoringRender();
+      } catch (_) {
+        breaker.recordFailure();
+      }
+    });
+  }
+
+  function harvestStaffFromBook(book) {
+    if (!book || !book.source) return;
+    absorbDirectories(null, book.source);
+  }
+
+  async function loadBoard(opts) {
+    opts = opts || {};
+    var gen = _boardGen;
+    var keepDraft = opts.skipSplit ? _draft || C.emptyDraft() : null;
+    _rxItemCounts = {};
+    _rxRegimenTotals = {};
+    _rxOverdueMedReview = {};
+    _loading = true;
+    _error = null;
+    render();
+    try {
+      await loadAgState({ applyDefault: !_agLoaded });
+      if (gen !== _boardGen) return;
+      _agLoaded = true;
+      var presenceP = Promise.all([loadRotaAbsences(), loadMedicusPresence()]);
+      var inboxP = C.fetchRxTaskList(_route.apiBase, _route.slug, _route.search, inboxFetchOpts());
+      var sittingP = C.fetchRxTaskList(_route.apiBase, _route.slug, '', inboxFetchOpts({ bareOnly: true })).catch(
+        function () {
+          return { rows: [] };
+        }
+      );
+      var out = await inboxP;
+      var sitting = await sittingP;
+      if (gen !== _boardGen) return;
+      var stampSearch = out && out.search != null ? out.search : '';
+      _rows = C.mergeInboxAndSitting(
+        out.rows || [],
+        (sitting && sitting.rows) || [],
+        stampSearch,
+        mergeOptsFor(stampSearch)
+      );
+      _route.slug = out.slug || _route.slug;
+      _route.search = stampSearch;
+      _taskList = out.taskList;
+      _staffDir = C.harvestStaffDirectory(_rows, out.body);
+      _teamDir = C.harvestTeamDirectory(_rows, out.body);
+      render();
+      await presenceP;
+      if (gen !== _boardGen) return;
+      harvestStaffFromBook(_book);
+      await harvestStaffFromOverviews(_rows);
+      if (gen !== _boardGen) return;
+      persistStaffCache();
+      // Fire-and-forget: the slow (~70s/148 rows) regimen pass must not
+      // block the board from becoming usable. It self-guards against a
+      // later loadBoard()/closeOverlay() call via the _boardGen check.
+      loadRxMonitoringTotals(gen);
+      _draft = C.ensureWorkingTodayColumns(keepDraft || C.emptyDraft(), splitDestinations());
+      if (!opts.skipSplit) _splitDefaulted = false;
+    } catch (err) {
+      if (gen !== _boardGen) return;
+      _error = err && err.message ? err.message : 'Could not read this prescription queue.';
+      _rows = [];
+    } finally {
+      if (gen === _boardGen) {
+        _loading = false;
+        _overviewProgress = '';
+        render();
+      }
+    }
+  }
+
+  async function loadRotaAbsences() {
+    _rota = { staff: [], leave: [], loaded: false };
+    if (!chrome.storage || !chrome.storage.local) return;
+    try {
+      var got = await chrome.storage.local.get(['rota.staff', 'rota.leave']);
+      _rota = {
+        staff: Array.isArray(got['rota.staff']) ? got['rota.staff'] : [],
+        leave: Array.isArray(got['rota.leave']) ? got['rota.leave'] : [],
+        loaded: true,
+      };
+    } catch (_) {
+      _rota = { staff: [], leave: [], loaded: false };
+    }
+  }
+
+  async function loadMedicusPresence() {
+    _book = null;
+    _absences = [];
+    if (!_route) return;
+    var cli = client();
+    var date = workDate();
+    try {
+      _book = await cli.fetchTodayBook(date);
+    } catch (_) {
+      _book = null;
+    }
+    try {
+      _absences = await cli.fetchStaffScheduleAbsences();
+    } catch (_) {
+      _absences = [];
+    }
+  }
+
+  async function reloadWorkingDay() {
+    if (!_open || !_route) return;
+    _overviewProgress = 'Reading the appointment book for ' + dayPhrase() + '…';
+    render();
+    try {
+      await loadMedicusPresence();
+      harvestStaffFromBook(_book);
+      persistStaffCache();
+      _draft = C.replaceDestColumns(_draft || C.emptyDraft(), destSetPeople());
+    } catch (_) {
+      _book = null;
+    }
+    _overviewProgress = '';
+    announce(
+      _splitDefaulted
+        ? 'Even split staged for doctors working ' + dayPhrase() + '. Drag a request to move it.'
+        : 'Even split is for doctors working ' + dayPhrase() + '.'
+    );
+    render();
+  }
+
+  function setWorkDate(iso) {
+    var next = C.coerceWorkDate(iso, calendarToday());
+    if (next === workDate()) return;
+    _workDate = next;
+    reloadWorkingDay();
+  }
+
+  function presenceForClinician(col) {
+    if (!col || col.kind !== 'clinician') return { state: 'n/a', reason: 'not-a-person', label: '' };
+    // Display casing — matching is case-insensitive, labels are user-facing.
+    return C.presenceForName({
+      name: C.displayClinicianName(col.title),
+      dateISO: workDate(),
+      book: _book,
+      absences: _absences,
+      staffList: _rota.staff,
+      leaveList: _rota.leave,
+    });
+  }
+
+  function presenceRank(col) {
+    var p = presenceForClinician(col);
+    if (p.state === 'present' && p.reason === 'in-today') return 0;
+    if (col.count > 0 || col.stagedCount > 0) return 1;
+    if (p.state === 'away' || p.state === 'away-pending') return 3;
+    return 2;
+  }
+
+  function sortClinicianFields(cols) {
+    return (cols || []).slice().sort(function (a, b) {
+      var ra = presenceRank(a);
+      var rb = presenceRank(b);
+      if (ra !== rb) return ra - rb;
+      var na = C.displayClinicianName(a.title).toLowerCase();
+      var nb = C.displayClinicianName(b.title).toLowerCase();
+      if (na < nb) return -1;
+      if (na > nb) return 1;
+      return 0;
+    });
+  }
+
+  function rxCountsAndTotalsFor(taskId) {
+    var counts = _rxItemCounts[taskId];
+    if (!counts) return { counts: null, totals: null };
+    var totals = counts.resolvedPatientId ? _rxRegimenTotals[counts.resolvedPatientId] : null;
+    return { counts: counts, totals: totals };
+  }
+
+  // 1-5, green (least complex) to amber (most complex) — driven purely by
+  // how many items THIS request contains (a colleague, 2026-09-10: "the number
+  // needing reauthorised is less useful" — dropped medicationsTotal from
+  // the score; the regimen totals stay visible in rxMonitoringLine's own
+  // sentence as extra info, just don't feed the score any more). Only
+  // needs counts (Pass A), so it resolves as soon as that pass does —
+  // null (rendered as nothing) only while that's still in flight. title
+  // carries the raw number so the badge is never an opaque unexplained
+  // digit.
+  function rxComplexityBadgeHtml(counts) {
+    var score = C.complexityScore(counts);
+    if (!score) return '';
+    var title =
+      'Complexity ' +
+      score.level +
+      '/5 — ' +
+      score.requestedItemsTotal +
+      ' item' +
+      (score.requestedItemsTotal === 1 ? '' : 's') +
+      ' requested';
+    return (
+      '<span class="ms-lac-tile-complexity ms-lac-tile-complexity-' +
+      score.level +
+      '" title="' +
+      esc(title) +
+      '">' +
+      score.level +
+      '</span>'
+    );
+  }
+
+  // "Med review overdue" — patient-level flag (RxAllocateCore.
+  // overdueMedicationReviewFromPayload), distinct from the per-medication
+  // "N/M repeats overdue for reauthorising" sentence rxMonitoringLine
+  // already carries. Only resolves once Pass A has fetched this row's own
+  // overview (same fetch rxComplexityBadgeHtml depends on) — renders
+  // nothing while that's still in flight or once resolved false.
+  function rxOverdueMedReviewBadgeHtml(taskId) {
+    if (!_rxOverdueMedReview[taskId]) return '';
+    return '<span class="ms-lac-tile-token ms-lac-tile-token-warn" title="This patient’s medication review is overdue (Medicus future action)">Med review overdue</span>';
+  }
+
+  // "Request for 3/6 repeats, 1 acute, 0/2 batches. 3/5 repeats overdue for
+  // reauthorising." — a colleague's own confirmed format, 2026-09-10. The sentence
+  // itself is built by shared/rx-allocate-core.js's rxMonitoringLine (pure,
+  // require()-able from tests); this just resolves this tile's counts/
+  // totals out of the module caches and wraps the result (plus the
+  // complexity badge) for the DOM.
+  function rxMonitoringLineHtml(taskId) {
+    var ct = rxCountsAndTotalsFor(taskId);
+    if (!ct.counts) return '';
+    var sentence = C.rxMonitoringLine(ct.counts, ct.totals);
+    var badge = rxComplexityBadgeHtml(ct.counts);
+    if (!sentence && !badge) return '';
+    return (
+      '<div class="ms-lac-tile-monitoring">' +
+      (sentence ? esc(sentence) : '') +
+      (sentence && badge ? ' ' : '') +
+      badge +
+      '</div>'
+    );
+  }
+
+  // One-line row. Group headers carry the registered GP; the row only
+  // repeats it in the unknown pile, where it varies per row.
+  function tileHtml(tile, opts) {
+    opts = opts || {};
+    var selected = !!_selected[tile.id];
+    var cls = 'ms-lac-tile' + (tile.staged ? ' ms-lac-tile-staged' : '') + (selected ? ' ms-lac-tile-picked' : '');
+    var assignedPerson =
+      opts.showAssignee && tile.assignedTo && !C.isTeamAssignee(tile.assignedTo)
+        ? '<span class="ms-lac-tile-token">with ' + esc(C.displayClinicianName(tile.assignedTo)) + '</span>'
+        : '';
+    var whoLine = '';
+    if (opts.showWho && (tile.requester || tile.namedGp)) {
+      whoLine =
+        '<span class="ms-lac-tile-token">' +
+        esc('Usual GP ' + C.displayClinicianName(tile.requester || tile.namedGp)) +
+        '</span>';
+    }
+    if (tile.staged) {
+      whoLine += '<span class="ms-lac-tile-token">not saved</span>';
+    }
+    return (
+      '<div class="' +
+      cls +
+      '" role="option" tabindex="0" aria-selected="' +
+      (selected ? 'true' : 'false') +
+      '" draggable="true" data-task-id="' +
+      esc(tile.id) +
+      '">' +
+      '<span class="ms-lac-tile-check" aria-hidden="true">' +
+      (selected ? '✓' : '') +
+      '</span>' +
+      '<span class="ms-lac-tile-name">' +
+      esc(tile.patientName) +
+      '</span>' +
+      '<span class="ms-lac-tile-test">' +
+      esc(tile.summary || tile.statusText || 'Task') +
+      '</span>' +
+      assignedPerson +
+      whoLine +
+      rxOverdueMedReviewBadgeHtml(tile.id) +
+      rxMonitoringLineHtml(tile.id) +
+      '</div>'
+    );
+  }
+
+  function groupHtml(group) {
+    var collapsed = !!_collapsed[group.key];
+    var title = group.known
+      ? 'Usual GP · ' + C.displayClinicianName(group.requester || group.groupName)
+      : 'No usual GP on the request';
+    var idsAttr = esc(group.tileIds.join(','));
+    var selectedInGroup = group.tiles.filter(function (t) {
+      return _selected[t.id];
+    }).length;
+    var allOn = selectedInGroup === group.count && group.count > 0;
+    var pickLabel = allOn ? 'All selected' : selectedInGroup ? selectedInGroup + ' selected' : 'Select all';
+    var groupState = allOn ? ' ms-lac-group-on' : selectedInGroup ? ' ms-lac-group-some' : '';
+    return (
+      '<section class="ms-lac-group' +
+      (collapsed ? ' ms-lac-group-collapsed' : '') +
+      groupState +
+      '" data-group-key="' +
+      esc(group.key) +
+      '">' +
+      '<div class="ms-lac-group-head" role="button" tabindex="0" draggable="true" data-group-ids="' +
+      idsAttr +
+      '" data-group-key="' +
+      esc(group.key) +
+      '" aria-pressed="' +
+      (allOn ? 'true' : 'false') +
+      '" aria-label="Select all ' +
+      group.count +
+      (group.known ? ' grouped as ' + esc(title) : ' with no registered GP') +
+      '. Ctrl-click to add another clinician">' +
+      '<span class="ms-lac-group-grip" aria-hidden="true">⠿</span>' +
+      '<span class="ms-lac-group-title">' +
+      esc(title) +
+      '</span>' +
+      '<span class="ms-lac-group-count">' +
+      group.count +
+      '</span>' +
+      '<button type="button" class="ms-lac-group-pick' +
+      (selectedInGroup ? ' ms-lac-group-picked' : '') +
+      '" data-group-ids="' +
+      idsAttr +
+      '" data-group-key="' +
+      esc(group.key) +
+      '" draggable="false" aria-pressed="' +
+      (allOn ? 'true' : 'false') +
+      '" aria-label="' +
+      (allOn ? 'Remove these tasks from the selection' : 'Add all ' + group.count + ' tasks to the selection') +
+      '">' +
+      esc(pickLabel) +
+      '</button>' +
+      (group.known
+        ? '<button type="button" class="ms-lac-ghost ms-rxac-send-group" data-usual-gp-ids="' +
+          idsAttr +
+          '" draggable="false" title="Stage this usual-GP pile onto that clinician if they are working the picked day. Proposal only.">Send this pile to usual GP</button>'
+        : '') +
+      '<button type="button" class="ms-lac-group-toggle" data-toggle-key="' +
+      esc(group.key) +
+      '" aria-expanded="' +
+      (collapsed ? 'false' : 'true') +
+      '" aria-label="' +
+      (collapsed ? 'Show' : 'Hide') +
+      ' this group">' +
+      (collapsed ? '▸' : '▾') +
+      '</button>' +
+      '</div>' +
+      (collapsed
+        ? ''
+        : '<div class="ms-lac-group-body" role="listbox" aria-label="' +
+          esc(title) +
+          '">' +
+          group.tiles
+            .map(function (t) {
+              return tileHtml(t, { showWho: !group.known, showAssignee: true });
+            })
+            .join('') +
+          '</div>') +
+      '</section>'
+    );
+  }
+
+  function fieldCounts(col) {
+    var proposed = 0;
+    var sitting = 0;
+    (col.tiles || []).forEach(function (t) {
+      if (!t) return;
+      if (t.staged || C.isRxUnallocated(t)) proposed += 1;
+      else sitting += 1;
+    });
+    var bits = [];
+    if (col.kind === 'team') bits.push('Team');
+    if (proposed) bits.push(proposed + ' proposed — not saved');
+    if (sitting) bits.push(sitting + ' already sitting');
+    if (!proposed && !sitting) bits.push(col.kind === 'team' ? 'nothing yet' : 'none yet');
+    return bits.join(' · ');
+  }
+
+  function fieldHtml(col, selCount) {
+    var abs = presenceForClinician(col);
+    var away = abs.state === 'away' || abs.state === 'away-pending';
+    var inToday = abs.state === 'present' && abs.reason === 'in-today';
+    var open = fieldIsOpen(col.key);
+    var body = col.tiles
+      .map(function (t) {
+        return tileHtml(t, { showWho: true, showAssignee: false });
+      })
+      .join('');
+    var flag = destFlagHtml(col, abs);
+    var note = '';
+    if (away && abs.label) note = '<div class="ms-lac-col-absence">' + esc(abs.label) + '</div>';
+    else if (inToday && abs.label) note = '<div class="ms-lac-col-in">' + esc(abs.label) + '</div>';
+    var name = C.displayClinicianName(col.title);
+    var isTeam = col.kind === 'team';
+    var expandHint = isTeam
+      ? open
+        ? 'Hide staged tasks'
+        : 'Click to expand'
+      : open
+        ? 'Hide what sits with them'
+        : 'Click to expand and see what sits with them';
+    var sittingIds = col.tiles
+      .map(function (t) {
+        return t && t.id;
+      })
+      .filter(Boolean);
+    var sittingPicked = sittingIds.filter(function (id) {
+      return _selected[id];
+    }).length;
+    var sittingAllOn = sittingPicked === sittingIds.length && sittingIds.length > 0;
+    var selectSitting =
+      open && sittingIds.length
+        ? '<button type="button" class="ms-lac-field-select" data-select-ids="' +
+          esc(sittingIds.join(',')) +
+          '" data-group-key="' +
+          esc(col.key) +
+          '" aria-pressed="' +
+          (sittingAllOn ? 'true' : 'false') +
+          '">' +
+          (sittingAllOn
+            ? isTeam
+              ? 'All selected'
+              : 'All sitting selected'
+            : isTeam
+              ? 'Select these'
+              : 'Select all sitting') +
+          '</button>'
+        : '';
+    return (
+      '<div class="ms-lac-chip-wrap ms-lac-field' +
+      (away ? ' ms-lac-chip-away' : '') +
+      (inToday ? ' ms-lac-chip-in' : '') +
+      (open ? ' ms-lac-chip-open' : '') +
+      (selCount ? ' ms-lac-chip-target' : '') +
+      (col.count ? ' ms-lac-field-has' : '') +
+      (col.kind === 'team' ? ' ms-lac-chip-team' : '') +
+      (_peopleSelected[col.key] ? ' ms-ags-field-on' : '') +
+      '" data-col-key="' +
+      esc(col.key) +
+      '" data-col-kind="' +
+      esc(col.kind || 'clinician') +
+      '">' +
+      '<button type="button" class="ms-lac-chip" data-chip-key="' +
+      esc(col.key) +
+      '" aria-expanded="' +
+      (open ? 'true' : 'false') +
+      '" aria-controls="ms-lac-drawer-' +
+      esc(col.key).replace(/[^a-z0-9]/gi, '_') +
+      '" aria-label="' +
+      esc(selCount ? 'Stage ' + selCount + ' selected tasks onto ' + name : name + '. ' + expandHint) +
+      '">' +
+      '<span class="ms-lac-chip-name">' +
+      esc(name) +
+      '</span>' +
+      flag +
+      '<span class="ms-lac-chip-count">' +
+      esc(fieldCounts(col)) +
+      '</span>' +
+      '</button>' +
+      (selCount
+        ? '<button type="button" class="ms-lac-chip-stagehint" data-stage-key="' +
+          esc(col.key) +
+          '">Sit ' +
+          selCount +
+          ' here (not saved)</button>' +
+          '<button type="button" class="ms-lac-field-expand" data-expand-key="' +
+          esc(col.key) +
+          '" aria-expanded="' +
+          (open ? 'true' : 'false') +
+          '">' +
+          esc(open ? 'Hide list' : 'See patients') +
+          '</button>'
+        : '') +
+      (open
+        ? '<div class="ms-lac-chip-drawer" role="listbox" aria-label="' +
+          esc(isTeam ? 'Staged onto ' + name : 'Sitting with ' + name) +
+          '" id="ms-lac-drawer-' +
+          esc(col.key).replace(/[^a-z0-9]/gi, '_') +
+          '">' +
+          note +
+          selectSitting +
+          (body ||
+            '<div class="ms-lac-empty-sm">' +
+              (isTeam
+                ? 'Nothing staged onto this team yet. Drag from the unallocated box, or select there and click this field.'
+                : 'Nothing sitting with them yet. Drag from the unallocated box, or select there and click this field.') +
+              '</div>') +
+          '</div>'
+        : '') +
+      '</div>'
+    );
+  }
+
+  function emptyPoolHtml() {
+    var destN = splitDestinations().length;
+    var title = !_rows.length
+      ? _bridgeCount
+        ? 'Suite’s list is empty — the table is not'
+        : 'No open requests on this queue'
+      : destN
+        ? 'Inbox is on the right — not saved yet'
+        : 'Requests are here — no doctors to share onto';
+    var sub =
+      pileReason() ||
+      (_rows.length
+        ? 'Doctors working ' +
+          dayPhrase() +
+          ' are on the right. Open a name to see who, or drag to move. Medicus does not change until you confirm.'
+        : 'If the grid on this page still shows rows, reload the list, then open again.');
+    return (
+      '<div class="ms-lac-empty">' +
+      '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
+      '<path d="M3 8l4-5h10l4 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 8h18"/><path d="M9 12h6"/>' +
+      '</svg>' +
+      '<div class="ms-lac-empty-title">' +
+      esc(title) +
+      '</div>' +
+      '<div class="ms-lac-empty-sub">' +
+      esc(sub) +
+      '</div>' +
+      '</div>'
+    );
+  }
+
+  function currentDestinations() {
+    return inTodayPeople();
+  }
+
+  function groupsCore() {
+    return window.AllocationGroupsCore || null;
+  }
+
+  function destStripApi() {
+    return window.AllocationDestStrip || null;
+  }
+
+  function labCore() {
+    return window.LabAllocateCore || null;
+  }
+
+  function presenceForNameLookup(name) {
+    return C.presenceForName({
+      name: name,
+      dateISO: workDate(),
+      book: _book,
+      absences: _absences,
+      staffList: _rota.staff,
+      leaveList: _rota.leave,
+    });
+  }
+
+  function asSplitDestsPinned(people) {
+    var Lab = labCore();
+    var mapped =
+      typeof C.asSplitDests === 'function'
+        ? C.asSplitDests(people)
+        : Lab && typeof Lab.asSplitDests === 'function'
+          ? Lab.asSplitDests(people)
+          : [];
+    var pinned = C.pinDestStaffIds(mapped, _staffDir);
+    var out = pinned.map(function (d) {
+      if (!d) return d;
+      return Object.assign({}, d, { kind: d.kind || 'clinician' });
+    });
+    out.collisions = pinned.collisions || mapped.collisions || [];
+    return out;
+  }
+
+  function destSetPeople() {
+    // Groups are people (staff UUIDs), never a Medicus team inbox.
+    var Core = groupsCore();
+    _lastSkipped = [];
+    if (!Core || !_destKind || _destKind === 'in-today') {
+      return asSplitDestsPinned(currentDestinations());
+    }
+    var set =
+      _destKind === 'group'
+        ? { kind: 'group', id: _destGroupId }
+        : _destKind === 'custom'
+          ? { kind: 'custom', members: _customMembers }
+          : { kind: 'in-today' };
+    var from = Core.destsFromSet(set, {
+      presets: _presets,
+      presenceFor: function (member) {
+        return presenceForNameLookup(member && member.name);
+      },
+    });
+    _lastSkipped = from.skipped || [];
+    return asSplitDestsPinned(from.dests || []);
+  }
+
+  function currentDestSet() {
+    if (_destKind === 'group') return { kind: 'group', id: _destGroupId };
+    if (_destKind === 'custom') return { kind: 'custom', members: _customMembers };
+    return { kind: 'in-today' };
+  }
+
+  async function loadAgState(opts) {
+    opts = opts || {};
+    var Core = groupsCore();
+    if (!chrome.storage || !chrome.storage.local) {
+      if (opts.applyDefault) _destKind = _destKind || 'in-today';
+      return;
+    }
+    try {
+      var state = null;
+      if (typeof loadAllocationGroupsState === 'function') {
+        state = await loadAllocationGroupsState();
+      } else if (
+        window.AllocationGroupsIO &&
+        typeof window.AllocationGroupsIO.loadAllocationGroupsState === 'function'
+      ) {
+        state = await window.AllocationGroupsIO.loadAllocationGroupsState();
+      }
+      if (state) {
+        _presets = state.presets || [];
+        _agConfig = state.config || { lastUsedBySurface: {} };
+      } else {
+        var got = await chrome.storage.local.get(['allocationGroups.presets', 'allocationGroups.config']);
+        _presets = Core
+          ? Core.normalisePresets(got['allocationGroups.presets'])
+          : got['allocationGroups.presets'] || [];
+        _agConfig = Core
+          ? Core.normaliseConfig(got['allocationGroups.config'])
+          : got['allocationGroups.config'] || { lastUsedBySurface: {} };
+      }
+      if (opts.applyDefault && Core) {
+        var last = _agConfig.lastUsedBySurface && _agConfig.lastUsedBySurface.rx;
+        var def = Core.defaultDestSet(_presets, new Date(), last);
+        _destKind = def.kind || 'in-today';
+        _destGroupId = def.id || '';
+        _scheduleAutoPick = def.kind === 'group';
+        if (_destKind !== 'custom') _customMembers = [];
+      }
+    } catch (_) {
+      if (opts.applyDefault) _destKind = _destKind || 'in-today';
+    }
+  }
+
+  async function persistAgPresets() {
+    var Core = groupsCore();
+    var cleaned = Core ? Core.normalisePresets(_presets) : _presets || [];
+    _presets = cleaned;
+    try {
+      if (typeof saveAllocationGroupsPresets === 'function') {
+        await saveAllocationGroupsPresets(cleaned);
+        return;
+      }
+      if (window.AllocationGroupsIO && typeof window.AllocationGroupsIO.saveAllocationGroupsPresets === 'function') {
+        await window.AllocationGroupsIO.saveAllocationGroupsPresets(cleaned);
+        return;
+      }
+      if (chrome.storage && chrome.storage.local) {
+        await chrome.storage.local.set({ 'allocationGroups.presets': cleaned });
+      }
+    } catch (_) {}
+  }
+
+  async function persistAgConfig() {
+    var Core = groupsCore();
+    var cleaned = Core ? Core.normaliseConfig(_agConfig) : _agConfig || {};
+    _agConfig = cleaned;
+    try {
+      if (typeof saveAllocationGroupsConfig === 'function') {
+        await saveAllocationGroupsConfig(cleaned);
+        return;
+      }
+      if (window.AllocationGroupsIO && typeof window.AllocationGroupsIO.saveAllocationGroupsConfig === 'function') {
+        await window.AllocationGroupsIO.saveAllocationGroupsConfig(cleaned);
+        return;
+      }
+      if (chrome.storage && chrome.storage.local) {
+        await chrome.storage.local.set({ 'allocationGroups.config': cleaned });
+      }
+    } catch (_) {}
+  }
+
+  function persistLastUsed() {
+    var Core = groupsCore();
+    if (!Core) return;
+    _agConfig = Core.rememberLastUsed(_agConfig, 'rx', currentDestSet());
+    persistAgConfig();
+  }
+
+  function persistStaffCache() {
+    if (!chrome.storage || !chrome.storage.local) return;
+    var Core = groupsCore();
+    var harvested = ((_staffDir && _staffDir.list) || [])
+      .map(function (s) {
+        if (!s || !s.id || !s.name) return null;
+        var id = String(s.id).toLowerCase();
+        if (Core && !Core.isUuid(id)) return null;
+        return { id: id, name: s.name };
+      })
+      .filter(Boolean);
+    if (!harvested.length) return;
+    chrome.storage.local.get('allocationGroups.staffCache', function (got) {
+      var prev = Array.isArray(got['allocationGroups.staffCache']) ? got['allocationGroups.staffCache'] : [];
+      var seen = {};
+      var merged = [];
+      harvested.concat(prev).forEach(function (s) {
+        if (!s || !s.id || seen[s.id]) return;
+        seen[s.id] = true;
+        merged.push({ id: s.id, name: s.name });
+      });
+      chrome.storage.local.set({ 'allocationGroups.staffCache': merged.slice(0, 80) });
+    });
+  }
+
+  function peopleSelectedCount() {
+    return Object.keys(_peopleSelected).filter(function (k) {
+      return _peopleSelected[k];
+    }).length;
+  }
+
+  function peopleSelectedKeys() {
+    return Object.keys(_peopleSelected).filter(function (k) {
+      return _peopleSelected[k];
+    });
+  }
+
+  function clearPeopleSelection() {
+    _peopleSelected = {};
+    _lastPeopleKey = '';
+  }
+
+  function clinicianFieldKeys() {
+    return sortClinicianFields(currentWorkspace().clinicians || []).map(function (c) {
+      return c.key;
+    });
+  }
+
+  function columnByKey(key) {
+    var board = currentWorkspace();
+    var cols = (board.clinicians || []).concat(board.teams || []);
+    for (var i = 0; i < cols.length; i++) {
+      if (cols[i] && cols[i].key === key) return cols[i];
+    }
+    return null;
+  }
+
+  function resolvePersonForCol(col) {
+    if (!col || col.kind === 'team') return null;
+    var name = C.displayClinicianName(col.title);
+    var draft = _draft || C.emptyDraft();
+    var id = (draft.columnStaffIds && draft.columnStaffIds[col.key]) || '';
+    var Lab = labCore();
+    if (!id && Lab && typeof Lab.resolveStaffForColumn === 'function') {
+      var hit = Lab.resolveStaffForColumn(col.key, name, _staffDir, _rows, null, '');
+      if (hit && hit.ok && hit.staff && hit.staff.id) id = hit.staff.id;
+    }
+    if (!id) {
+      var dests = currentDestinations();
+      for (var i = 0; i < dests.length; i++) {
+        if (dests[i] && dests[i].key === col.key && dests[i].staffId) {
+          id = dests[i].staffId;
+          break;
+        }
+      }
+    }
+    return { id: id, name: name, key: col.key };
+  }
+
+  function peopleMembersFromKeys(keys) {
+    var Core = groupsCore();
+    var cap = Core ? Core.MAX_MEMBERS : 12;
+    var members = [];
+    var seen = {};
+    (keys || []).forEach(function (key) {
+      if (members.length >= cap) return;
+      var col = columnByKey(key);
+      var person = resolvePersonForCol(col);
+      if (!person || !person.id || seen[person.id]) return;
+      if (Core && !Core.isUuid(person.id)) return;
+      seen[person.id] = true;
+      members.push({ id: person.id, name: person.name });
+    });
+    return members;
+  }
+
+  function applyPeopleClick(key, additive, shiftKey) {
+    if (!key) return;
+    var keys = clinicianFieldKeys();
+    if (shiftKey && _lastPeopleKey) {
+      var a = keys.indexOf(_lastPeopleKey);
+      var b = keys.indexOf(key);
+      if (a !== -1 && b !== -1) {
+        var next = additive ? Object.assign({}, _peopleSelected) : {};
+        var lo = Math.min(a, b);
+        var hi = Math.max(a, b);
+        for (var i = lo; i <= hi; i++) next[keys[i]] = true;
+        _peopleSelected = next;
+        _lastPeopleKey = key;
+        render();
+        return;
+      }
+    }
+    if (additive) {
+      if (_peopleSelected[key]) delete _peopleSelected[key];
+      else _peopleSelected[key] = true;
+    } else {
+      _peopleSelected = {};
+      _peopleSelected[key] = true;
+    }
+    _lastPeopleKey = key;
+    render();
+  }
+
+  function setCustomFromKeys(keys) {
+    var members = peopleMembersFromKeys(keys);
+    if (!members.length) {
+      announce('Need a staff id for those people before they can be a group.');
+      return false;
+    }
+    _destKind = 'custom';
+    _destGroupId = '';
+    _customMembers = members;
+    _draft = C.replaceDestColumns(_draft || C.emptyDraft(), destSetPeople());
+    announce('Custom group of ' + members.length + '. Save as group to keep it.');
+    return true;
+  }
+
+  function addPeopleToPreset(groupId, keys) {
+    var Core = groupsCore();
+    if (!Core) return false;
+    var preset = Core.findPreset(_presets, groupId);
+    if (!preset) return false;
+    var incoming = peopleMembersFromKeys(keys);
+    if (!incoming.length) {
+      announce('Need a staff id for those people before they can join a group.');
+      return false;
+    }
+    var members = (preset.memberIds || []).map(function (id) {
+      return { id: id, name: (preset.memberNames && preset.memberNames[id]) || '' };
+    });
+    incoming.forEach(function (m) {
+      var already = members.some(function (x) {
+        return x.id === m.id;
+      });
+      if (!already) members.push(m);
+    });
+    if (members.length > Core.MAX_MEMBERS) members = members.slice(0, Core.MAX_MEMBERS);
+    var res = Core.upsertPreset(_presets, {
+      id: preset.id,
+      name: preset.name,
+      members: members,
+      schedule: preset.schedule,
+    });
+    if (!res.ok) {
+      announce((res.errors && res.errors[0]) || 'Could not update that group.');
+      return false;
+    }
+    _presets = res.presets;
+    _destKind = 'group';
+    _destGroupId = res.preset.id;
+    _customMembers = [];
+    persistAgPresets();
+    persistLastUsed();
+    _draft = C.replaceDestColumns(_draft || C.emptyDraft(), destSetPeople());
+    announce('Added to ' + res.preset.name + '.');
+    return true;
+  }
+
+  function setDestKind(kind, groupId) {
+    _destKind = kind || 'in-today';
+    _destGroupId = groupId || '';
+    if (_destKind !== 'custom') _customMembers = [];
+    _agsAllOpen = false;
+    _scheduleAutoPick = false;
+    _namingGroup = false;
+    persistLastUsed();
+    _draft = C.replaceDestColumns(_draft || C.emptyDraft(), destSetPeople());
+    render();
+  }
+
+  function startSaveAsGroup() {
+    var Core = groupsCore();
+    if (!Core) return;
+    var members =
+      _destKind === 'custom' && _customMembers.length
+        ? _customMembers.slice()
+        : peopleMembersFromKeys(peopleSelectedKeys());
+    if (!members.length) {
+      announce('Pick people first, then save as a group.');
+      return;
+    }
+    _namingGroup = true;
+    render();
+    var input = document.getElementById('ms-ags-save-name');
+    if (input) input.focus();
+  }
+
+  function commitSaveAsGroup() {
+    var Core = groupsCore();
+    if (!Core) return;
+    var members =
+      _destKind === 'custom' && _customMembers.length
+        ? _customMembers.slice()
+        : peopleMembersFromKeys(peopleSelectedKeys());
+    if (!members.length) {
+      announce('Pick people first, then save as a group.');
+      return;
+    }
+    var input = document.getElementById('ms-ags-save-name');
+    var name = input && input.value ? String(input.value).trim() : '';
+    if (!name) {
+      announce('A group needs a name.');
+      return;
+    }
+    var res = Core.upsertPreset(_presets, { name: name, members: members, schedule: null });
+    if (!res.ok) {
+      announce((res.errors && res.errors[0]) || 'Could not save that group.');
+      return;
+    }
+    _presets = res.presets;
+    _destKind = 'group';
+    _destGroupId = res.preset.id;
+    _customMembers = [];
+    _namingGroup = false;
+    clearPeopleSelection();
+    persistAgPresets();
+    persistLastUsed();
+    _draft = C.replaceDestColumns(_draft || C.emptyDraft(), destSetPeople());
+    announce('Saved group ' + res.preset.name + '. Local to this suite, not a Medicus team inbox.');
+    render();
+  }
+
+  function teamIdForName(name) {
+    var list = (_teamDir && _teamDir.list) || [];
+    var want = C.teamColumnKey ? C.teamColumnKey(name) : '';
+    var hits = [];
+    list.forEach(function (t) {
+      if (!t || !t.id || !t.name) return;
+      if (want && C.teamColumnKey(t.name) === want) hits.push(t);
+    });
+    return hits.length === 1 ? hits[0].id : '';
+  }
+
+  function addableTeams() {
+    var list = (_teamDir && _teamDir.list) || [];
+    var used = {};
+    ((_draft && _draft.extraColumns) || []).forEach(function (k) {
+      used[k] = true;
+    });
+    return list.filter(function (t) {
+      if (!t || !t.id || !t.name) return false;
+      if (C.isRxInboxName(t.name)) return false;
+      var key = C.teamColumnKey(t.name);
+      if (!key || used[key]) return false;
+      return true;
+    });
+  }
+
+  function splitDestinations() {
+    var dests = destSetPeople();
+    var collisions = dests.collisions ? dests.collisions.slice() : [];
+    dests = dests.slice();
+    dests.collisions = collisions;
+    var seen = {};
+    dests.forEach(function (d) {
+      if (d && d.key) seen[d.key] = true;
+    });
+    var draft = _draft || C.emptyDraft();
+    (draft.extraColumns || []).forEach(function (key) {
+      if (!key || seen[key]) return;
+      var title = (draft.columnTitles && draft.columnTitles[key]) || '';
+      var id = (draft.columnStaffIds && draft.columnStaffIds[key]) || '';
+      if (String(key).indexOf('team:') === 0) {
+        dests.push({
+          key: key,
+          name: title,
+          staffId: id || teamIdForName(title),
+          kind: 'team',
+        });
+        seen[key] = true;
+        return;
+      }
+      if (String(key).indexOf('clinician:') === 0 && title) {
+        var pres = C.presenceForName({
+          name: title,
+          dateISO: workDate(),
+          book: _book,
+          absences: _absences,
+          staffList: _rota.staff,
+          leaveList: _rota.leave,
+        });
+        if (pres.state === 'away' || pres.state === 'away-pending') return;
+        dests.push({
+          key: key,
+          name: title,
+          staffId: id,
+          kind: 'clinician',
+        });
+        seen[key] = true;
+      }
+    });
+    return dests;
+  }
+
+  function visibleUnallocatedCount() {
+    var pool = currentWorkspace().pool;
+    return (pool && pool.tiles && pool.tiles.length) || 0;
+  }
+
+  function tilesForPlan() {
+    var leftover = C.unallocatedNotStaged(_rows, _draft);
+    var onDest = {};
+    var board = currentWorkspace();
+    (board.clinicians || []).concat(board.teams || []).forEach(function (col) {
+      (col.tiles || []).forEach(function (t) {
+        if (t && t.id) onDest[t.id] = true;
+      });
+    });
+    return leftover.filter(function (r) {
+      return r && r.id && !onDest[r.id];
+    });
+  }
+
+  function destBoxCounts() {
+    var dests = splitDestinations();
+    var counts = {};
+    dests.forEach(function (d) {
+      counts[d.key] = 0;
+    });
+    var board = currentWorkspace();
+    (board.clinicians || []).concat(board.teams || []).forEach(function (col) {
+      if (!col || counts[col.key] == null) return;
+      counts[col.key] = (col.tiles || []).length;
+    });
+    return counts;
+  }
+
+  function destsHaveWork() {
+    var counts = destBoxCounts();
+    return Object.keys(counts).some(function (k) {
+      return counts[k] > 0;
+    });
+  }
+
+  function inTodayBoxTiles() {
+    var dests = splitDestinations();
+    var want = {};
+    dests.forEach(function (d) {
+      want[d.key] = true;
+    });
+    var tiles = [];
+    var seen = {};
+    var board = currentWorkspace();
+    (board.clinicians || []).forEach(function (col) {
+      if (!col || !want[col.key]) return;
+      (col.tiles || []).forEach(function (t) {
+        if (!t || !t.id || seen[t.id]) return;
+        seen[t.id] = true;
+        tiles.push(t);
+      });
+    });
+    return tiles;
+  }
+
+  function applyPileSplit() {
+    var dests = splitDestinations();
+    if (dests.collisions && dests.collisions.length) {
+      return { ok: false, reason: C.collisionPhrase(dests.collisions) };
+    }
+    var plan = C.planEvenSplit(tilesForPlan(), dests, { dayPhrase: dayPhrase() });
+    if (!plan.ok) {
+      _splitDefaulted = false;
+      if (plan.reason && /Nothing unallocated/.test(plan.reason)) {
+        plan.reason = pileReason() || plan.reason;
+      }
+      return plan;
+    }
+    _draft = C.applyEvenSplit(_draft || C.ensureWorkingTodayColumns(C.emptyDraft(), dests), plan);
+    _splitDefaulted = true;
+    _selected = {};
+    _lastUsualGpPlan = null;
+    openDestsFromPlan(plan);
+    return plan;
+  }
+
+  function applyTopUp() {
+    var dests = splitDestinations();
+    if (dests.collisions && dests.collisions.length) {
+      return { ok: false, reason: C.collisionPhrase(dests.collisions) };
+    }
+    var plan = C.planTopUp(tilesForPlan(), dests, destBoxCounts(), { dayPhrase: dayPhrase() });
+    if (!plan.ok) {
+      _splitDefaulted = false;
+      if (plan.reason && /Nothing unallocated/.test(plan.reason)) {
+        plan.reason = pileReason() || plan.reason;
+      }
+      return plan;
+    }
+    _draft = C.applyEvenSplit(_draft || C.ensureWorkingTodayColumns(C.emptyDraft(), dests), plan);
+    _splitDefaulted = true;
+    _selected = {};
+    _lastUsualGpPlan = null;
+    openDestsFromPlan(plan);
+    return plan;
+  }
+
+  function applyDefaultEvenSplit() {
+    return applyPileSplit();
+  }
+
+  function applyLevel() {
+    var dests = splitDestinations();
+    if (dests.collisions && dests.collisions.length) {
+      return { ok: false, reason: C.collisionPhrase(dests.collisions) };
+    }
+    var seen = {};
+    var tiles = inTodayBoxTiles()
+      .concat(tilesForPlan())
+      .filter(function (t) {
+        if (!t || !t.id || seen[t.id]) return false;
+        seen[t.id] = true;
+        return true;
+      });
+    var plan = C.planLevel(tiles, dests, { dayPhrase: dayPhrase() });
+    if (!plan.ok) {
+      if (plan.reason && /Nothing to distribute/.test(plan.reason)) {
+        plan.reason = pileReason() || plan.reason;
+      }
+      return plan;
+    }
+    var next = C.ensureWorkingTodayColumns(C.emptyDraft(), dests);
+    _draft = C.applyEvenSplit(next, plan);
+    _splitDefaulted = true;
+    _selected = {};
+    _lastUsualGpPlan = null;
+    openDestsFromPlan(plan);
+    return plan;
+  }
+
+  function usualGpPlanOpts(includeNotIn) {
+    return {
+      includeNotIn: !!includeNotIn,
+      directory: _staffDir,
+    };
+  }
+
+  function applySendToUsualGp(tiles) {
+    var plan = C.planSendToUsualGp(tiles || tilesForPlan(), inTodayPeople(), usualGpPlanOpts(_sendToUsualGpNotIn));
+    if (!plan.ok) {
+      if (!visibleUnallocatedCount()) plan.reason = pileReason() || plan.reason;
+      return plan;
+    }
+    var dests = (plan.sent || []).map(function (m) {
+      return { key: m.toKey, name: m.toName, staffId: m.staffId };
+    });
+    _draft = C.applySendToUsualGp(C.ensureWorkingTodayColumns(_draft || C.emptyDraft(), dests), plan);
+    _selected = {};
+    _lastUsualGpPlan = plan;
+    (plan.sent || []).forEach(function (m) {
+      if (m && m.toKey) _openDests[m.toKey] = true;
+    });
+    return plan;
+  }
+
+  function currentAllocationRows() {
+    var board = currentWorkspace();
+    var counts = {};
+    (board.clinicians || []).forEach(function (col) {
+      var n = 0;
+      (col.tiles || []).forEach(function (t) {
+        if (C.isRxUnallocated(t)) n += 1;
+      });
+      counts[col.key] = n;
+    });
+    return splitDestinations().map(function (d) {
+      return { name: d.name, key: d.key, count: counts[d.key] || 0 };
+    });
+  }
+
+  function allGroupsPanelHtml() {
+    var Core = groupsCore();
+    var list = Core ? Core.normalisePresets(_presets) : _presets || [];
+    var days = Core ? Core.DAY_IDS : ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    var cards = list
+      .map(function (p) {
+        if (!p || !p.id) return '';
+        var sched = p.schedule;
+        var dayChecks = days
+          .map(function (d) {
+            var on = sched && sched.days && sched.days.indexOf(d) !== -1;
+            return (
+              '<label style="margin-right:8px;font-size:12px"><input type="checkbox" id="ms-ags-day-' +
+              esc(p.id) +
+              '-' +
+              esc(d) +
+              '" data-ags-day="' +
+              esc(d) +
+              '" data-ags-id="' +
+              esc(p.id) +
+              '"' +
+              (on ? ' checked' : '') +
+              '> ' +
+              esc(d) +
+              '</label>'
+            );
+          })
+          .join('');
+        var names = (p.memberIds || [])
+          .map(function (id) {
+            return (p.memberNames && p.memberNames[id]) || id.slice(0, 8);
+          })
+          .join(', ');
+        return (
+          '<div class="ms-ags-all-card" data-ags-card="' +
+          esc(p.id) +
+          '" style="padding:8px 0;border-top:1px solid var(--border,#e2e8f0)">' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+          '<button type="button" class="ms-lac-ghost" data-ags-pick="' +
+          esc(p.id) +
+          '">Pick</button>' +
+          '<input type="text" id="ms-ags-name-' +
+          esc(p.id) +
+          '" data-ags-rename="' +
+          esc(p.id) +
+          '" value="' +
+          esc(p.name) +
+          '" maxlength="48" aria-label="Group name" style="font-weight:600;width:min(220px,100%)">' +
+          '<button type="button" class="ms-lac-ghost" data-ags-always="' +
+          esc(p.id) +
+          '" title="Show this chip every day, all hours.">Always</button>' +
+          '<button type="button" class="ms-lac-ghost" data-ags-delete="' +
+          esc(p.id) +
+          '">Delete</button>' +
+          '</div>' +
+          '<div style="margin-top:4px;font-size:12px;color:var(--text-3,#64748b)">' +
+          esc(names || 'No people yet') +
+          '</div>' +
+          '<div style="margin-top:6px">' +
+          dayChecks +
+          '</div>' +
+          '<div style="margin-top:4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+          '<label>From <input type="time" id="ms-ags-start-' +
+          esc(p.id) +
+          '" data-ags-start="' +
+          esc(p.id) +
+          '" value="' +
+          esc((sched && sched.start) || '') +
+          '"></label>' +
+          '<label>to <input type="time" id="ms-ags-end-' +
+          esc(p.id) +
+          '" data-ags-end="' +
+          esc(p.id) +
+          '" value="' +
+          esc((sched && sched.end) || '') +
+          '"></label>' +
+          '<span style="font-size:12px;color:var(--text-3,#64748b)">Leave blank for always.</span>' +
+          '</div></div>'
+        );
+      })
+      .join('');
+    return (
+      '<div class="ms-ags-all" id="ms-ags-all-panel" style="margin:8px 0;padding:10px;border:1px solid var(--border,#cbd5e1);border-radius:8px;background:var(--bg-elev,#fff);max-height:280px;overflow:auto">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+      '<strong>All groups</strong>' +
+      '<button type="button" class="ms-lac-ghost" id="ms-ags-all-close">Close</button>' +
+      '</div>' +
+      '<p style="margin:6px 0 8px;font-size:12px;color:var(--text-3,#64748b)">Every saved group, including those outside their days and times.</p>' +
+      (cards || '<p style="font-size:12px">No groups yet. Encircle people and Save as group.</p>') +
+      '</div>'
+    );
+  }
+
+  function usualGpOfferParts() {
+    var poolN = visibleUnallocatedCount();
+    var tiles = tilesForPlan();
+    var people = inTodayPeople();
+    var sendSafe = C.planSendToUsualGp(tiles, people, usualGpPlanOpts(false));
+    var sendPlan = _sendToUsualGpNotIn ? C.planSendToUsualGp(tiles, people, usualGpPlanOpts(true)) : sendSafe;
+    if (
+      !poolN ||
+      !sendPlan ||
+      !(
+        sendSafe.sent.length ||
+        sendSafe.skippedNotIn.length ||
+        sendSafe.skippedUnknown.length ||
+        sendSafe.skippedAmbiguous.length
+      )
+    ) {
+      return { preview: '', button: '' };
+    }
+    var day = dayPhrase();
+    var willSend = sendPlan.sent.length;
+    var sendLabel = willSend > 0 ? 'Send ' + willSend + ' to usual GP' : 'Nobody’s usual GP is in';
+    var preview = C.usualGpPreviewCopy(sendSafe, day);
+    var notInN = sendSafe.skippedNotIn.length;
+    return {
+      preview:
+        '<div class="ms-lac-nwd-offer" role="status">' +
+        '<strong>Send to usual GP if they are working ' +
+        esc(day) +
+        '?</strong> ' +
+        esc(preview) +
+        ' Proposal only — nothing is written until you confirm.' +
+        (notInN
+          ? '<label class="ms-lac-send-not-in"><input type="checkbox" id="ms-rxac-send-not-in"' +
+            (_sendToUsualGpNotIn ? ' checked' : '') +
+            '> Also send ' +
+            notInN +
+            ' to usual GPs who are not in on ' +
+            esc(day) +
+            '</label>'
+          : '') +
+        '</div>',
+      button: willSend
+        ? '<button type="button" class="ms-lac-confirm-btn ms-rxac-action" id="ms-rxac-send-usual" title="Stage each unallocated request onto the patient’s usual GP, only if they have a session that day unless you turned on the not-in toggle. Proposal only.">' +
+          esc(sendLabel) +
+          '</button>'
+        : '',
+    };
+  }
+
+  function evenSplitHtml() {
+    var dests = splitDestinations();
+    var phrase = dayPhrase();
+    var cal = calendarToday();
+    var picked = workDate();
+    var poolN = visibleUnallocatedCount();
+    var stagedN = C.draftSummary(_rows, _draft).count;
+    var haveWork = destsHaveWork();
+    var destPhrase = C.destNamesPhrase(dests);
+    var Core = groupsCore();
+    var Strip = destStripApi();
+    var skipped = Core ? Core.skippedPhrase(_lastSkipped) : '';
+    var summary = dests.length
+      ? poolN + ' unallocated · ' + dests.length + ' destination' + (dests.length === 1 ? '' : 's') + ' for ' + phrase
+      : _destKind === 'group' || _destKind === 'custom'
+        ? skipped || 'No people in that group to share onto.'
+        : 'No one is on the book for this day. Type a name below to add them, or pick a saved group.';
+    var destLine = destPhrase ? '<div class="ms-rxac-dests">To: ' + esc(destPhrase) + '</div>' : '';
+    var canSave = (_destKind === 'custom' && _customMembers.length > 0) || peopleSelectedCount() > 0;
+    var strip = Strip
+      ? Strip.destSetStripHtml({
+          destKind: _destKind,
+          destGroupId: _destGroupId,
+          visibleGroups: Core ? Core.visiblePresets(_presets, new Date()) : [],
+          inTodayCount: inTodayPeople().length,
+          workDateISO: workDate(),
+          calendarTodayISO: calendarToday(),
+          destPhrase: destPhrase,
+          skippedPhrase: skipped,
+          canSave: canSave,
+          scheduleHint: scheduleHintText(),
+        })
+      : '';
+    if (Strip) destLine = '';
+    var allPanel = _agsAllOpen ? allGroupsPanelHtml() : '';
+    var splitHint =
+      'Split the unallocated pile evenly among ' +
+      destPhrase +
+      ' (' +
+      phrase +
+      '). Proposal only — nothing is written until you confirm.';
+    var topHint =
+      'Give leftover unallocated requests to whoever of these currently has least: ' +
+      destPhrase +
+      '. Does not move work already sitting. Proposal only.';
+    var levelHint =
+      'Rebalance among ' +
+      destPhrase +
+      ' so each has the same number, or as near as it can be. Moves sitting work on this canvas. Proposal only.';
+    var collisionPhrase =
+      dests.collisions && dests.collisions.length
+        ? (
+            C.collisionPhrase ||
+            (labCore() && labCore().collisionPhrase) ||
+            function () {
+              return 'Two people share a name — split refused.';
+            }
+          )(dests.collisions)
+        : '';
+    var actions = '';
+    if (collisionPhrase) {
+      actions = '<span class="ms-lac-split-note">' + esc(collisionPhrase) + '</span>';
+    } else if (!dests.length) {
+      var emptyBook = _destKind === 'in-today' && inTodayPeople().length === 0;
+      actions =
+        '<span class="ms-lac-split-note">' +
+        esc(
+          pileReason() ||
+            (emptyBook
+              ? 'No one is on the book for this day. Type a name below to add them, or pick a saved group.'
+              : 'Pick Working today, a group, or encircle people. Or pick another day, or add a doctor or team.')
+        ) +
+        '</span>';
+    } else if (poolN && !haveWork) {
+      actions =
+        '<button type="button" class="ms-lac-confirm-btn ms-lac-primary ms-rxac-split-go ms-rxac-action" id="ms-rxac-split" title="' +
+        esc(splitHint) +
+        '">Split equally</button>';
+    } else if (poolN && haveWork) {
+      actions =
+        '<button type="button" class="ms-lac-confirm-btn ms-lac-primary ms-rxac-split-go ms-rxac-action" id="ms-rxac-topup" title="' +
+        esc(topHint) +
+        '">Top up empty boxes</button>' +
+        '<button type="button" class="ms-lac-confirm-btn ms-rxac-action" id="ms-rxac-level" title="' +
+        esc(levelHint) +
+        '">Distribute equally</button>';
+    } else if (haveWork) {
+      actions =
+        '<button type="button" class="ms-lac-confirm-btn ms-rxac-action" id="ms-rxac-level" title="' +
+        esc(levelHint) +
+        '">Distribute equally</button>';
+    } else {
+      actions =
+        '<span class="ms-lac-split-note">' +
+        esc(
+          pileReason() ||
+            'Inbox is clear. Share this box on a doctor splits only that doctor’s requests among the current destinations.'
+        ) +
+        '</span>';
+    }
+    var naming = _namingGroup && Strip && typeof Strip.saveGroupRowHtml === 'function' ? Strip.saveGroupRowHtml() : '';
+    var dist =
+      stagedN && dests.length && Strip && typeof Strip.evenSplitDistributionPhrase === 'function'
+        ? Strip.evenSplitDistributionPhrase(
+            stagedN,
+            dests.length,
+            'prescriptions',
+            dests.map(function (d) {
+              return d && d.name ? String(d.name) : '';
+            })
+          )
+        : '';
+    var usualPhrase = _lastUsualGpPlan && C.usualGpDestPhrase ? C.usualGpDestPhrase(_lastUsualGpPlan) : '';
+    var usualOffer = usualGpOfferParts();
+    var proposal = stagedN
+      ? '<div class="ms-rxac-proposal" role="status">' +
+        '<strong>Proposal, not written yet.</strong> ' +
+        esc(usualPhrase || dist || stagedN + ' prescriptions would sit with ' + dests.length + ' people.') +
+        ' <span class="ms-rxac-drag-hint">Drag a patient from one person onto another to change who gets them.</span>' +
+        '</div>'
+      : '';
+    return (
+      '<div class="ms-lac-split' +
+      (stagedN ? ' ms-rxac-split-proposing' : '') +
+      '" id="ms-rxac-split-box">' +
+      strip +
+      naming +
+      allPanel +
+      usualOffer.preview +
+      '<div class="ms-rxac-split-row">' +
+      '<label class="ms-lac-split-day-label" for="ms-rxac-day" title="The appointment book for this date decides who is in. Defaults to today; pick tomorrow if you are doing this the night before.">Working day</label>' +
+      '<input type="date" id="ms-rxac-day" value="' +
+      esc(picked) +
+      '" aria-label="Working day for the even split" title="The appointment book for this date decides who is in.">' +
+      '<button type="button" class="ms-lac-ghost' +
+      (picked === cal ? ' ms-lac-split-day-on' : '') +
+      '" id="ms-rxac-day-today" title="Use today’s appointment book.">Today</button>' +
+      '<button type="button" class="ms-lac-ghost' +
+      (picked === C.addDaysISO(cal, 1) ? ' ms-lac-split-day-on' : '') +
+      '" id="ms-rxac-day-tomorrow" title="Use tomorrow’s appointment book — for allocating the night before.">Tomorrow</button>' +
+      '<span class="ms-lac-split-summary" title="' +
+      esc(destPhrase ? 'Destinations: ' + destPhrase : summary) +
+      '">' +
+      esc(summary) +
+      '</span>' +
+      '<div class="ms-rxac-split-actions">' +
+      actions +
+      usualOffer.button +
+      '</div>' +
+      '</div>' +
+      destLine +
+      proposal +
+      '</div>'
+    );
+  }
+
+  function inTodayShareDests(exceptKey) {
+    return splitDestinations().filter(function (d) {
+      if (!d || !d.key || d.key === exceptKey) return false;
+      if (d.kind === 'team' || String(d.key).indexOf('team:') === 0) return false;
+      var pres = C.presenceForName({
+        name: d.name,
+        dateISO: workDate(),
+        book: _book,
+        absences: _absences,
+        staffList: _rota.staff,
+        leaveList: _rota.leave,
+      });
+      if (pres.state === 'away' || pres.state === 'away-pending') return false;
+      return true;
+    });
+  }
+
+  function applyShareOut(fromKey) {
+    var board = currentWorkspace();
+    var col = null;
+    (board.clinicians || []).concat(board.teams || []).forEach(function (c) {
+      if (c && c.key === fromKey) col = c;
+    });
+    var tiles = (col && col.tiles) || [];
+    var dests = inTodayShareDests(fromKey);
+    var plan = C.planEvenSplit(tiles, dests, { anyTile: true, dayPhrase: dayPhrase() });
+    if (!plan.ok) return plan;
+    _draft = C.applyEvenSplit(_draft || C.emptyDraft(), plan);
+    _selected = {};
+    plan.fromName = C.displayClinicianName((col && col.title) || '');
+    return plan;
+  }
+
+  // Sum of the complexity level (1-5 each) across every tile currently
+  // sitting/staged in this doctor's box — a colleague's request, 2026-09-10: "a
+  // total of those complexity scores next to each clinician's name",
+  // labelled "Complexity" (a colleague's follow-up the same day) so the number
+  // reads as self-explanatory next to the doctor's name rather than
+  // depending on the hover title. Only needs Pass A (item counts, not the
+  // slow regimen totals — see complexityScore's own comment), so every
+  // tile's score is available as soon as it's rendered at all.
+  function rxColumnComplexityHtml(tiles) {
+    var sum = 0;
+    var any = false;
+    (tiles || []).forEach(function (t) {
+      if (!t) return;
+      var score = C.complexityScore(_rxItemCounts[t.id]);
+      if (!score) return;
+      sum += score.level;
+      any = true;
+    });
+    if (!any) return '';
+    return (
+      '<span class="ms-rxac-folder-complexity" title="Total complexity ' +
+      sum +
+      '">' +
+      '<span class="ms-rxac-folder-complexity-label">Complexity</span>' +
+      '<span class="ms-rxac-folder-complexity-value">' +
+      esc(String(sum)) +
+      '</span>' +
+      '</span>'
+    );
+  }
+
+  function folderHtml(col, opts) {
+    opts = opts || {};
+    var inbox = !!opts.inbox;
+    var abs = inbox ? { state: 'n/a', label: '' } : presenceForClinician(col);
+    var away = abs.state === 'away' || abs.state === 'away-pending';
+    var clear = inbox && !(col.tiles && col.tiles.length);
+    var name = inbox ? 'Unallocated' : C.displayClinicianName(col.title);
+    var flag = inbox ? '' : destFlagHtml(col, abs);
+    var meta = inbox ? (clear ? 'Clear' : col.count + ' in this box') : fieldCounts(col);
+    if (!inbox && away && abs.label) meta = abs.label + (meta ? ' · ' + meta : '');
+    var shareDests = inbox ? [] : inTodayShareDests(col.key);
+    var nTiles = (col.tiles || []).length;
+    var canShare = !inbox && nTiles && shareDests.length;
+    var loud = !!(!inbox && away && nTiles);
+    if (!inbox && nTiles && !shareDests.length) {
+      meta = (meta ? meta + ' · ' : '') + 'No doctors working today to share onto';
+    }
+    var shareTitle = canShare
+      ? 'Share only ' + name + '’s box equally among ' + C.destNamesPhrase(shareDests) + ' — not the unallocated pile'
+      : !inbox && nTiles
+        ? 'No doctors working today to share onto. Pick another working day.'
+        : '';
+    var shareBtn = '';
+    if (!inbox && nTiles) {
+      shareBtn =
+        '<button type="button" class="ms-rxac-share ms-rxac-folder-action' +
+        (loud ? ' ms-rxac-share-away' : ' ms-rxac-share-quiet') +
+        (canShare ? '' : ' ms-rxac-share-off') +
+        '"' +
+        (canShare ? ' data-share-key="' + esc(col.key) + '"' : ' disabled') +
+        ' title="' +
+        esc(shareTitle) +
+        '" aria-label="' +
+        esc(shareTitle) +
+        '">Share this box</button>';
+    }
+    var proposedN = 0;
+    var sittingN = 0;
+    (col.tiles || []).forEach(function (t) {
+      if (!t) return;
+      if (t.staged) proposedN += 1;
+      else sittingN += 1;
+    });
+    var countHtml =
+      !inbox && proposedN
+        ? '<span class="ms-rxac-folder-count ms-rxac-count-proposed">' +
+          '<span class="ms-rxac-count-pop">' +
+          proposedN +
+          '</span>' +
+          '<span class="ms-rxac-count-label">proposed</span>' +
+          (sittingN ? '<span class="ms-rxac-count-sit">' + sittingN + ' sitting</span>' : '') +
+          '</span>'
+        : '<span class="ms-rxac-folder-count">' + esc(String(col.count || 0)) + '</span>';
+    var body = (col.tiles || [])
+      .map(function (t) {
+        return tileHtml(t, { showWho: true, showAssignee: false });
+      })
+      .join('');
+    if (!body) {
+      body =
+        '<div class="ms-lac-empty-sm">' +
+        (inbox
+          ? clear
+            ? 'This box is clear.'
+            : 'Empty — patients are in the doctor boxes.'
+          : 'Nothing in this box yet. Drag a patient here.') +
+        '</div>';
+    }
+    return (
+      '<div class="ms-rxac-folder' +
+      (inbox ? ' ms-rxac-folder-inbox' : '') +
+      (clear ? ' ms-rxac-folder-clear' : '') +
+      (away ? ' ms-rxac-folder-away' : '') +
+      (proposedN ? ' ms-rxac-folder-proposed' : '') +
+      (!inbox && col.kind !== 'team' ? ' ms-lac-field' : '') +
+      (!inbox && _peopleSelected[col.key] ? ' ms-ags-field-on' : '') +
+      '" data-col-key="' +
+      esc(col.key) +
+      '" data-col-kind="' +
+      esc(inbox ? 'pool' : col.kind || 'clinician') +
+      '">' +
+      '<div class="ms-rxac-folder-head" tabindex="-1"' +
+      (!inbox && col.kind !== 'team' ? ' draggable="true" data-people-key="' + esc(col.key) + '"' : '') +
+      '>' +
+      '<div class="ms-rxac-folder-title">' +
+      '<span class="ms-rxac-folder-name">' +
+      esc(name) +
+      '</span>' +
+      (inbox ? '' : rxColumnComplexityHtml(col.tiles)) +
+      '</div>' +
+      countHtml +
+      '<div class="ms-rxac-folder-meta">' +
+      flag +
+      (meta ? '<span class="ms-rxac-folder-meta-text">' + esc(meta) + '</span>' : '') +
+      '</div>' +
+      shareBtn +
+      '</div>' +
+      '<div class="ms-rxac-folder-body" role="listbox" aria-label="' +
+      esc(name) +
+      '">' +
+      body +
+      '</div></div>'
+    );
+  }
+
+  function boardHtml() {
+    var board = currentWorkspace();
+    var pool = board.pool;
+    var clinicians = sortClinicianFields(board.clinicians);
+    var teams = board.teams || [];
+    var inboxEmpty = !(pool.tiles && pool.tiles.length);
+    var inboxFolder = folderHtml(pool, { inbox: true });
+    var docFolders = clinicians
+      .concat(teams)
+      .map(function (col) {
+        return folderHtml(col, {});
+      })
+      .join('');
+    var teamOpts = addableTeams()
+      .map(function (t) {
+        return '<option value="' + esc(t.id) + '" data-name="' + esc(t.name) + '">' + esc(t.name) + '</option>';
+      })
+      .join('');
+    var addRow =
+      '<div class="ms-lac-add-row">' +
+      '<input type="text" id="ms-lac-add-name" maxlength="80" placeholder="Add a doctor — e.g. Dr Jane Cole" aria-label="Add a doctor" title="Add a named doctor as a destination, even if they have no session on the book.">' +
+      '<button type="button" class="ms-lac-ghost" id="ms-lac-add-btn" title="Add that doctor as a destination for split, top-up, and distribute.">Add doctor</button>' +
+      (teamOpts
+        ? '<select id="ms-rxac-add-team" aria-label="Add a team from Medicus" title="Teams scraped from Medicus assignee options. Adding one includes them in Split equally, Top up, and Distribute equally.">' +
+          '<option value="">Add a team from Medicus…</option>' +
+          teamOpts +
+          '</select>' +
+          '<button type="button" class="ms-lac-ghost" id="ms-rxac-add-team-btn" title="Add the selected Medicus team as a destination.">Add team</button>'
+        : '') +
+      '</div>';
+    if (inboxEmpty) {
+      return (
+        evenSplitHtml() +
+        '<div class="ms-rxac-board ms-rxac-board-clear" id="ms-rxac-folders">' +
+        inboxFolder +
+        '<div class="ms-rxac-folders">' +
+        docFolders +
+        '</div>' +
+        addRow +
+        '</div>'
+      );
+    }
+    return (
+      evenSplitHtml() +
+      '<div class="ms-rxac-board" id="ms-rxac-folders">' +
+      '<div class="ms-rxac-main">' +
+      inboxFolder +
+      '</div>' +
+      '<aside class="ms-rxac-rail" aria-label="Doctors working ' +
+      esc(dayPhrase()) +
+      '">' +
+      docFolders +
+      addRow +
+      '</aside></div>'
+    );
+  }
+
+  function selectionBarHtml() {
+    var n = selectedIds().length;
+    if (!n) return '';
+    var preview = C.dragPreview(_rows, selectedIds());
+    return (
+      '<div class="ms-lac-selectbar">' +
+      '<span class="ms-lac-selectbar-count">' +
+      n +
+      ' selected</span>' +
+      '<span class="ms-lac-selectbar-label">' +
+      esc(preview.label) +
+      ' — click a clinician field to stage them, or drag. Ctrl-click another heading or task to add it</span>' +
+      '<button type="button" class="ms-lac-ghost" id="ms-lac-sel-clear">Clear selection</button>' +
+      '</div>'
+    );
+  }
+
+  function confirmBarHtml() {
+    if (_error) {
+      return (
+        '<div class="ms-lac-confirmbar ms-lac-confirmbar-error">' +
+        esc(_error) +
+        ' <button type="button" class="ms-lac-ghost" id="ms-lac-error-dismiss">Dismiss</button></div>'
+      );
+    }
+    if (_writing) {
+      return (
+        '<div class="ms-lac-confirmbar ms-lac-confirmbar-warn">' +
+        '<strong>Writing to Medicus…</strong> The board is frozen until this finishes. Check the queue afterwards — this canvas is a working copy.' +
+        '</div>'
+      );
+    }
+    if (_confirmClose) {
+      var nClose = C.draftSummary(_rows, _draft).count;
+      return (
+        '<div class="ms-lac-confirmbar ms-lac-confirmbar-warn">' +
+        '<strong>Close and discard?</strong> ' +
+        nClose +
+        ' staged move' +
+        (nClose === 1 ? '' : 's') +
+        ' exist only on this canvas — closing forgets them. The Medicus queue itself is untouched either way.' +
+        '<div class="ms-lac-confirmbar-actions">' +
+        '<button type="button" class="ms-lac-ghost" id="ms-lac-close-keep">Keep working</button>' +
+        '<button type="button" class="ms-lac-confirm-btn" id="ms-lac-close-discard">Discard and close</button>' +
+        '</div></div>'
+      );
+    }
+    if (_pendingAbsence) {
+      return (
+        '<div class="ms-lac-confirmbar ms-lac-confirmbar-warn">' +
+        '<strong>Absence check before staging.</strong> ' +
+        esc(_pendingAbsence.copy) +
+        '<div class="ms-lac-confirmbar-actions">' +
+        '<button type="button" class="ms-lac-ghost" id="ms-lac-abs-cancel">Keep them where they were</button>' +
+        '<button type="button" class="ms-lac-confirm-btn" id="ms-lac-abs-stage">Stage anyway</button>' +
+        '</div></div>'
+      );
+    }
+    if (_confirmWrite) {
+      var lines = (_confirmWrite.items || [])
+        .map(function (item) {
+          return (
+            '<li>' + esc(item.patientName || 'Unknown') + ' → ' + esc(C.displayClinicianName(item.toTitle)) + '</li>'
+          );
+        })
+        .join('');
+      var refusedNote = '';
+      var refusedPhrase = C.refusedPatientsPhrase ? C.refusedPatientsPhrase(_confirmWrite, _rows) : '';
+      if (refusedPhrase) {
+        refusedNote = '<p class="ms-lac-confirmbar-note">' + esc(refusedPhrase) + '</p>';
+      }
+      return (
+        '<div class="ms-lac-confirmbar ms-lac-confirmbar-warn ms-rxac-review-open" role="region" aria-label="Review this proposal">' +
+        '<div class="ms-rxac-review-copy">' +
+        '<div class="ms-rxac-review-title">Confirm write to Medicus</div>' +
+        '<strong>This is the write.</strong> Medicus will reassign these prescriptions. This changes who the task sits with — it does not issue, sign, or file the prescription.' +
+        '<ul class="ms-lac-writelist">' +
+        lines +
+        '</ul>' +
+        refusedNote +
+        '</div>' +
+        '<div class="ms-lac-confirmbar-actions">' +
+        '<button type="button" class="ms-lac-ghost" id="ms-lac-write-keep">Keep planning</button>' +
+        '<button type="button" class="ms-lac-confirm-btn ms-lac-primary ms-rxac-review-go" id="ms-lac-write-go" title="Writes these reassignments to Medicus. Does not issue, sign, or file the prescription.">Write to Medicus</button>' +
+        '</div></div>'
+      );
+    }
+    var sum = C.draftSummary(_rows, _draft);
+    var gate = C.canWriteAllocations({ taskList: _taskList, slug: _route && _route.slug });
+    var plan = sum.count
+      ? C.planBulkReassign(_rows, _draft, _taskList, _staffDir, _route && _route.slug, _teamDir)
+      : null;
+    var canWrite = !!(gate.ok && plan && plan.ok && plan.batches && plan.batches.length);
+    var blockReason = '';
+    if (sum.count && !canWrite) {
+      blockReason = !gate.ok ? gate.reason : C.writeBlockReason(plan);
+    }
+    var writeTitle = canWrite
+      ? 'Opens the patient → destination list. You still confirm before anything is written to Medicus.'
+      : blockReason;
+    var writeLabel = 'Review then write ' + sum.count + '…';
+    var status = blockReason
+      ? '<strong>Cannot move these yet.</strong> ' + esc(blockReason)
+      : sum.count
+        ? '<div class="ms-rxac-review-title">Proposal — not written yet</div><strong>' +
+          sum.count +
+          ' would sit with the doctors above.</strong> Drag a patient onto another doctor to change who gets them. Review then write starts the write — you still confirm on the next step.'
+        : 'Drag a patient into a doctor’s box. Medicus does not change until you confirm.';
+    return (
+      '<div class="ms-lac-confirmbar' +
+      (blockReason ? ' ms-lac-confirmbar-warn' : '') +
+      (sum.count && !blockReason ? ' ms-rxac-review-dock' : '') +
+      '">' +
+      '<div class="ms-rxac-review-copy">' +
+      '<span class="ms-lac-confirmbar-note">' +
+      status +
+      '</span>' +
+      (_copyNote ? '<span class="ms-lac-hint">' + esc(_copyNote) + '</span>' : '') +
+      '</div>' +
+      '<div class="ms-lac-confirmbar-actions">' +
+      (sum.count
+        ? '<button type="button" class="ms-lac-ghost" id="ms-lac-clear" title="Forget this proposal. Nothing has been written to Medicus.">Clear proposals</button>'
+        : '') +
+      (canWrite
+        ? '<button type="button" class="ms-lac-confirm-btn ms-lac-primary ms-rxac-review-go" id="ms-lac-finalise" title="' +
+          esc(writeTitle) +
+          '">' +
+          esc(writeLabel) +
+          '</button>'
+        : '') +
+      '</div></div>'
+    );
+  }
+
+  function shellHtml() {
+    var board = currentWorkspace();
+    var stagedN = C.draftSummary(_rows, _draft).count;
+    var destN = splitDestinations().length;
+    var poolN = visibleUnallocatedCount();
+    var counts =
+      poolN +
+      ' unallocated' +
+      (stagedN ? ' · ' + stagedN + ' proposed' : '') +
+      (destN ? ' · to ' + destN + ' destination' + (destN === 1 ? '' : 's') : '');
+    return (
+      '<div class="ms-lac-panel' +
+      (_writing ? ' ms-lac-panel-writing' : '') +
+      (stagedN ? ' ms-rxac-proposing' : '') +
+      (_confirmWrite ? ' ms-rxac-reviewing' : '') +
+      '" role="dialog" aria-modal="true" aria-labelledby="ms-lac-title">' +
+      '<div class="ms-lac-header">' +
+      '<h2 class="ms-lac-title" id="ms-lac-title">Allocate ' +
+      esc(queueTitle().toLowerCase()) +
+      '</h2>' +
+      '<span class="ms-lac-header-counts">' +
+      esc(counts) +
+      '</span>' +
+      '<span class="ms-lac-header-note" title="Unallocated is the pile still sitting in this inbox. Split equally / Top up / Distribute equally propose moves among the named destinations. Drag a patient onto another folder to change one. Nothing is written until you confirm.">Unallocated is the pile. Split equally, or drag a patient onto a doctor. Share this box splits only that doctor’s requests among the current destinations.</span>' +
+      '<span class="ms-lac-hint" id="ms-lac-progress">' +
+      esc(_overviewProgress) +
+      '</span>' +
+      '<button type="button" class="ms-lac-close" id="ms-lac-close" title="Close this canvas. Staged proposals that have not been written are forgotten.">Close</button>' +
+      '</div>' +
+      selectionBarHtml() +
+      '<div class="ms-lac-body"><div class="ms-lac-board" id="ms-lac-board">' +
+      (_loading && !_rows.length ? '<div class="ms-lac-msg">Reading the queue…</div>' : boardHtml()) +
+      '</div></div>' +
+      confirmBarHtml() +
+      '</div>'
+    );
+  }
+
+  function focusKeyOf(el) {
+    if (!el || !el.getAttribute) return '';
+    var shareKey = el.getAttribute('data-share-key');
+    if (shareKey) {
+      return '.ms-rxac-folder[data-col-key="' + shareKey + '"] .ms-rxac-folder-head';
+    }
+    return (
+      (el.id && '#' + el.id) ||
+      (el.getAttribute('data-task-id') && '[data-task-id="' + el.getAttribute('data-task-id') + '"]') ||
+      (el.getAttribute('data-chip-key') && '[data-chip-key="' + el.getAttribute('data-chip-key') + '"]') ||
+      (el.getAttribute('data-group-key') &&
+        '.ms-lac-group-head[data-group-key="' + el.getAttribute('data-group-key') + '"]') ||
+      ''
+    );
+  }
+
+  function render() {
+    var el = document.getElementById(OVERLAY_ID);
+    if (!el || !_open) return;
+    var shell = el.querySelector('.ms-lac-shell');
+    if (!shell) return;
+    var focusKey = focusKeyOf(document.activeElement);
+    shell.innerHTML = shellHtml();
+    bindOverlay(shell);
+    if (focusKey) {
+      var again = shell.querySelector(focusKey);
+      if (again) again.focus();
+    }
+  }
+
+  function toggleSelect(id, additive, shiftKey) {
+    if (!id) return;
+    if (shiftKey && _lastSelectId) {
+      var range = C.rangeSelectIds(visibleTileOrder(), _lastSelectId, id);
+      _selected = additive ? C.addToSelection(_selected, range) : C.replaceSelection(range);
+    } else {
+      _selected = C.toggleIdInSelection(_selected, id, additive);
+      _lastSelectId = id;
+    }
+    render();
+  }
+
+  function addNamedColumn() {
+    var input = document.getElementById('ms-lac-add-name');
+    var name = input && input.value;
+    if (!name || !String(name).trim()) return;
+    var trimmed = String(name).trim();
+    var teamId = teamIdForName(trimmed);
+    if (teamId && C.isTeamAssignee(trimmed) && !C.isRxInboxName(trimmed)) {
+      _draft = C.addTeamColumn(_draft, trimmed, teamId);
+      announce('Added team ' + trimmed);
+    } else {
+      _draft = C.addColumn(_draft, trimmed);
+      announce('Added clinician field ' + trimmed);
+    }
+    if (input) input.value = '';
+    render();
+  }
+
+  function addTeamFromPicker() {
+    var sel = document.getElementById('ms-rxac-add-team');
+    if (!sel || !sel.value) return;
+    var opt = sel.options[sel.selectedIndex];
+    var name = (opt && opt.getAttribute('data-name')) || opt.text || '';
+    if (!name) return;
+    _draft = C.addTeamColumn(_draft, name, sel.value);
+    announce('Added team ' + name);
+    render();
+  }
+
+  function scheduleFromAllCard(card) {
+    var Core = groupsCore();
+    if (!Core || !card) return null;
+    var days = [];
+    card.querySelectorAll('[data-ags-day]').forEach(function (box) {
+      if (box.checked) days.push(box.getAttribute('data-ags-day'));
+    });
+    var startEl = card.querySelector('[data-ags-start]');
+    var endEl = card.querySelector('[data-ags-end]');
+    var start = (startEl && startEl.value) || '';
+    var end = (endEl && endEl.value) || '';
+    var raw = { days: days, start: start, end: end };
+    var preset = card.getAttribute('data-ags-card')
+      ? Core.findPreset(_presets, card.getAttribute('data-ags-card'))
+      : null;
+    if (!days.length && !start && !end) return null;
+    if (!days.length || !start || !end) return (preset && preset.schedule) || null;
+    if (Core.scheduleErrors(raw).length) return (preset && preset.schedule) || null;
+    return Core.normaliseSchedule(raw);
+  }
+
+  function upsertPresetFromCard(id, patch) {
+    var Core = groupsCore();
+    if (!Core) return;
+    var preset = Core.findPreset(_presets, id);
+    if (!preset) return;
+    var next = Object.assign({}, preset, patch || {});
+    var res = Core.upsertPreset(_presets, next);
+    if (!res.ok) {
+      announce((res.errors && res.errors[0]) || 'Could not update that group.');
+      return;
+    }
+    _presets = res.presets;
+    persistAgPresets();
+    render();
+  }
+
+  function bindAllGroupsPanel(root) {
+    var panel = root.querySelector('#ms-ags-all-panel');
+    if (!panel) return;
+    panel.addEventListener('click', function (e) {
+      var pick = e.target.closest && e.target.closest('[data-ags-pick]');
+      if (pick) {
+        e.preventDefault();
+        e.stopPropagation();
+        setDestKind('group', pick.getAttribute('data-ags-pick') || '');
+        return;
+      }
+      var always = e.target.closest && e.target.closest('[data-ags-always]');
+      if (always) {
+        e.preventDefault();
+        e.stopPropagation();
+        upsertPresetFromCard(always.getAttribute('data-ags-always') || '', { schedule: null });
+        return;
+      }
+      var del = e.target.closest && e.target.closest('[data-ags-delete]');
+      if (del) {
+        e.preventDefault();
+        e.stopPropagation();
+        var Core = groupsCore();
+        var id = del.getAttribute('data-ags-delete') || '';
+        var preset = Core && Core.findPreset(_presets, id);
+        if (!window.confirm('Delete group' + (preset && preset.name ? ' ' + preset.name : '') + '?')) return;
+        if (!Core) return;
+        _presets = Core.removePreset(_presets, id).presets;
+        if (_destKind === 'group' && _destGroupId === id) {
+          setDestKind('in-today', '');
+          persistAgPresets();
+          render();
+          return;
+        }
+        persistAgPresets();
+        render();
+      }
+    });
+    panel.addEventListener('change', function (e) {
+      var t = e.target;
+      if (!t) return;
+      var id =
+        t.getAttribute('data-ags-rename') ||
+        t.getAttribute('data-ags-day') ||
+        t.getAttribute('data-ags-start') ||
+        t.getAttribute('data-ags-end') ||
+        '';
+      if (t.getAttribute('data-ags-id')) id = t.getAttribute('data-ags-id');
+      if (!id) return;
+      var card = t.closest('[data-ags-card]');
+      var patch = { schedule: scheduleFromAllCard(card) };
+      if (t.hasAttribute('data-ags-rename')) patch.name = t.value;
+      upsertPresetFromCard(id, patch);
+    });
+  }
+
+  function endPeopleDrag() {
+    _peopleDragKeys = null;
+    if (_dragGhost) {
+      _dragGhost.remove();
+      _dragGhost = null;
+    }
+    setTimeout(function () {
+      _ignoreClickAfterDrag = false;
+    }, 0);
+  }
+
+  function beginPeopleDrag(e, key) {
+    var keys = peopleSelectedKeys();
+    if (keys.indexOf(key) === -1) keys = [key].concat(keys);
+    var seen = {};
+    keys = keys.filter(function (k) {
+      if (!k || seen[k]) return false;
+      seen[k] = true;
+      return true;
+    });
+    _peopleDragKeys = keys;
+    _ignoreClickAfterDrag = true;
+    var label = keys.length === 1 ? '1 person' : keys.length + ' people';
+    if (e.dataTransfer) {
+      e.dataTransfer.setData('text/plain', 'people:' + keys.join(','));
+      e.dataTransfer.effectAllowed = 'move';
+      if (_dragGhost) _dragGhost.remove();
+      _dragGhost = document.createElement('div');
+      _dragGhost.className = 'ms-lac-drag-ghost';
+      _dragGhost.textContent = label;
+      document.body.appendChild(_dragGhost);
+      e.dataTransfer.setDragImage(_dragGhost, 16, 16);
+    }
+    announce(label);
+  }
+
+  function peopleKeysFromDrop(e) {
+    if (_peopleDragKeys && _peopleDragKeys.length) return _peopleDragKeys.slice();
+    if (e && e.dataTransfer) {
+      var text = String(e.dataTransfer.getData('text/plain') || '');
+      if (text.indexOf('people:') === 0) {
+        return text.slice('people:'.length).split(',').filter(Boolean);
+      }
+    }
+    return [];
+  }
+
+  function bindOverlay(root) {
+    var close = root.querySelector('#ms-lac-close');
+    if (close) close.addEventListener('click', requestClose);
+    var dismiss = root.querySelector('#ms-lac-error-dismiss');
+    if (dismiss)
+      dismiss.addEventListener('click', function () {
+        _error = null;
+        render();
+      });
+    var keepBtn = root.querySelector('#ms-lac-close-keep');
+    if (keepBtn)
+      keepBtn.addEventListener('click', function () {
+        _confirmClose = false;
+        render();
+      });
+    var discardBtn = root.querySelector('#ms-lac-close-discard');
+    if (discardBtn) discardBtn.addEventListener('click', closeOverlay);
+    var dayInput = root.querySelector('#ms-rxac-day');
+    if (dayInput)
+      dayInput.addEventListener('change', function () {
+        setWorkDate(dayInput.value);
+      });
+    var dayToday = root.querySelector('#ms-rxac-day-today');
+    if (dayToday)
+      dayToday.addEventListener('click', function () {
+        setWorkDate(calendarToday());
+      });
+    var dayTomorrow = root.querySelector('#ms-rxac-day-tomorrow');
+    if (dayTomorrow)
+      dayTomorrow.addEventListener('click', function () {
+        setWorkDate(C.addDaysISO(calendarToday(), 1));
+      });
+    function bindPileAction(id, applyFn, okNote) {
+      var btn = root.querySelector(id);
+      if (!btn) return;
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (_writing) return;
+        var applied = applyFn();
+        _selected = {};
+        _confirmWrite = null;
+        _copyNote = applied && applied.ok ? okNote(applied) : (applied && applied.reason) || 'Could not split.';
+        announce(_copyNote);
+        render();
+      });
+    }
+    var sendNotIn = root.querySelector('#ms-rxac-send-not-in');
+    if (sendNotIn)
+      sendNotIn.addEventListener('change', function () {
+        _sendToUsualGpNotIn = !!sendNotIn.checked;
+        render();
+      });
+    bindPileAction(
+      '#ms-rxac-send-usual',
+      function () {
+        return applySendToUsualGp(tilesForPlan());
+      },
+      function (applied) {
+        var inN = applied.sentIn != null ? applied.sentIn : (applied.sent || []).length;
+        var notInN = (applied.skippedNotIn || []).length;
+        var ambN = (applied.skippedAmbiguous || []).length;
+        var extra = applied.sentNotIn ? ' Including ' + applied.sentNotIn + ' whose usual GP is not in.' : '';
+        var left = notInN ? ' ' + notInN + ' stayed in the pile — those usual GPs are not in.' : '';
+        var amb = ambN ? ' ' + ambN + ' stayed — two staff match that name.' : '';
+        return (
+          'Staged ' +
+          inN +
+          ' onto their usual GP (working ' +
+          dayPhrase() +
+          ').' +
+          extra +
+          left +
+          amb +
+          ' Proposal, not written yet.'
+        );
+      }
+    );
+    root.querySelectorAll('.ms-rxac-send-group').forEach(function (btn) {
+      btn.addEventListener('mousedown', function (e) {
+        e.stopPropagation();
+      });
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (_writing) return;
+        var ids = parseIdList(btn.getAttribute('data-usual-gp-ids'));
+        var want = {};
+        ids.forEach(function (id) {
+          want[id] = true;
+        });
+        var tiles = tilesForPlan().filter(function (t) {
+          return t && t.id && want[t.id];
+        });
+        var applied = applySendToUsualGp(tiles);
+        _confirmWrite = null;
+        _copyNote =
+          applied && applied.ok
+            ? 'Staged ' +
+              (applied.sentIn != null ? applied.sentIn : (applied.sent || []).length) +
+              ' from this pile onto their usual GP. Proposal, not written yet.'
+            : (applied && applied.reason) || 'Could not stage this pile.';
+        announce(_copyNote);
+        render();
+      });
+    });
+    bindPileAction('#ms-rxac-split', applyPileSplit, function (applied) {
+      return (
+        'Split ' +
+        applied.total +
+        ' equally onto ' +
+        applied.doctors +
+        ' doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    bindPileAction('#ms-rxac-topup', applyTopUp, function (applied) {
+      return (
+        'Topped up empty boxes with ' +
+        applied.total +
+        ' among doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    bindPileAction('#ms-rxac-level', applyLevel, function (applied) {
+      return (
+        'Distributed ' +
+        applied.total +
+        ' equally among ' +
+        applied.doctors +
+        ' doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    root.querySelectorAll('.ms-rxac-share').forEach(function (btn) {
+      ['dragover', 'drop'].forEach(function (ev) {
+        btn.addEventListener(ev, function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+      });
+    });
+    root.querySelectorAll('[data-share-key]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (_writing) return;
+        var applied = applyShareOut(btn.getAttribute('data-share-key') || '');
+        _confirmWrite = null;
+        _copyNote =
+          applied && applied.ok
+            ? 'Shared ' +
+              (applied.fromName ? applied.fromName + '’s box — ' : '') +
+              applied.total +
+              ' equally among ' +
+              applied.doctors +
+              ' doctors in today. Proposal — not written yet.'
+            : (applied && applied.reason) || 'Could not share that box out.';
+        announce(_copyNote);
+        render();
+      });
+    });
+    var inTodayChip = root.querySelector('#ms-ags-in-today');
+    if (inTodayChip)
+      inTodayChip.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setDestKind('in-today', '');
+      });
+    root.querySelectorAll('[data-ags-group]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setDestKind('group', btn.getAttribute('data-ags-group') || '');
+      });
+      ['dragover', 'drop'].forEach(function (ev) {
+        btn.addEventListener(ev, function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (ev !== 'drop') return;
+          var keys = _peopleDragKeys && _peopleDragKeys.length ? _peopleDragKeys.slice() : peopleSelectedKeys();
+          endPeopleDrag();
+          if (!keys.length) return;
+          addPeopleToPreset(btn.getAttribute('data-ags-group') || '', keys);
+          render();
+        });
+      });
+    });
+    var saveGroup = root.querySelector('#ms-ags-save');
+    if (saveGroup)
+      saveGroup.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        startSaveAsGroup();
+      });
+    var saveGo = root.querySelector('#ms-ags-save-go');
+    if (saveGo)
+      saveGo.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        commitSaveAsGroup();
+      });
+    var saveCancel = root.querySelector('#ms-ags-save-cancel');
+    if (saveCancel)
+      saveCancel.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        _namingGroup = false;
+        render();
+      });
+    var saveName = root.querySelector('#ms-ags-save-name');
+    if (saveName)
+      saveName.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commitSaveAsGroup();
+        }
+      });
+    var allBtn = root.querySelector('#ms-ags-all');
+    if (allBtn)
+      allBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        _agsAllOpen = !_agsAllOpen;
+        render();
+      });
+    var allClose = root.querySelector('#ms-ags-all-close');
+    if (allClose)
+      allClose.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        _agsAllOpen = false;
+        render();
+      });
+    bindAllGroupsPanel(root);
+    var newGroup = root.querySelector('#ms-ags-new-group');
+    if (newGroup) {
+      newGroup.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var keys = peopleSelectedKeys();
+        if (keys.length) {
+          setCustomFromKeys(keys);
+        } else {
+          setDestKind('custom', '');
+          announce('Drag a person onto New group, or draw a box around names on the board.');
+        }
+        render();
+      });
+      ['dragover', 'drop'].forEach(function (ev) {
+        newGroup.addEventListener(ev, function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (ev !== 'drop') return;
+          var keys = _peopleDragKeys && _peopleDragKeys.length ? _peopleDragKeys.slice() : peopleSelectedKeys();
+          endPeopleDrag();
+          if (!keys.length) return;
+          setCustomFromKeys(keys);
+          render();
+        });
+      });
+    }
+    bindPileAction('#ms-ags-split', applyPileSplit, function (applied) {
+      return (
+        'Split ' +
+        applied.total +
+        ' equally onto ' +
+        applied.doctors +
+        ' doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    bindPileAction('#ms-ags-topup', applyTopUp, function (applied) {
+      return (
+        'Topped up empty boxes with ' +
+        applied.total +
+        ' among doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    bindPileAction('#ms-ags-level', applyLevel, function (applied) {
+      return (
+        'Distributed ' +
+        applied.total +
+        ' equally among ' +
+        applied.doctors +
+        ' doctors working ' +
+        dayPhrase() +
+        '. Proposal — not written yet. Drag a patient onto another doctor to change who gets them.'
+      );
+    });
+    var addBtn = root.querySelector('#ms-lac-add-btn');
+    if (addBtn) addBtn.addEventListener('click', addNamedColumn);
+    var addTeamBtn = root.querySelector('#ms-rxac-add-team-btn');
+    if (addTeamBtn) addTeamBtn.addEventListener('click', addTeamFromPicker);
+    var addTeamSel = root.querySelector('#ms-rxac-add-team');
+    if (addTeamSel)
+      addTeamSel.addEventListener('change', function () {
+        if (addTeamSel.value) addTeamFromPicker();
+      });
+    var addName = root.querySelector('#ms-lac-add-name');
+    if (addName) {
+      addName.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          addNamedColumn();
+        }
+      });
+    }
+    var selClear = root.querySelector('#ms-lac-sel-clear');
+    if (selClear)
+      selClear.addEventListener('click', function () {
+        _selected = {};
+        _lastSelectId = '';
+        _lastGroupKey = '';
+        announce('Selection cleared');
+        render();
+      });
+    var copyBtn = root.querySelector('#ms-lac-copy');
+    if (copyBtn) copyBtn.addEventListener('click', copyWorkingList);
+    var clearBtn = root.querySelector('#ms-lac-clear');
+    if (clearBtn)
+      clearBtn.addEventListener('click', function () {
+        _draft = C.ensureWorkingTodayColumns(C.emptyDraft(), splitDestinations());
+        _splitDefaulted = false;
+        _openDests = {};
+        _expandedChip = '';
+        _copyNote = '';
+        _lastUsualGpPlan = null;
+        _pendingAbsence = null;
+        announce('Proposals cleared. Doctor boxes show what already sits with them. The queue itself is unchanged.');
+        render();
+      });
+    var absCancel = root.querySelector('#ms-lac-abs-cancel');
+    if (absCancel)
+      absCancel.addEventListener('click', function () {
+        _pendingAbsence = null;
+        announce('Not staged. They stayed where they were.');
+        render();
+      });
+    var absStage = root.querySelector('#ms-lac-abs-stage');
+    if (absStage)
+      absStage.addEventListener('click', function () {
+        if (!_pendingAbsence) return;
+        commitStage(_pendingAbsence.ids, _pendingAbsence.key);
+      });
+    var reviewBtn = root.querySelector('#ms-lac-finalise');
+    if (reviewBtn)
+      reviewBtn.addEventListener('click', function () {
+        requestWrite();
+      });
+    var writeKeep = root.querySelector('#ms-lac-write-keep');
+    if (writeKeep)
+      writeKeep.addEventListener('click', function () {
+        _confirmWrite = null;
+        announce('Kept planning. Nothing was written.');
+        render();
+      });
+    var writeGo = root.querySelector('#ms-lac-write-go');
+    if (writeGo)
+      writeGo.addEventListener('click', function () {
+        commitWrite();
+      });
+    function markDragSources(ids) {
+      var overlay = document.getElementById(OVERLAY_ID);
+      if (!overlay) return;
+      overlay.classList.add('ms-lac-lifting');
+      var idSet = {};
+      (ids || []).forEach(function (id) {
+        idSet[id] = true;
+      });
+      overlay.querySelectorAll('.ms-lac-tile').forEach(function (tile) {
+        var id = tile.getAttribute('data-task-id');
+        if (idSet[id]) tile.classList.add('ms-lac-drag-source');
+      });
+      overlay.querySelectorAll('.ms-lac-group').forEach(function (group) {
+        var head = group.querySelector('.ms-lac-group-head');
+        var gids = parseIdList(head && head.getAttribute('data-group-ids'));
+        var any = false;
+        var all = gids.length > 0;
+        for (var i = 0; i < gids.length; i++) {
+          if (idSet[gids[i]]) any = true;
+          else all = false;
+        }
+        if (all) group.classList.add('ms-lac-group-lift');
+        else if (any) group.classList.add('ms-lac-group-lift-partial');
+      });
+    }
+    function clearDragMarks() {
+      var overlay = document.getElementById(OVERLAY_ID);
+      if (!overlay) return;
+      overlay.classList.remove('ms-lac-lifting');
+      overlay
+        .querySelectorAll('.ms-lac-drag-source, .ms-lac-group-lift, .ms-lac-group-lift-partial')
+        .forEach(function (node) {
+          node.classList.remove('ms-lac-drag-source', 'ms-lac-group-lift', 'ms-lac-group-lift-partial');
+        });
+    }
+    function beginDrag(e, startIds) {
+      _peopleDragKeys = null;
+      var ids = C.dragIdsFor(_selected, startIds);
+      _ignoreClickAfterDrag = true;
+      _dragIds = ids;
+      var from = e.currentTarget;
+      var wrap = from && from.closest && from.closest('.ms-lac-chip-wrap');
+      var folder = from && from.closest && from.closest('.ms-rxac-folder');
+      _dragOriginKind =
+        (folder && folder.getAttribute('data-col-kind')) ||
+        (from && from.closest && from.closest('.ms-lac-pool')
+          ? 'pool'
+          : wrap
+            ? wrap.getAttribute('data-col-kind') || 'clinician'
+            : '');
+      markDragSources(ids);
+      var preview = C.dragPreview(_rows, ids);
+      if (e.dataTransfer) {
+        e.dataTransfer.setData('text/plain', ids.join(','));
+        e.dataTransfer.effectAllowed = 'move';
+        if (_dragGhost) _dragGhost.remove();
+        _dragGhost = document.createElement('div');
+        _dragGhost.className = 'ms-lac-drag-ghost';
+        _dragGhost.textContent = preview.label;
+        document.body.appendChild(_dragGhost);
+        e.dataTransfer.setDragImage(_dragGhost, 16, 16);
+      }
+      announce(preview.label);
+    }
+    function endDrag() {
+      _dragIds = null;
+      _dragOriginKind = '';
+      clearDragMarks();
+      if (_dragGhost) {
+        _dragGhost.remove();
+        _dragGhost = null;
+      }
+      setTimeout(function () {
+        _ignoreClickAfterDrag = false;
+      }, 0);
+    }
+    root.querySelectorAll('.ms-lac-group-toggle').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var key = btn.getAttribute('data-toggle-key') || '';
+        _collapsed[key] = !_collapsed[key];
+        render();
+      });
+    });
+    root.querySelectorAll('.ms-lac-group-pick, .ms-lac-field-select').forEach(function (btn) {
+      btn.addEventListener('mousedown', function (e) {
+        e.stopPropagation();
+      });
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        applyGroupSelection(
+          parseIdList(btn.getAttribute('data-group-ids') || btn.getAttribute('data-select-ids')),
+          btn.getAttribute('data-group-key') || '',
+          true,
+          false
+        );
+      });
+    });
+    root.querySelectorAll('.ms-lac-group-head').forEach(function (head) {
+      head.addEventListener('click', function (e) {
+        if (_ignoreClickAfterDrag) return;
+        if (
+          e.target &&
+          e.target.closest &&
+          (e.target.closest('.ms-lac-group-toggle') ||
+            e.target.closest('.ms-lac-group-pick') ||
+            e.target.closest('.ms-rxac-send-group'))
+        ) {
+          return;
+        }
+        e.stopPropagation();
+        applyGroupSelection(
+          parseIdList(head.getAttribute('data-group-ids')),
+          head.getAttribute('data-group-key') || '',
+          !!(e.metaKey || e.ctrlKey),
+          !!e.shiftKey
+        );
+      });
+      head.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          applyGroupSelection(
+            parseIdList(head.getAttribute('data-group-ids')),
+            head.getAttribute('data-group-key') || '',
+            !!(e.metaKey || e.ctrlKey),
+            !!e.shiftKey
+          );
+        }
+      });
+      head.addEventListener('dragstart', function (e) {
+        beginDrag(e, parseIdList(head.getAttribute('data-group-ids')));
+      });
+      head.addEventListener('dragend', endDrag);
+    });
+    root.querySelectorAll('.ms-lac-tile').forEach(function (tile) {
+      tile.addEventListener('click', function (e) {
+        if (_ignoreClickAfterDrag) return;
+        var id = tile.getAttribute('data-task-id');
+        if (!id) return;
+        var onCheck = !!(e.target && e.target.closest && e.target.closest('.ms-lac-tile-check'));
+        toggleSelect(id, onCheck || e.metaKey || e.ctrlKey, e.shiftKey);
+      });
+      tile.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var id = tile.getAttribute('data-task-id');
+          if (id) toggleSelect(id, true, e.shiftKey);
+        }
+      });
+      tile.addEventListener('dragstart', function (e) {
+        var id = tile.getAttribute('data-task-id');
+        beginDrag(e, id ? [id] : []);
+      });
+      tile.addEventListener('dragend', endDrag);
+    });
+    function bindDropTarget(el) {
+      el.addEventListener('dragover', function (e) {
+        e.preventDefault();
+        var kind = el.getAttribute('data-col-kind') || '';
+        if (_peopleDragKeys && _peopleDragKeys.length) {
+          if (kind === 'clinician') el.classList.add('ms-lac-drop-hover');
+        } else if (C.dropTargetShowsHover(_dragOriginKind, kind)) {
+          el.classList.add('ms-lac-drop-hover');
+        }
+        scrollNearEdge(e);
+      });
+      el.addEventListener('dragleave', function (e) {
+        if (e.relatedTarget && el.contains(e.relatedTarget)) return;
+        el.classList.remove('ms-lac-drop-hover');
+      });
+      el.addEventListener('drop', function (e) {
+        e.preventDefault();
+        el.classList.remove('ms-lac-drop-hover');
+        var peopleKeys = peopleKeysFromDrop(e);
+        if (peopleKeys.length) {
+          var pKind = el.getAttribute('data-col-kind') || '';
+          var pKey = el.getAttribute('data-col-key') || '';
+          endPeopleDrag();
+          endDrag();
+          if (pKind === 'clinician' && pKey) {
+            if (peopleKeys.indexOf(pKey) === -1) peopleKeys.push(pKey);
+            setCustomFromKeys(peopleKeys);
+            render();
+          }
+          return;
+        }
+        var key = el.getAttribute('data-col-key');
+        var ids = _dragIds && _dragIds.length ? _dragIds : [];
+        if (!ids.length && e.dataTransfer) {
+          ids = String(e.dataTransfer.getData('text/plain') || '')
+            .split(',')
+            .filter(Boolean);
+        }
+        endDrag();
+        if (!key || !ids.length) return;
+        if (ids[0] && String(ids[0]).indexOf('people:') === 0) return;
+        requestStage(ids, key, el);
+      });
+    }
+    root.querySelectorAll('.ms-lac-col, .ms-lac-chip-wrap, .ms-rxac-folder').forEach(bindDropTarget);
+    root.querySelectorAll('.ms-rxac-folder-head[data-people-key]').forEach(function (head) {
+      head.addEventListener('click', function (e) {
+        if (_ignoreClickAfterDrag) return;
+        if (e.target && e.target.closest && e.target.closest('button, .ms-lac-tile, input, select')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        applyPeopleClick(head.getAttribute('data-people-key') || '', !!(e.metaKey || e.ctrlKey), !!e.shiftKey);
+      });
+      head.addEventListener('dragstart', function (e) {
+        if (e.target && e.target.closest && e.target.closest('.ms-lac-tile, button')) return;
+        e.stopPropagation();
+        beginPeopleDrag(e, head.getAttribute('data-people-key') || '');
+      });
+      head.addEventListener('dragend', function () {
+        endPeopleDrag();
+      });
+    });
+    root.addEventListener('click', function (e) {
+      if (_ignoreClickAfterDrag) return;
+      if (!peopleSelectedCount()) return;
+      if (
+        e.target &&
+        e.target.closest &&
+        e.target.closest(
+          '.ms-rxac-folder-head, .ms-ags-chip, .ms-ags-well, .ms-ags-all, .ms-lac-tile, button, input, select, textarea, .ms-ags-strip'
+        )
+      ) {
+        return;
+      }
+      clearPeopleSelection();
+      render();
+    });
+    root.querySelectorAll('.ms-lac-chip').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleFieldOpen(btn.getAttribute('data-chip-key') || '');
+        render();
+      });
+    });
+    root.querySelectorAll('[data-stage-key]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var key = btn.getAttribute('data-stage-key') || '';
+        var ids = selectedIds();
+        if (key && ids.length) requestStage(ids, key, btn.closest('.ms-lac-chip-wrap'));
+      });
+    });
+    root.querySelectorAll('.ms-lac-field-expand').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleFieldOpen(btn.getAttribute('data-expand-key') || '');
+        render();
+      });
+    });
+  }
+
+  function requestStage(ids, key, colEl) {
+    if (_writing) return;
+    var kind = (colEl && colEl.getAttribute('data-col-kind')) || '';
+    var titleEl =
+      (colEl && colEl.querySelector('.ms-lac-chip-name')) ||
+      (colEl && colEl.querySelector('.ms-rxac-folder-name')) ||
+      (colEl && colEl.querySelector('.ms-lac-col-heading'));
+    var title = C.displayClinicianName((titleEl && titleEl.textContent) || '');
+    if (kind === 'clinician') {
+      var abs = C.presenceForName({
+        name: title,
+        dateISO: workDate(),
+        book: _book,
+        absences: _absences,
+        staffList: _rota.staff,
+        leaveList: _rota.leave,
+      });
+      if (C.shouldWarnAbsence(abs)) {
+        _pendingAbsence = {
+          ids: ids,
+          key: key,
+          copy: C.absenceWarningCopy(abs, ids.length, title),
+        };
+        announce('Absence check before staging onto ' + title);
+        render();
+        return;
+      }
+    }
+    commitStage(ids, key);
+  }
+
+  function commitStage(ids, key) {
+    _draft = C.stageMoves(_draft, ids, key);
+    _selected = {};
+    _lastSelectId = '';
+    _lastGroupKey = '';
+    _pendingAbsence = null;
+    _dragIds = null;
+    _dragOriginKind = '';
+    if (key && (key.indexOf('clinician:') === 0 || key.indexOf('team:') === 0)) {
+      _expandedChip = key;
+      _openDests[key] = true;
+    }
+    announce('Staged ' + ids.length + ' task' + (ids.length === 1 ? '' : 's') + ' on this canvas only');
+    render();
+  }
+
+  function copyWorkingList() {
+    var text = C.copyList(
+      C.buildWorkspace(_rows, _draft, {
+        teams: (_teamDir && _teamDir.list) || [],
+        kind: _route && _route.kind,
+      })
+    );
+    var done = function (ok) {
+      _copyNote = ok
+        ? 'Working list copied. It is not a record of anything written to Medicus.'
+        : 'Could not copy — select the list from a text dump if you need it.';
+      render();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () {
+          done(true);
+        },
+        function () {
+          done(fallbackCopy(text));
+        }
+      );
+      return;
+    }
+    done(fallbackCopy(text));
+  }
+
+  function fallbackCopy(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function requestWrite() {
+    if (_writing) return;
+    var plan = C.planBulkReassign(_rows, _draft, _taskList, _staffDir, _route && _route.slug, _teamDir);
+    if (!plan.ok || !plan.batches.length) {
+      _error = C.writeBlockReason(plan);
+      announce(_error);
+      render();
+      return;
+    }
+    _confirmWrite = plan;
+    announce('Review the list, then confirm. Medicus will reassign those tasks.');
+    render();
+  }
+
+  async function commitWrite() {
+    if (_writing || !_confirmWrite) return;
+    _writing = true;
+    _error = null;
+    render();
+    try {
+      var pin = {
+        apiBase: _route && _route.apiBase,
+        slug: _route && _route.slug,
+        search: _route && _route.search,
+      };
+      var result = await client().commitAllocations({
+        slug: pin.slug,
+        search: pin.search,
+        draft: _draft,
+        rows: _rows,
+        taskList: _taskList,
+        directory: _staffDir,
+        teamDirectory: _teamDir,
+        fetchList: function () {
+          return C.fetchRxMergedTaskList(pin.apiBase, pin.slug, pin.search, inboxFetchOpts());
+        },
+      });
+      if (!result || !result.ok) {
+        var failReason =
+          (result && result.reason) || 'Medicus did not accept the reassignment. Nothing further was written.';
+        _confirmWrite = null;
+        _writing = false;
+        announce(failReason);
+        // A batch that stopped part-way DID write the earlier groups. The
+        // board is stale the moment that happens: those rows still show as
+        // staged, so the count says work is pending that Medicus already
+        // took. Re-read before telling the clinician to check the queue —
+        // loadBoard() clears _error, so restore the message after it.
+        if (result && (result.written > 0 || result.posted > 0)) {
+          await loadBoard({ skipSplit: true });
+          if (result.landedIds && result.landedIds.length && C.unstageIds) {
+            _draft = C.unstageIds(_draft, result.landedIds);
+          }
+          _error = failReason;
+          render();
+          return;
+        }
+        _error = failReason;
+        render();
+        return;
+      }
+      var n = result.written || 0;
+      _draft = C.emptyDraft();
+      _confirmWrite = null;
+      var leftover = (result.refused || []).length;
+      _copyNote =
+        (window.WriteCore && window.WriteCore.finaliseConfirmCopy(result, 'reassignments')) ||
+        'Medicus accepted ' + n + ' reassignment' + (n === 1 ? '' : 's');
+      if (leftover) {
+        _copyNote +=
+          '. ' +
+          leftover +
+          ' destination' +
+          (leftover === 1 ? '' : 's') +
+          ' had no unique staff id and stayed unallocated';
+      }
+      _copyNote +=
+        '. The open list is the same queue with new assignees — reload Medicus if the grid still shows the old number.';
+      _writing = false;
+      announce(_copyNote);
+      await loadBoard({ skipSplit: true });
+    } catch (err) {
+      _writing = false;
+      _confirmWrite = null;
+      _error = err && err.message ? err.message : 'Medicus did not accept the reassignment.';
+      announce(_error);
+      render();
+    }
+  }
+
+  function requestClose() {
+    if (_writing) return;
+    if (_confirmWrite) {
+      _confirmWrite = null;
+      announce('Kept planning. Nothing was written.');
+      render();
+      return;
+    }
+    if (C.draftSummary(_rows, _draft).count > 0) {
+      _confirmClose = true;
+      announce('Close and discard staged moves? Confirm below.');
+      render();
+      return;
+    }
+    closeOverlay();
+  }
+
+  function closeOverlay() {
+    _boardGen++;
+    _open = false;
+    _rows = [];
+    _rxItemCounts = {};
+    _rxRegimenTotals = {};
+    _rxOverdueMedReview = {};
+    _draft = C.emptyDraft();
+    _selected = {};
+    _lastSelectId = '';
+    _lastGroupKey = '';
+    _error = null;
+    _copyNote = '';
+    _expandedChip = '';
+    _openDests = {};
+    _confirmClose = false;
+    _confirmWrite = null;
+    _taskList = undefined;
+    _staffDir = C.harvestStaffDirectory([], null);
+    _teamDir = C.harvestTeamDirectory([], null);
+    _collapsed = {};
+    _workDate = '';
+    _splitDefaulted = false;
+    _destKind = 'in-today';
+    _destGroupId = '';
+    _customMembers = [];
+    _peopleSelected = {};
+    _lastPeopleKey = '';
+    _agsAllOpen = false;
+    _agLoaded = false;
+    _namingGroup = false;
+    _scheduleAutoPick = false;
+    _sendToUsualGpNotIn = false;
+    _lastUsualGpPlan = null;
+    _lastSkipped = [];
+    _peopleDragKeys = null;
+    _marquee = null;
+    var el = document.getElementById(OVERLAY_ID);
+    if (el) el.remove();
+    var launch = document.getElementById(LAUNCH_ID);
+    if (launch) launch.focus();
+  }
+
+  function openOverlay() {
+    if (_writing) return;
+    _route = currentRoute();
+    if (!_route) return;
+    _open = true;
+    _draft = C.emptyDraft();
+    _selected = {};
+    _lastSelectId = '';
+    _lastGroupKey = '';
+    _expandedChip = '';
+    _openDests = {};
+    _confirmClose = false;
+    _confirmWrite = null;
+    _writing = false;
+    _taskList = undefined;
+    _staffDir = C.harvestStaffDirectory([], null);
+    _teamDir = C.harvestTeamDirectory([], null);
+    _copyNote = '';
+    _error = null;
+    _collapsed = {};
+    _workDate = calendarToday();
+    _splitDefaulted = false;
+    _destKind = 'in-today';
+    _destGroupId = '';
+    _customMembers = [];
+    _peopleSelected = {};
+    _lastPeopleKey = '';
+    _agsAllOpen = false;
+    _agLoaded = false;
+    _namingGroup = false;
+    _scheduleAutoPick = false;
+    _sendToUsualGpNotIn = false;
+    _lastUsualGpPlan = null;
+    _lastSkipped = [];
+    _peopleDragKeys = null;
+    _marquee = null;
+    var el = document.getElementById(OVERLAY_ID);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = OVERLAY_ID;
+      // The live region is a stable sibling of the re-rendered shell so
+      // announcements survive re-renders.
+      el.innerHTML = '<div class="ms-lac-live" aria-live="polite"></div><div class="ms-lac-shell"></div>';
+      document.documentElement.appendChild(el);
+    }
+    render();
+    var close = el.querySelector('#ms-lac-close');
+    if (close) close.focus();
+    loadBoard();
+  }
+
+  function muteAllocateChrome() {
+    var launch = document.getElementById(LAUNCH_ID);
+    if (launch) launch.remove();
+    var wrap = document.getElementById(LAUNCH_WRAP_ID);
+    if (wrap && !document.getElementById('ms-rx-od-btn')) wrap.remove();
+    if (_open) closeOverlay();
+  }
+
+  function ensureLauncher() {
+    if (!_packOn) {
+      muteAllocateChrome();
+      return;
+    }
+    var route = currentRoute();
+    var launch = document.getElementById(LAUNCH_ID);
+    var wrap = document.getElementById(LAUNCH_WRAP_ID);
+    if (!route) {
+      if (launch) launch.remove();
+      if (wrap && !document.getElementById('ms-rx-od-btn')) wrap.remove();
+      if (_open) closeOverlay();
+      return;
+    }
+    if (!_open && !_writing) _route = route;
+    var launchLabel = 'Share out this inbox…';
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = LAUNCH_WRAP_ID;
+      document.documentElement.appendChild(wrap);
+    }
+    if (!launch) {
+      launch = document.createElement('button');
+      launch.type = 'button';
+      launch.id = LAUNCH_ID;
+      launch.textContent = launchLabel;
+      launch.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        openOverlay();
+      });
+      wrap.insertBefore(launch, wrap.firstChild);
+    } else {
+      launch.textContent = launchLabel;
+      if (launch.parentNode !== wrap) wrap.insertBefore(launch, wrap.firstChild);
+    }
+  }
+
+  function marqueeHost(target) {
+    if (!target || !target.closest) return null;
+    return target.closest('.ms-rxac-rail, .ms-rxac-folders');
+  }
+
+  function marqueeBlocked(target) {
+    if (!target || !target.closest) return true;
+    return !!target.closest(
+      '.ms-lac-tile, button, input, select, textarea, a, .ms-rxac-folder-head, .ms-ags-chip, .ms-ags-well, .ms-ags-all, .ms-rxac-share, .ms-rxac-folder-inbox'
+    );
+  }
+
+  function removeMarqueeBox() {
+    var box = document.getElementById('ms-ags-marquee');
+    if (box) box.remove();
+    _marquee = null;
+  }
+
+  function updateMarqueeBox(x1, y1, x2, y2) {
+    var overlay = document.getElementById(OVERLAY_ID);
+    if (!overlay) return;
+    var box = document.getElementById('ms-ags-marquee');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'ms-ags-marquee';
+      box.className = 'ms-ags-marquee';
+      overlay.appendChild(box);
+    }
+    var rect = overlay.getBoundingClientRect();
+    var left = Math.min(x1, x2) - rect.left;
+    var top = Math.min(y1, y2) - rect.top;
+    box.style.left = left + 'px';
+    box.style.top = top + 'px';
+    box.style.width = Math.abs(x2 - x1) + 'px';
+    box.style.height = Math.abs(y2 - y1) + 'px';
+  }
+
+  function clinicianFieldsInMarquee(x1, y1, x2, y2) {
+    var overlay = document.getElementById(OVERLAY_ID);
+    if (!overlay) return [];
+    var left = Math.min(x1, x2);
+    var right = Math.max(x1, x2);
+    var top = Math.min(y1, y2);
+    var bottom = Math.max(y1, y2);
+    var keys = [];
+    overlay.querySelectorAll('.ms-lac-field, .ms-rxac-folder[data-col-kind="clinician"]').forEach(function (el) {
+      if (el.classList.contains('ms-rxac-folder-inbox')) return;
+      if (el.getAttribute('data-col-kind') === 'team') return;
+      var r = el.getBoundingClientRect();
+      var hit = r.left < right && r.right > left && r.top < bottom && r.bottom > top;
+      if (!hit) return;
+      var key = el.getAttribute('data-col-key');
+      if (key && keys.indexOf(key) === -1) keys.push(key);
+    });
+    return keys;
+  }
+
+  document.addEventListener(
+    'pointerdown',
+    function (e) {
+      if (!_open || _writing || e.button !== 0) return;
+      var overlay = document.getElementById(OVERLAY_ID);
+      if (!overlay || !overlay.contains(e.target)) return;
+      if (marqueeBlocked(e.target)) return;
+      if (!marqueeHost(e.target)) return;
+      _marquee = {
+        x: e.clientX,
+        y: e.clientY,
+        moved: false,
+        additive: !!(e.metaKey || e.ctrlKey),
+      };
+      try {
+        if (e.target.setPointerCapture) e.target.setPointerCapture(e.pointerId);
+      } catch (_) {}
+    },
+    true
+  );
+
+  document.addEventListener(
+    'pointermove',
+    function (e) {
+      if (!_marquee || !_open) return;
+      var dx = e.clientX - _marquee.x;
+      var dy = e.clientY - _marquee.y;
+      if (!_marquee.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      _marquee.moved = true;
+      e.preventDefault();
+      updateMarqueeBox(_marquee.x, _marquee.y, e.clientX, e.clientY);
+    },
+    true
+  );
+
+  document.addEventListener(
+    'pointerup',
+    function (e) {
+      if (!_marquee || !_open) return;
+      var start = _marquee;
+      var moved = start.moved;
+      var x2 = e.clientX;
+      var y2 = e.clientY;
+      removeMarqueeBox();
+      if (!moved) return;
+      var keys = clinicianFieldsInMarquee(start.x, start.y, x2, y2);
+      if (start.additive) {
+        keys.forEach(function (k) {
+          _peopleSelected[k] = true;
+        });
+      } else {
+        _peopleSelected = {};
+        keys.forEach(function (k) {
+          _peopleSelected[k] = true;
+        });
+      }
+      if (keys.length) _lastPeopleKey = keys[keys.length - 1];
+      _ignoreClickAfterDrag = true;
+      setTimeout(function () {
+        _ignoreClickAfterDrag = false;
+      }, 0);
+      render();
+    },
+    true
+  );
+
+  document.addEventListener(
+    'dragover',
+    function (e) {
+      if ((!_dragIds && !_peopleDragKeys) || !_open) return;
+      e.preventDefault();
+      scrollNearEdge(e);
+    },
+    true
+  );
+
+  document.addEventListener(
+    'keydown',
+    function (e) {
+      if (e.key === 'Escape' && _open) {
+        e.stopPropagation();
+        if (_writing) return;
+        if (_marquee) {
+          removeMarqueeBox();
+          return;
+        }
+        if (_confirmWrite) {
+          _confirmWrite = null;
+          announce('Kept planning. Nothing was written.');
+          render();
+          return;
+        }
+        if (_agsAllOpen) {
+          _agsAllOpen = false;
+          render();
+          return;
+        }
+        if (peopleSelectedCount()) {
+          clearPeopleSelection();
+          announce('People selection cleared');
+          render();
+          return;
+        }
+        if (selectedIds().length) {
+          _selected = {};
+          _lastSelectId = '';
+          _lastGroupKey = '';
+          announce('Selection cleared');
+          render();
+          return;
+        }
+        requestClose();
+      }
+    },
+    true
+  );
+
+  function startHeavyChrome() {
+    if (!_bridgeOn) {
+      _bridgeOn = true;
+      window.addEventListener('ch-task-list-data', onTaskListData);
+    }
+    ensureLauncher();
+  }
+
+  function stopHeavyChrome() {
+    if (_bridgeOn) {
+      window.removeEventListener('ch-task-list-data', onTaskListData);
+      _bridgeOn = false;
+    }
+    _bridgeCount = 0;
+    _visiblePileIds = {};
+    muteAllocateChrome();
+  }
+
+  var Runtime = window.InjectorRuntime;
+  if (Runtime && typeof Runtime.register === 'function') {
+    Runtime.register('rx-allocate', {
+      match: function () {
+        return !!_packOn && !!currentRoute();
+      },
+      start: startHeavyChrome,
+      place: ensureLauncher,
+      stop: stopHeavyChrome,
+    });
+    if (window.PracticePacks && window.PracticePacks.bindInjector) {
+      window.PracticePacks.bindInjector(PACK_KEY, {
+        on: function () {
+          _packOn = true;
+          Runtime.sync();
+        },
+        off: function () {
+          _packOn = false;
+          Runtime.sync();
+        },
+      });
+    } else {
+      Runtime.sync();
+    }
+  } else if (window.PracticePacks && window.PracticePacks.bindInjector) {
+    window.PracticePacks.bindInjector(PACK_KEY, {
+      on: function () {
+        _packOn = true;
+        startHeavyChrome();
+      },
+      off: function () {
+        _packOn = false;
+        stopHeavyChrome();
+      },
+    });
+  } else {
+    startHeavyChrome();
+  }
+})();

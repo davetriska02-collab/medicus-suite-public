@@ -1,0 +1,833 @@
+/* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
+/* Medicus Suite — Trends module (BP / Renal / DOAC / HbA1c / Cholesterol / Weight) */
+
+.trends-module {
+  font-family: var(--sans);
+}
+
+.trends-msg {
+  font-family: var(--sans);
+  color: var(--text-3);
+  padding: 20px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.trends-hint {
+  font-size: 11px;
+}
+.trends-msg-inline {
+  padding: 16px 12px;
+}
+
+/* ── Resting state (no patient open) ─────────────────────────────────────────
+   Self-describing rest: worked example (sparkline) + purpose + first step.
+   Deliberately calm — accent/neutral ink only, no amber/red — this is a
+   resting state, not an alert. Replaces the old one-line "black box" empty
+   state (whole-suite appraisal). */
+.trends-rest {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 20px 24px;
+  text-align: center;
+}
+
+.trends-rest-example {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 14px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.trends-rest-spark {
+  display: block;
+  overflow: visible;
+}
+
+.trends-rest-spark-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.75;
+}
+
+.trends-rest-spark-dot {
+  fill: var(--accent);
+  opacity: 0.85;
+}
+
+.trends-rest-example-lbl {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-4);
+  letter-spacing: 0.04em;
+}
+
+.trends-rest-purpose {
+  margin: 0;
+  max-width: 320px;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+.trends-rest-step {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.trends-rest-step strong {
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+/* Feed provenance ("Data: API feed" / "Data: session") — subtle, not a badge.
+   Mirrors record.css .rec-feed-label's idiom. */
+.trends-source {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-4);
+  padding: 0 12px 4px;
+}
+
+/* ── Picker ──────────────────────────────────────────────────────────────────── */
+.trends-picker {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px 4px;
+  flex-wrap: wrap;
+}
+.trends-tab {
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  /* Reserve border on rest state so active never shifts layout */
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.trends-tab:hover {
+  color: var(--text-2);
+  border-color: var(--border-hi);
+}
+.trends-tab:active {
+  opacity: 0.85;
+}
+/* Selected state: accent wash + line — full fill reserved for clinical salience.
+   [aria-selected] alias keeps the ARIA truth and the visual truth on one attribute. */
+.trends-tab.active,
+.trends-tab[aria-selected='true'] {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--text-2);
+}
+
+/* Export button: mirrors .trends-tab, pushed to the right of the picker row */
+.trends-export {
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  margin-left: auto;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+.trends-export:hover {
+  color: var(--text-2);
+  border-color: var(--border-hi);
+}
+.trends-export:active {
+  opacity: 0.85;
+}
+
+/* ── Shared chart primitives (tc-*) ─────────────────────────────────────────── */
+.tc-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  overflow: visible;
+}
+.tc-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.tc-axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.tc-axis-lbl {
+  fill: var(--text-3);
+  font-size: 9px;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+}
+.tc-empty {
+  fill: var(--text-4);
+  font-size: 10px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.tc-line {
+  stroke-width: 2.5;
+}
+.tc-dot {
+  fill: var(--text-4);
+  cursor: default;
+}
+.tc-dot-alert {
+  fill: var(--red);
+}
+.tc-target {
+  stroke: var(--text-3);
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+}
+.tc-target-lbl {
+  fill: var(--text-3);
+  font-size: 9px;
+  font-family: var(--mono);
+}
+/* Reference zones: dim washes, not saturated ink — the data line is the signal.
+   Zone edges carried by the dashed band-edge line instead of fill contrast. */
+.tc-band {
+  opacity: 1;
+}
+.tc-band-edge {
+  stroke: var(--border-hi);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+/* Series colours */
+.tc-trend {
+  stroke: var(--accent);
+}
+.tc-sys {
+  stroke: var(--red);
+}
+.tc-dia {
+  stroke: var(--accent);
+}
+.tc-acr {
+  stroke: var(--accent);
+}
+/* eGFR: violet ink — distinct from ACR (accent) and BP (red/accent), and passes
+   non-text contrast where --text-4 failed (~2.5:1 dark) */
+.tc-egfr {
+  stroke: var(--violet);
+}
+/* CrCl: teal-leaning cat-2 — not a status hue; creat uses accent so the two
+   DOAC series stay separable from eGFR violet */
+.tc-crcl {
+  stroke: var(--cat-2);
+}
+.tc-creat {
+  stroke: var(--accent);
+}
+
+/* ACR band fills — dim washes (reference zones, not alerts) */
+.tc-a1 {
+  fill: var(--green-dim);
+}
+.tc-a2 {
+  fill: var(--amber-dim);
+}
+.tc-a3 {
+  fill: var(--red-dim);
+}
+
+/* eGFR G-stage band fills — dim washes */
+.tc-g1,
+.tc-g2 {
+  fill: var(--green-dim);
+}
+.tc-g3a {
+  fill: var(--amber-dim);
+}
+.tc-g3b,
+.tc-g4,
+.tc-g5 {
+  fill: var(--red-dim);
+}
+
+/* ── Obs view: latest value head ─────────────────────────────────────────────── */
+.trends-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px 4px;
+  flex-wrap: wrap;
+}
+.trends-val {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.trends-num {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.trends-unit {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+.trends-delta {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.trends-up,
+.trends-down {
+  color: var(--text-2);
+}
+.trends-flat {
+  color: var(--text-3);
+}
+.trends-latest-date {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.trends-section-lbl {
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-4);
+  padding: 6px 12px 2px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.trends-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  padding: 4px 12px 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── BP view ─────────────────────────────────────────────────────────────────── */
+.bpt-module {
+  font-family: var(--sans);
+}
+
+.bpt-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px 6px;
+}
+.bpt-latest {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.bpt-latest small {
+  font-size: 11px;
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.bpt-pill {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  font-weight: 600;
+  white-space: nowrap;
+}
+/* CLINICAL SALIENCE: full-ink fills — these are patient-safety state indicators.
+   color: var(--bg-deep) ensures near-black on pastel dark-theme inks (not pure #fff
+   which would give low contrast on dark's pastel red/green).                    */
+.bpt-above {
+  background: var(--red);
+  color: var(--bg-deep);
+}
+.bpt-met {
+  background: var(--green);
+  color: var(--bg-deep);
+}
+/* bpt-neutral: informational, not a status — chip recipe, not a flat fill */
+.bpt-neutral {
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+}
+.bpt-tgt-lbl {
+  font-weight: 400;
+  opacity: 0.85;
+}
+
+.bpt-registers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 12px 8px;
+}
+/* bpt-reg: register chip — bg-mid + explicit border for both-theme correctness */
+.bpt-reg {
+  font-size: 10px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-4);
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+}
+.bpt-reg-none {
+  color: var(--text-3);
+  background: transparent;
+  padding: 0;
+}
+
+.bpt-note {
+  font-size: 11px;
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+  margin: 0 12px 8px;
+  line-height: 1.4;
+}
+
+.bpt-legend {
+  display: flex;
+  gap: 12px;
+  padding: 5px 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-4);
+  letter-spacing: 0.04em;
+}
+.bpt-key {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.bpt-key::before {
+  content: '';
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+}
+.bpt-k-sys::before {
+  background: var(--red);
+}
+.bpt-k-dia::before {
+  background: var(--accent);
+}
+.bpt-k-tgt::before {
+  background: var(--text-3);
+  border-top: 2px dashed var(--text-3);
+  height: 0;
+}
+
+.bpt-foot {
+  font-size: 10px;
+  color: var(--text-3);
+  margin: 4px 12px 8px;
+  padding: 5px 9px;
+  background: var(--accent-dim);
+  border-left: 2px solid var(--accent-line);
+  border-radius: var(--r-sm);
+}
+
+.bpt-count {
+  font-size: 10px;
+  color: var(--text-3);
+  padding: 0 12px 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Renal view ──────────────────────────────────────────────────────────────── */
+.acrt-module {
+  font-family: var(--sans);
+}
+
+.acrt-banner {
+  font-size: 12px;
+  padding: 7px 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+/* CLINICAL SALIENCE: full-ink fills — colour: var(--bg-deep) for dark-theme contrast */
+.acrt-banner-red {
+  background: var(--red);
+  color: var(--bg-deep);
+}
+.acrt-banner-amber {
+  background: var(--amber);
+  color: var(--bg-deep);
+}
+
+.acrt-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px 8px;
+}
+.acrt-val {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+.acrt-num {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.acrt-unit {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.acrt-no-val {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.acrt-stage {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+}
+/* CLINICAL SALIENCE: KDIGO stage pills — full-ink fills, colour: var(--bg-deep) */
+.acrt-a1 {
+  background: var(--green);
+  color: var(--bg-deep);
+}
+.acrt-a2 {
+  background: var(--amber);
+  color: var(--bg-deep);
+}
+.acrt-a3 {
+  background: var(--red);
+  color: var(--bg-deep);
+}
+
+.acrt-g1,
+.acrt-g2 {
+  background: var(--green);
+  color: var(--bg-deep);
+}
+.acrt-g3a {
+  background: var(--amber);
+  color: var(--bg-deep);
+}
+.acrt-g3b,
+.acrt-g4,
+.acrt-g5 {
+  background: var(--red);
+  color: var(--bg-deep);
+}
+
+.acrt-kdigo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+/* acrt-kdigo-cell: non-clinical container — bg-mid + border (replaces raw --border background) */
+.acrt-kdigo-cell {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: var(--r-md);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.acrt-kdigo-freq {
+  font-size: 12px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.acrt-kdigo-lbl {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.acrt-section-lbl {
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-4);
+  padding: 6px 12px 2px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.acrt-band-legend {
+  display: flex;
+  gap: 12px;
+  padding: 4px 12px;
+  font-size: 10px;
+}
+.acrt-band-a1,
+.acrt-band-a2,
+.acrt-band-a3 {
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+}
+/* CLINICAL SALIENCE: band legend chips — full-ink, colour: var(--bg-deep) */
+.acrt-band-a1 {
+  background: var(--green);
+  color: var(--bg-deep);
+  opacity: 0.85;
+}
+.acrt-band-a2 {
+  background: var(--amber);
+  color: var(--bg-deep);
+  opacity: 0.85;
+}
+.acrt-band-a3 {
+  background: var(--red);
+  color: var(--bg-deep);
+  opacity: 0.85;
+}
+
+.acrt-count {
+  font-size: 10px;
+  color: var(--text-3);
+  padding: 4px 12px 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── DOAC card (renal page) + DOAC view ─────────────────────────────────────── */
+.doac-module,
+.doac-renal-card {
+  font-family: var(--sans);
+}
+
+.doac-renal-card {
+  margin: 8px 12px 4px;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-1);
+}
+
+.doac-renal-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.doac-kicker {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.doac-drug {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-top: 2px;
+}
+
+.doac-indication {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.doac-renal-crcl,
+.doac-head-crcl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+}
+
+.doac-crcl-num {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.doac-crcl-unit {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.doac-crcl-miss {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.doac-inputs,
+.doac-formula {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
+.doac-open-view {
+  margin-top: 8px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  transition:
+    background var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.doac-open-view:hover {
+  color: var(--text-2);
+  border-color: var(--border-hi);
+  background: var(--accent-dim);
+}
+
+.doac-open-view:active {
+  opacity: 0.85;
+}
+
+.doac-band {
+  display: inline-block;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: var(--r-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.doac-band-ok {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid var(--green-line);
+}
+
+.doac-band-amber {
+  background: var(--amber);
+  color: var(--bg-deep);
+}
+
+.doac-band-red {
+  background: var(--red);
+  color: var(--bg-deep);
+}
+
+.doac-band-unknown {
+  background: var(--bg-mid);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+}
+
+.doac-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 10px 12px 6px;
+}
+
+.doac-missing {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  padding: 7px 12px;
+  background: var(--amber-dim);
+  color: var(--amber);
+  border-bottom: 1px solid var(--amber-line);
+}
+
+.doac-input-grid,
+.doac-monitor {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  padding: 4px 12px 2px;
+}
+
+.doac-input {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.doac-input-k {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+
+.doac-input-v {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.doac-formula {
+  padding: 0 12px 6px;
+}
+
+.doac-notes {
+  padding: 2px 0 4px;
+}
+
+.doac-note {
+  margin: 0 12px 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+}

@@ -1,0 +1,242 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — shared API helper
+// Used by Slot Counter and Capacity Forecast.
+// Provides fetch, caching, and a concurrency-limited multi-day fetcher.
+
+'use strict';
+
+import { nextWorkingDayISO as calendarNextWorkingDayISO } from './uk-calendar.js';
+import { boundMap } from './cache-bound.js';
+
+const _cache = new Map(); // `${siteId}|${dateISO}` -> { data, fetchedAt }
+const CACHE_TTL_MS = 5 * 60 * 1000;
+// Capacity's widest horizon is 84 days, plus a visible month (~31). 160 keeps
+// that working set and still stops a long calendar browse from retaining every
+// day-book for the life of the side panel. Expired entries used to stay until
+// that exact key was read again.
+const SCHEDULE_CACHE_MAX = 160;
+
+// F8: Practice code format guard — must match the same 4–8 hex-char pattern as
+// practice-code.js (SITE_CODE_RE). Defined here as a local constant because
+// medicus-api.js is an ES module and cannot use the global PracticeCode object.
+// If the canonical pattern ever changes, update practice-code.js first, then here.
+// keep in sync with PRACTICE_CODE_RE in shared/request-monitor.js
+const _SITE_CODE_RE = /^[a-f0-9]{4,8}$/i;
+function _isValidSiteId(id) {
+  return typeof id === 'string' && _SITE_CODE_RE.test(id);
+}
+
+function apiBase(siteId) {
+  return `https://${siteId}.api.england.medicus.health`;
+}
+
+export async function fetchSchedulingOverview(siteId, dateISO, { bypassCache = false, signal } = {}) {
+  if (!siteId) throw new Error('Practice code not set');
+  // F8: Abort if siteId doesn't match the expected Medicus hex site-ID format to
+  // prevent building fetch requests to unexpected hosts.
+  if (!_isValidSiteId(siteId)) throw new Error(`Invalid practice code format: ${siteId}`);
+  const cacheKey = `${siteId}|${dateISO}`;
+  const now = Date.now();
+  boundMap(_cache, { now, ttlMs: CACHE_TTL_MS, maxEntries: SCHEDULE_CACHE_MAX, timeKey: 'fetchedAt' });
+  const cached = _cache.get(cacheKey);
+  if (!bypassCache && cached) {
+    return cached.data;
+  }
+
+  const url = `${apiBase(siteId)}/scheduling/data/appointment-book/embedded-overview?date=${dateISO}&filterByUsualLocation=false`;
+  const init = { credentials: 'include', cache: 'no-store' };
+  if (signal) init.signal = signal;
+  const r = await fetch(url, init);
+  const dateHdr = r.headers && typeof r.headers.get === 'function' ? r.headers.get('date') : null;
+  if (dateHdr) {
+    const serverMs = Date.parse(dateHdr);
+    if (!Number.isNaN(serverMs)) fetchSchedulingOverview.lastServerMs = serverMs;
+  }
+  if (r.redirected && /login|sign-?in/i.test(String(r.url || ''))) {
+    const err = new Error('Not signed in to Medicus');
+    err.status = 401;
+    throw err;
+  }
+  if (!r.ok) {
+    const err = new Error(r.status === 401 || r.status === 403 ? 'Not signed in to Medicus' : `API error ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
+  const ctype = r.headers && typeof r.headers.get === 'function' ? r.headers.get('content-type') || '' : '';
+  if (ctype && !/json/i.test(ctype)) {
+    const err = new Error('API error 200');
+    err.status = 200;
+    throw err;
+  }
+  const data = await r.json();
+  const fetchedAt = Date.now();
+  _cache.set(cacheKey, { data, fetchedAt });
+  boundMap(_cache, { now: fetchedAt, ttlMs: CACHE_TTL_MS, maxEntries: SCHEDULE_CACHE_MAX, timeKey: 'fetchedAt' });
+  return data;
+}
+
+export function invalidateCache(siteId, dateISO) {
+  // Support legacy single-arg call: invalidateCache(dateISO)
+  // In that case siteId looks like "YYYY-MM-DD" and dateISO is undefined.
+  // Fall back to clearing all entries for that date across all practices.
+  if (siteId && !dateISO && /^\d{4}-\d{2}-\d{2}$/.test(siteId)) {
+    const dateSuffix = `|${siteId}`;
+    for (const k of _cache.keys()) {
+      if (k.endsWith(dateSuffix)) _cache.delete(k);
+    }
+    return;
+  }
+  if (siteId && dateISO) _cache.delete(`${siteId}|${dateISO}`);
+  else _cache.clear();
+}
+
+// Get the latest appointmentTypeOptions for the multi-select preset editor
+export async function fetchAppointmentTypes(siteId) {
+  const today = todayISO();
+  const data = await fetchSchedulingOverview(siteId, today).catch(() => null);
+  if (!data) return [];
+  return (data.appointmentTypeOptions || [])
+    .map((t) => ({ id: t.value, name: t.label }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Aggregate raw data into slot counts by type, filtering by an optional time cutoff and type whitelist
+export function aggregateSlots(raw, { allowedTypes = null, filterPastTimes = false } = {}) {
+  const byType = {};
+  const byStaff = [];
+  let total = 0;
+  let sessionsCount = 0;
+  const now = filterPastTimes ? new Date() : null;
+
+  (raw?.staffSchedules || []).forEach((staff) => {
+    let staffTotal = 0;
+    const staffByType = {};
+    let staffHasSessions = false;
+    // Per-clinician non-cancelled session count — feeds Activity's "per session"
+    // adjustment (activity.js). Additive alongside the existing whole-payload
+    // sessionsCount below; both count the same isCancelled flag, just scoped
+    // differently (whole result vs this one clinician).
+    let staffSessions = 0;
+
+    (staff.schedule || []).forEach((session) => {
+      if (!session.summary?.status?.isCancelled) {
+        sessionsCount++;
+        staffHasSessions = true;
+        staffSessions++;
+      }
+      (session.entries || []).forEach((entry) => {
+        if (entry.diaryEntryType?.value !== 'slot') return;
+
+        const type = entry.appointmentType?.name || 'Unknown';
+        if (allowedTypes && !allowedTypes.includes(type)) return;
+
+        if (now && entry.startDateTime) {
+          if (new Date(entry.startDateTime) < now) return;
+        }
+
+        byType[type] = (byType[type] || 0) + 1;
+        staffByType[type] = (staffByType[type] || 0) + 1;
+        staffTotal++;
+        total++;
+      });
+    });
+
+    if (staffHasSessions) {
+      byStaff.push({ name: staff.name || 'Unknown', total: staffTotal, byType: staffByType, sessions: staffSessions });
+    }
+  });
+
+  byStaff.sort((a, b) => a.name.localeCompare(b.name));
+  return { total, byType, byStaff, sessionsCount };
+}
+
+// Parallel fetch a list of dates with concurrency limit
+export async function fetchManyDates(siteId, dates, { concurrency = 5, onProgress } = {}) {
+  const results = {};
+  let cursor = 0;
+  let done = 0;
+
+  async function worker() {
+    while (cursor < dates.length) {
+      const i = cursor++;
+      const date = dates[i];
+      try {
+        results[date] = await fetchSchedulingOverview(siteId, date);
+      } catch (e) {
+        results[date] = { error: e.message };
+      }
+      done++;
+      if (onProgress) onProgress(done, dates.length, date, results[date]);
+    }
+  }
+
+  await Promise.all(Array(Math.min(concurrency, dates.length)).fill(0).map(worker));
+  return results;
+}
+
+// Status computation given a daily count, minimum, and threshold percentages
+export function computeStatus(count, minimum, thresholds = { tight: 75, low: 50 }) {
+  if (count >= minimum) return 'sufficient';
+  const pct = minimum > 0 ? (count / minimum) * 100 : 100;
+  if (pct >= thresholds.tight) return 'tight';
+  if (pct >= thresholds.low) return 'low';
+  return 'critical';
+}
+
+// ── Date utilities ────────────────────────────────────────────────────────────
+
+export function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Tomorrow, or the next weekday that is not an England & Wales bank holiday. */
+export function nextWorkingDayISO(division) {
+  // `division` is the practice's chosen bank-holiday nation (capacity.lookahead);
+  // undefined falls back to England & Wales inside the calendar.
+  return calendarNextWorkingDayISO(division || undefined);
+}
+
+export function pad(n) {
+  return String(n).padStart(2, '0');
+}
+
+export function addDays(iso, n) {
+  const d = new Date(iso + 'T12:00:00');
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function startOfWeek(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  const dow = d.getDay() === 0 ? 6 : d.getDay() - 1; // Monday = 0
+  d.setDate(d.getDate() - dow);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function startOfMonth(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-01`;
+}
+
+export function daysInMonth(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+
+export function formatDateShort(iso) {
+  return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' });
+}
+
+export function formatDateLong(iso) {
+  return new Date(iso + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+export function isWeekend(iso) {
+  const dow = new Date(iso + 'T12:00:00').getDay();
+  return dow === 0 || dow === 6;
+}
+
+export function isPast(iso) {
+  return iso < todayISO();
+}

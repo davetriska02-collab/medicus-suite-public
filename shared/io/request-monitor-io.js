@@ -1,0 +1,97 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+// Medicus Suite — Request Monitor IO (backup/restore support)
+//
+// Only user-configurable settings are round-tripped.
+// Excluded (transient runtime state, not user config):
+//   suite.requestMonitor.state    — live poll state ({ buckets, seenIds, lastPoll, error })
+//   suite.requestMonitor.notifMap — service-worker notification tracking map
+
+(function(global) {
+  'use strict';
+
+  const REQUEST_MONITOR_KEYS = [
+    'suite.requestMonitor.enabled',
+    'suite.requestMonitor.assigneeId',
+    'suite.requestMonitor.pollSeconds',
+    'suite.requestMonitor.notifyEnabled',
+    'suite.requestMonitor.notifySound',
+    'suite.requestMonitor.urgentAgeAmberHours',
+    'suite.requestMonitor.urgentAgeRedHours',
+  ];
+
+  async function requestMonitorExport() {
+    const r = await chrome.storage.local.get(REQUEST_MONITOR_KEYS);
+    return {
+      enabled:       r['suite.requestMonitor.enabled']       ?? null,
+      assigneeId:    r['suite.requestMonitor.assigneeId']    ?? null,
+      pollSeconds:   r['suite.requestMonitor.pollSeconds']   ?? null,
+      notifyEnabled: r['suite.requestMonitor.notifyEnabled'] ?? null,
+      notifySound:   r['suite.requestMonitor.notifySound']   ?? null,
+      urgentAgeAmberHours: r['suite.requestMonitor.urgentAgeAmberHours'] ?? null,
+      urgentAgeRedHours:   r['suite.requestMonitor.urgentAgeRedHours']   ?? null,
+    };
+  }
+
+  async function requestMonitorImport(data) {
+    if (!data || typeof data !== 'object') return;
+    const toSet = {};
+    // requestMonitorExport writes null for every setting the source machine never had. A null therefore means "not set in the backup":
+    // skip it (never reject it, never overwrite what this machine already has). Only a value of the WRONG TYPE is an error. Found live
+    // 2026-10-07: a backup from a machine that had never configured the monitor failed to restore with "enabled must be a boolean (got null)".
+    // Validate types so a crafted/corrupt backup cannot write a NaN/Infinity/string
+    // pollSeconds (parity with submissions-io / triage-alert-io M2 hardening). The
+    // consumer already clamps via Math.max(MIN_POLL_SECONDS, …); this rejects the
+    // bad value at the import boundary rather than relying on runtime coercion.
+    if (data.enabled !== undefined && data.enabled !== null) {
+      if (typeof data.enabled !== 'boolean') {
+        throw new Error(`requestMonitor.enabled must be a boolean (got ${JSON.stringify(data.enabled)}).`);
+      }
+      toSet['suite.requestMonitor.enabled'] = data.enabled;
+    }
+    if (data.assigneeId !== undefined && data.assigneeId !== null) toSet['suite.requestMonitor.assigneeId'] = data.assigneeId;
+    if (data.pollSeconds !== undefined && data.pollSeconds !== null) {
+      if (!Number.isFinite(data.pollSeconds) || data.pollSeconds <= 0) {
+        throw new Error(`requestMonitor.pollSeconds must be a finite positive number (got ${JSON.stringify(data.pollSeconds)}).`);
+      }
+      toSet['suite.requestMonitor.pollSeconds'] = data.pollSeconds;
+    }
+    if (data.notifyEnabled !== undefined && data.notifyEnabled !== null) {
+      if (typeof data.notifyEnabled !== 'boolean') {
+        throw new Error(`requestMonitor.notifyEnabled must be a boolean (got ${JSON.stringify(data.notifyEnabled)}).`);
+      }
+      toSet['suite.requestMonitor.notifyEnabled'] = data.notifyEnabled;
+    }
+    if (data.notifySound !== undefined && data.notifySound !== null) {
+      if (typeof data.notifySound !== 'boolean') {
+        throw new Error(`requestMonitor.notifySound must be a boolean (got ${JSON.stringify(data.notifySound)}).`);
+      }
+      toSet['suite.requestMonitor.notifySound'] = data.notifySound;
+    }
+    // Breach-risk thresholds (hours) — reject non-finite/non-positive values at
+    // the import boundary (parity with pollSeconds hardening above).
+    if (data.urgentAgeAmberHours !== undefined && data.urgentAgeAmberHours !== null) {
+      if (!Number.isFinite(data.urgentAgeAmberHours) || data.urgentAgeAmberHours <= 0) {
+        throw new Error(`requestMonitor.urgentAgeAmberHours must be a finite positive number (got ${JSON.stringify(data.urgentAgeAmberHours)}).`);
+      }
+      toSet['suite.requestMonitor.urgentAgeAmberHours'] = data.urgentAgeAmberHours;
+    }
+    if (data.urgentAgeRedHours !== undefined && data.urgentAgeRedHours !== null) {
+      if (!Number.isFinite(data.urgentAgeRedHours) || data.urgentAgeRedHours <= 0) {
+        throw new Error(`requestMonitor.urgentAgeRedHours must be a finite positive number (got ${JSON.stringify(data.urgentAgeRedHours)}).`);
+      }
+      toSet['suite.requestMonitor.urgentAgeRedHours'] = data.urgentAgeRedHours;
+    }
+    if (Object.keys(toSet).length > 0) {
+      await chrome.storage.local.set(toSet);
+    }
+  }
+
+  global.REQUEST_MONITOR_KEYS      = REQUEST_MONITOR_KEYS;
+  global.requestMonitorExport      = requestMonitorExport;
+  global.requestMonitorImport      = requestMonitorImport;
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { requestMonitorExport, requestMonitorImport, REQUEST_MONITOR_KEYS };
+  }
+// Works in extension pages (window === self) and service workers (no window).
+})(typeof self !== 'undefined' ? self : this);

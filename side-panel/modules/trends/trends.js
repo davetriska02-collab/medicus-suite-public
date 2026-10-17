@@ -1,0 +1,742 @@
+// © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE.
+'use strict';
+import { lineChart, esc, fmtDate, parseBp, bpTarget } from '../shared/trend-chart.js';
+import { loadUiState, saveUiState } from '../shared/ui-state.js';
+import { downloadCsv } from '../shared/export-util.js';
+import { getTxnBundleIfEnabled, feedSourceLabel } from '../../../shared/panel-txn-feed.js';
+// ── Transactional feed integration (v3.165.0+) ──────────────────────────────
+//
+// Trends' existing data path (content-scripts/sentinel.js getTrendData) is
+// the baseline "session" fetch and is always tried first. v3.245.0 added a
+// slim `medications` list to that payload (name/dosage/source/startDate) so
+// the DOAC view can detect a current anticoagulant without a second fetch.
+// Once session data (and a patientUuid) is in hand, the official
+// Transactional API feed (shared/panel-txn-feed.js) is offered for the SAME
+// patient; getTxnBundleIfEnabled() returns null in every case except a
+// practice explicitly on integrationMode 'transactional' with a healthy feed.
+//
+// COMPATIBILITY MAPPING VERIFIED (engine/normalisers.js
+// normaliseObservationHistory vs shared/fhir-normaliser.js normaliseCareRecord
+// observationHistory), 2026-07-09:
+//   - Both group ONE observationHistory row per distinct analyte, with the
+//     SAME row shape { name, code, group, unit, history } and the SAME
+//     history-point shape { date, value(number|NaN), rawValue(string),
+//     isAbove, isBelow }. The FHIR side only gained value/rawValue/isAbove/
+//     isBelow parity with the session shape in v3.165.0 (see CHANGELOG) —
+//     before that this swap would NOT have been safe, since buildRenalModel/
+//     seriesFor both filter on Number.isFinite(h.value).
+//   - Row matching is NAME-substring based on both sides (session:
+//     row.investigationType; FHIR: text(Observation.code) i.e. the GP Connect
+//     display term) — neither source carries a code Trends can match on
+//     instead, so this was already the accepted strategy pre-dating this
+//     change (BP_NAMES/ACR_NAMES/EGFR_NAMES/OBS_METRICS[].match below).
+//   - BP is structurally identical end to end: both sources synthesise ONE
+//     "Blood pressure" row per patient with rawValue "sys/dia" — session by
+//     pairing separate systolic/diastolic investigationType rows, FHIR from a
+//     single component-based Observation — and buildBpModel()'s primary path
+//     reads h.rawValue (not h.value), so the BP row's `value: NaN` on both
+//     sides is a non-issue.
+//   - ACR/eGFR/HbA1c/cholesterol/weight are structurally identical (row/point
+//     shape), but the exact analyte NAME TEXT is source-specific vocabulary
+//     (Medicus's internal investigationType label vs GP Connect's SNOMED
+//     display term) that cannot be verified from static code alone, and a
+//     name-matching miss on any one metric would silently drop that chart's
+//     only series — exactly the kind of regression the "never render worse"
+//     rule forbids. So rather than trust the vocabulary blind, every refresh()
+//     runs a per-patient RUNTIME coverage check (feedCoversSessionSeries,
+//     below): it re-runs the SAME builders (buildBpModel/buildRenalModel/
+//     seriesFor) against both the session and feed observationHistory and
+//     only adopts the feed's observationHistory if it finds a series for
+//     every metric the session bundle found one for. If the feed is missing
+//     (or produces zero points for) any series the session has, the feed is
+//     rejected and the WHOLE tab stays on session data for that patient — one
+//     consistent provenance per render, not a per-chart source that would
+//     vary confusingly between tabs.
+//   - `registers` (the BP-target qualifying-register list) and `patientContext`
+//     (age, used for BP target banding) have NO transactional-feed equivalent
+//     — `registers` is a Trends-only field the content script attaches from
+//     the session Sentinel snapshot's qof-register chips, not part of any
+//     normalised bundle. These always come from session data regardless of
+//     which observationHistory is used, so BP-target computation is never
+//     affected by the feed swap (see resolveTrendData below).
+
+// ── Observation metrics (passive display — no clinical thresholds) ─────────────
+const OBS_METRICS = [
+  {
+    key: 'hba1c',
+    label: 'HbA1c',
+    unit: 'mmol/mol',
+    match: ['hba1c', 'glycated haemoglobin', 'haemoglobin a1c'],
+    exclude: [],
+  },
+  {
+    key: 'chol',
+    label: 'Cholesterol',
+    unit: 'mmol/L',
+    match: ['cholesterol'],
+    exclude: ['hdl', 'ldl', 'ratio', 'non-hdl', 'non hdl'],
+  },
+  {
+    key: 'weight',
+    label: 'Weight',
+    unit: 'kg',
+    match: ['weight', 'body weight'],
+    exclude: ['weight loss', 'birth weight', 'ideal body weight', 'loss'],
+  },
+];
+
+// ── BP constants ───────────────────────────────────────────────────────────────
+const BP_NAMES = ['blood pressure', 'bp', 'arterial blood pressure'];
+
+// ── Renal constants ────────────────────────────────────────────────────────────
+const ACR_NAMES = ['acr', 'albumin creatinine ratio', 'albumin:creatinine', 'albumin/creatinine'];
+const EGFR_NAMES = ['egfr', 'estimated glomerular filtration rate', 'estimated gfr'];
+
+const KDIGO = {
+  G1: { A1: '0–1', A2: '1', A3: '1+' },
+  G2: { A1: '0–1', A2: '1', A3: '1+' },
+  G3a: { A1: '1', A2: '1', A3: '2' },
+  G3b: { A1: '1–2', A2: '2', A3: '2+' },
+  G4: { A1: '2', A2: '2', A3: '3' },
+  G5: { A1: '4+', A2: '4+', A3: '4+' },
+};
+
+function gStage(e) {
+  if (e == null || !Number.isFinite(e)) return null;
+  if (e >= 90) return 'G1';
+  if (e >= 60) return 'G2';
+  if (e >= 45) return 'G3a';
+  if (e >= 30) return 'G3b';
+  if (e >= 15) return 'G4';
+  return 'G5';
+}
+function aStage(a) {
+  if (a == null || !Number.isFinite(a)) return null;
+  if (a < 3) return 'A1';
+  if (a <= 30) return 'A2';
+  return 'A3';
+}
+
+// ── Module state ───────────────────────────────────────────────────────────────
+let container = null;
+let pollTimer = null;
+let onRuntimeMsg = null;
+let selectedView = 'bp'; // 'bp' | 'renal' | 'hba1c' | 'chol' | 'weight'
+let lastData = null;
+
+export async function init(el) {
+  container = el;
+
+  // Restore persisted view selection before first render
+  const saved = await loadUiState('trends');
+  if (saved && typeof saved.selectedView === 'string') {
+    const VALID_VIEWS = VIEWS.map((v) => v.key);
+    if (VALID_VIEWS.includes(saved.selectedView)) selectedView = saved.selectedView;
+  }
+
+  render({ state: 'loading' });
+  await refresh();
+  pollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') refresh();
+  }, 15000);
+  onRuntimeMsg = (msg, sender) => {
+    if (!sender || sender.id !== chrome.runtime.id) return;
+    if (msg && msg.type === 'sentinel:snapshot-updated') refresh();
+  };
+  chrome.runtime.onMessage.addListener(onRuntimeMsg);
+  return cleanup;
+}
+
+export function cleanup() {
+  clearInterval(pollTimer);
+  pollTimer = null;
+  if (onRuntimeMsg) {
+    chrome.runtime.onMessage.removeListener(onRuntimeMsg);
+    onRuntimeMsg = null;
+  }
+  container = null;
+  lastData = null;
+}
+
+async function refresh() {
+  if (!container) return;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.url || !/medicus\.health/.test(tab.url)) {
+      lastData = null;
+      render({ state: 'no-medicus' });
+      return;
+    }
+    const sessionData = await new Promise((res, rej) => {
+      chrome.tabs.sendMessage(tab.id, { action: 'getTrendData' }, (r) => {
+        if (chrome.runtime.lastError) rej(chrome.runtime.lastError);
+        else res(r);
+      });
+    }).catch(() => null);
+    if (!sessionData) {
+      lastData = null;
+      render({ state: 'no-data' });
+      return;
+    }
+    lastData = await resolveTrendData(sessionData);
+    render({ state: 'ok' });
+  } catch (_) {
+    render({ state: 'no-data' });
+  }
+}
+
+// resolveTrendData(sessionData) -> data object Trends renders from.
+//
+// Session data is always the baseline (see header comment): `registers` and
+// `patientContext` are ALWAYS taken from it, since the feed has no equivalent
+// for either. Only `observationHistory` is ever replaced, and only after
+// feedCoversSessionSeries() confirms the feed's coverage is at least as good
+// as session's for THIS patient. Any failure anywhere in this path (no uuid,
+// mode not transactional, feed error, comparison error) simply returns
+// sessionData unchanged — fail-soft, never a broken tab.
+async function resolveTrendData(sessionData) {
+  const uuid = sessionData?.patientContext?.patientUuid;
+  if (!uuid) return sessionData;
+
+  let feedBundle = null;
+  try {
+    feedBundle = await getTxnBundleIfEnabled(uuid);
+  } catch (_) {
+    feedBundle = null;
+  }
+  if (!feedBundle || !Array.isArray(feedBundle.observationHistory)) return sessionData;
+
+  let feedIsUsable = false;
+  try {
+    feedIsUsable = feedCoversSessionSeries(feedBundle, sessionData);
+  } catch (_) {
+    feedIsUsable = false; // any comparison failure -> keep session, never guess
+  }
+  if (!feedIsUsable) return sessionData;
+
+  return {
+    ...sessionData,
+    observationHistory: feedBundle.observationHistory,
+    debug: { ...(sessionData.debug || {}), panelFeed: 'transactional' },
+  };
+}
+
+// feedCoversSessionSeries(feedData, sessionData) -> boolean
+//
+// Runtime per-patient coverage check (see header comment): re-runs the SAME
+// series builders Trends renders with, against both bundles, and requires the
+// feed to have found a non-empty series for every metric session found one
+// for. When session found nothing for a metric there is nothing to lose by
+// trying the feed (fallback-of-last-resort for that metric); when session DID
+// find something, the feed must match or the whole tab stays on session.
+function feedCoversSessionSeries(feedData, sessionData) {
+  const sessionBp = buildBpModel(sessionData);
+  if (sessionBp.pairs.length > 0 && buildBpModel(feedData).pairs.length === 0) return false;
+
+  const sessionRenal = buildRenalModel(sessionData);
+  const feedRenal = buildRenalModel(feedData);
+  if (sessionRenal.acrPts.length > 0 && feedRenal.acrPts.length === 0) return false;
+  if (sessionRenal.egfrPts.length > 0 && feedRenal.egfrPts.length === 0) return false;
+
+  for (const metric of OBS_METRICS) {
+    const sessionPts = seriesFor(metric, sessionData).pts;
+    if (sessionPts.length > 0 && seriesFor(metric, feedData).pts.length === 0) return false;
+  }
+  return true;
+}
+
+// ── Picker ─────────────────────────────────────────────────────────────────────
+const VIEWS = [
+  { key: 'bp', label: 'BP' },
+  { key: 'renal', label: 'Renal' },
+  { key: 'hba1c', label: 'HbA1c' },
+  { key: 'chol', label: 'Cholesterol' },
+  { key: 'weight', label: 'Weight' },
+];
+
+function visibleViews() {
+  return VIEWS;
+}
+
+function activeView() {
+  const keys = visibleViews().map((v) => v.key);
+  return keys.includes(selectedView) ? selectedView : 'bp';
+}
+
+function pickerHtml() {
+  const view = activeView();
+  return (
+    `<div class="trends-picker" role="tablist">` +
+    visibleViews()
+      .map(
+        (v) =>
+          `<button class="trends-tab${v.key === view ? ' active' : ''}" id="trendsTab-${esc(v.key)}" data-view="${esc(v.key)}" role="tab" aria-selected="${v.key === view}" aria-controls="trendsPanel">${esc(v.label)}</button>`
+      )
+      .join('') +
+    `<button class="trends-export" id="trendsExport" title="Download the current view as CSV" aria-label="Export CSV">↓ CSV</button>` +
+    `</div>`
+  );
+}
+
+function wirePicker() {
+  if (!container) return;
+  container.querySelectorAll('.trends-tab').forEach((b) => {
+    b.addEventListener('click', () => {
+      const k = b.dataset.view;
+      if (k === selectedView) return;
+      selectedView = k;
+      saveUiState('trends', { selectedView });
+      render({ state: lastData ? 'ok' : 'no-data' });
+    });
+  });
+  container.querySelector('#trendsExport')?.addEventListener('click', exportCsv);
+}
+
+// ── CSV export of the active view ───────────────────────────────────────────────
+function exportCsv() {
+  if (!lastData) return;
+  const stamp = new Date().toISOString().slice(0, 10);
+  const view = activeView();
+  const filename = `trends-${view}-${stamp}.csv`;
+
+  if (view === 'bp') {
+    const bm = buildBpModel(lastData);
+    if (!bm.pairs.length) return;
+    const rows = bm.pairs.map((p) => [fmtDate(p.date), p.bp.systolic, p.bp.diastolic]);
+    downloadCsv(filename, ['Date', 'Systolic (mmHg)', 'Diastolic (mmHg)'], rows);
+    return;
+  }
+
+  if (view === 'renal') {
+    const rm = buildRenalModel(lastData);
+    if (!rm.acrPts.length && !rm.egfrPts.length) return;
+    const rows = [
+      ...rm.acrPts.map((p) => [fmtDate(p.date), 'ACR', p.value, rm.acrUnit]),
+      ...rm.egfrPts.map((p) => [fmtDate(p.date), 'eGFR', p.value, rm.egfrUnit]),
+    ];
+    if (!rows.length) return;
+    downloadCsv(filename, ['Date', 'Measure', 'Value', 'Unit'], rows);
+    return;
+  }
+
+  const metric = OBS_METRICS.find((x) => x.key === view) || OBS_METRICS[0];
+  const { pts, unit } = seriesFor(metric, lastData);
+  if (!pts.length) return;
+  const rows = pts.map((p) => [fmtDate(p.date), p.value]);
+  downloadCsv(filename, ['Date', `${metric.label} (${unit})`], rows);
+}
+
+// ── Resting state (no patient open yet) ─────────────────────────────────────────
+// "Black box" was the whole-suite appraisal's word for the old bare empty
+// state (a single line of prose, no worked example). This replaces it with a
+// self-describing rest: what Trends is, a worked example (a small annotated
+// sparkline built from static sample numbers — no live data, no new library),
+// and the first concrete step. Deliberately calm: no amber/red — this is a
+// resting state, not an alert, so it borrows only neutral/accent ink.
+const RESTING_SAMPLE_POINTS = [148, 152, 145, 139, 142, 136];
+
+function restingSparklineSvg() {
+  const w = 160;
+  const h = 40;
+  const pad = 4;
+  const vals = RESTING_SAMPLE_POINTS;
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const range = max - min || 1;
+  const stepX = (w - pad * 2) / (vals.length - 1);
+  const coords = vals.map((v, i) => {
+    const x = pad + i * stepX;
+    const y = pad + (1 - (v - min) / range) * (h - pad * 2);
+    return [x, y];
+  });
+  const path = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const [lastX, lastY] = coords[coords.length - 1];
+  return `
+    <svg class="trends-rest-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Example trend line: a measurement gently falling over six readings">
+      <path class="trends-rest-spark-line" d="${path}" fill="none" />
+      <circle class="trends-rest-spark-dot" cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="2.5" />
+    </svg>`;
+}
+
+function buildRestingState() {
+  return `
+    <div class="trends-rest">
+      <div class="trends-rest-example">
+        ${restingSparklineSvg()}
+        <span class="trends-rest-example-lbl">Example: systolic BP over six readings</span>
+      </div>
+      <p class="trends-rest-purpose">
+        Trends draws a line chart of one patient's recorded results over time — blood pressure,
+        renal function (ACR/eGFR), HbA1c, cholesterol or weight — so a slow drift is easy to see,
+        not just the latest number.
+      </p>
+      <p class="trends-rest-step">
+        <strong>First step:</strong> open a patient in Medicus, then pick a metric.
+      </p>
+    </div>`;
+}
+
+// ── Main render dispatcher ─────────────────────────────────────────────────────
+function render(m) {
+  if (!container) return;
+  if (m.state === 'loading') {
+    container.innerHTML = `<div class="trends-msg">Loading trends…</div>`;
+    return;
+  }
+  if (m.state === 'no-medicus') {
+    container.innerHTML = buildRestingState();
+    return;
+  }
+
+  const view = activeView();
+  let body;
+  if (view === 'bp') body = renderBp(m);
+  else if (view === 'renal') body = renderRenal(m);
+  else body = renderObs(m);
+
+  container.innerHTML = `<div class="trends-module">${pickerHtml()}${sourceLineHtml()}<div id="trendsPanel" role="tabpanel" aria-labelledby="trendsTab-${esc(view)}">${body}</div></div>`;
+  wirePicker();
+}
+
+// Subtle one-line provenance note ("Data: API feed" / "Data: session"),
+// following the Record tab's idiom (side-panel/modules/record/record.js
+// rec-feed-label). Only shown once a bundle has actually been rendered —
+// omitted in the loading/no-medicus/no-data states, where there is nothing
+// to attribute yet.
+function sourceLineHtml() {
+  if (!lastData) return '';
+  const label = feedSourceLabel(lastData) === 'API' ? 'API feed' : 'session';
+  return `<div class="trends-source">Data: ${esc(label)}</div>`;
+}
+
+// ── BP ─────────────────────────────────────────────────────────────────────────
+function buildBpModel(data) {
+  const history = data.observationHistory || [];
+  // Merge ALL BP-matching rows, not just the first hit. A patient can carry
+  // several rows whose names all match BP_NAMES — the synthesised
+  // "Blood pressure" row (paired sys/dia dashboard rows), display-term
+  // variants like "O/E - blood pressure reading", and journal-coded rows —
+  // and a first-hit find() silently dropped every reading outside whichever
+  // row came first (2026-09-21 live-consult miss: a same-day 119/86 under a
+  // second display name never rendered). Rows whose rawValues aren't
+  // "sys/dia" (e.g. the bare "Systolic blood pressure" row, which also
+  // substring-matches) contribute nothing because parseBp rejects them.
+  // Same-date collisions keep the FIRST row's reading — the synthesised
+  // "Blood pressure" row is ordered first by normaliseObservationHistory, so
+  // the dashboard stays authoritative.
+  const bpRows = history.filter((o) => BP_NAMES.some((n) => (o.name || '').toLowerCase().includes(n)));
+  const seenDates = new Set();
+  let pairs = [];
+  bpRows.forEach((row) => {
+    (row.history || []).forEach((h) => {
+      const bp = parseBp(h.rawValue);
+      if (!bp || seenDates.has(h.date)) return;
+      seenDates.add(h.date);
+      pairs.push({ date: h.date, bp });
+    });
+  });
+  // Oldest-first, matching the previous single-row `.reverse()` of the
+  // newest-first history contract.
+  pairs.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+  // Fallback: merge separate systolic/diastolic rows
+  if (pairs.length === 0) {
+    const sysRow = history.find((o) => /systolic\s+blood\s+pressure/i.test(o.name || ''));
+    const diaRow = history.find((o) => /diastolic\s+blood\s+pressure/i.test(o.name || ''));
+    if (sysRow && diaRow) {
+      const diaByDate = {};
+      (diaRow.history || []).forEach((h) => {
+        diaByDate[h.date] = h.rawValue;
+      });
+      pairs = (sysRow.history || [])
+        .filter((h) => diaByDate[h.date] != null)
+        .map((h) => ({ date: h.date, bp: parseBp(`${h.rawValue}/${diaByDate[h.date]}`) }))
+        .filter((p) => p.bp)
+        .reverse();
+    }
+  }
+
+  const age = computeAge(data.patientContext);
+  const registers = data.registers || [];
+  const acrRow = history.find((o) => ACR_NAMES.some((n) => (o.name || '').toLowerCase().includes(n)));
+  const latestAcr = acrRow?.history?.[0]?.value;
+  const acrOver70 = Number.isFinite(latestAcr) && latestAcr >= 70;
+  const target = bpTarget(registers, age, acrOver70);
+
+  const sysSeries = {
+    cls: 'tc-sys',
+    label: 'Systolic',
+    points: pairs.map((p) => ({ date: p.date, value: p.bp.systolic, flag: target && p.bp.systolic > target.sys })),
+  };
+  const diaSeries = {
+    cls: 'tc-dia',
+    label: 'Diastolic',
+    points: pairs.map((p) => ({ date: p.date, value: p.bp.diastolic, flag: target && p.bp.diastolic > target.dia })),
+  };
+  return { pairs, target, age, registers, series: [sysSeries, diaSeries] };
+}
+
+function computeAge(pc) {
+  if (!pc) return null;
+  if (Number.isFinite(pc.ageYears)) return pc.ageYears;
+  if (Number.isFinite(pc.age)) return pc.age;
+  const dob = pc.dob || pc.dateOfBirth;
+  if (!dob) return null;
+  const d = new Date(dob);
+  if (isNaN(d)) return null;
+  return Math.floor((Date.now() - d) / (365.25 * 24 * 3600 * 1000));
+}
+
+function renderBp(m) {
+  if (m.state === 'no-data' || !lastData) {
+    return `<div class="trends-msg">No blood pressure readings found for this patient.<br><span class="trends-hint">BP history is available once the investigation dashboard has been loaded in Medicus.</span></div>`;
+  }
+  const bm = buildBpModel(lastData);
+  if (!bm.pairs.length) {
+    return `<div class="trends-msg">No blood pressure readings found for this patient.<br><span class="trends-hint">BP history is available once the investigation dashboard has been loaded in Medicus.</span></div>`;
+  }
+
+  const latest = bm.pairs[bm.pairs.length - 1];
+  const t = bm.target;
+  const above = t && (latest.bp.systolic > t.sys || latest.bp.diastolic > t.dia);
+  const targets = t
+    ? [
+        { value: t.sys, label: `sys ≤${t.sys}` },
+        { value: t.dia, label: `dia ≤${t.dia}` },
+      ]
+    : [];
+  const registersHtml = bm.registers.length
+    ? bm.registers.map((r) => `<span class="bpt-reg">${esc(r.name || r.code)}</span>`).join('')
+    : '<span class="bpt-reg bpt-reg-none">No qualifying register</span>';
+  const paedNote =
+    bm.age != null && bm.age < 18
+      ? `<div class="bpt-note">⚠ Paediatric patient — adult thresholds shown. Use age/height centile charts to determine actual BP target.</div>`
+      : '';
+
+  return `
+    <div class="bpt-module">
+      <div class="bpt-head">
+        <span class="bpt-latest">${latest.bp.systolic}/${latest.bp.diastolic} <small>mmHg · ${esc(fmtDate(latest.date))}</small></span>
+        ${
+          t
+            ? `<span class="bpt-pill ${above ? 'bpt-above' : 'bpt-met'}">${above ? 'ABOVE TARGET' : 'AT TARGET'} · ≤${t.sys}/${t.dia} <span class="bpt-tgt-lbl">(${esc(t.label)})</span></span>`
+            : `<span class="bpt-pill bpt-neutral" title="BP targets apply to patients on the HYP, DM, CHD, Stroke/TIA or CKD registers">No BP target (no qualifying register)</span>`
+        }
+      </div>
+      <div class="bpt-registers">${registersHtml}</div>
+      ${paedNote}
+      ${lineChart({ series: bm.series, targets, yMin: 40, yMax: 200, unit: 'mmHg', title: 'Blood pressure trend' })}
+      <div class="bpt-legend">
+        <span class="bpt-key bpt-k-sys">Systolic</span>
+        <span class="bpt-key bpt-k-dia">Diastolic</span>
+        ${targets.length ? `<span class="bpt-key bpt-k-tgt">Target</span>` : ''}
+      </div>
+      ${t ? `<div class="bpt-foot">Default NICE/QOF thresholds — verify any personalised target in Medicus.</div>` : ''}
+      <div class="bpt-count">${bm.pairs.length} reading${bm.pairs.length !== 1 ? 's' : ''}</div>
+    </div>`;
+}
+
+// ── Renal ──────────────────────────────────────────────────────────────────────
+function buildRenalModel(data) {
+  const history = data.observationHistory || [];
+
+  const acrRow = history.find((o) => ACR_NAMES.some((n) => (o.name || '').toLowerCase().includes(n)));
+  const acrPts = (acrRow?.history || [])
+    .filter((h) => Number.isFinite(h.value))
+    .reverse()
+    .map((h) => ({ date: h.date, value: h.value }));
+
+  const egfrRow = history.find((o) => EGFR_NAMES.some((n) => (o.name || '').toLowerCase().includes(n)));
+  const egfrPts = (egfrRow?.history || [])
+    .filter((h) => Number.isFinite(h.value))
+    .reverse()
+    .map((h) => ({ date: h.date, value: h.value }));
+
+  const latestAcr = acrPts.length ? acrPts[acrPts.length - 1].value : null;
+  const prevAcr = acrPts.length > 1 ? acrPts[acrPts.length - 2].value : null;
+  const latestEgfr = egfrPts.length ? egfrPts[egfrPts.length - 1].value : null;
+
+  const gs = gStage(latestEgfr);
+  const as = aStage(latestAcr);
+  const kdigoFreq = gs && as ? KDIGO[gs]?.[as] : null;
+
+  const referralFlag = latestAcr != null && latestAcr >= 70;
+  const doublingFlag = latestAcr != null && prevAcr != null && latestAcr >= prevAcr * 2;
+  const crossingFlag =
+    prevAcr != null &&
+    latestAcr != null &&
+    aStage(prevAcr) !== as &&
+    ['A1', 'A2', 'A3'].indexOf(as) > ['A1', 'A2', 'A3'].indexOf(aStage(prevAcr));
+
+  const acrSeries = [
+    {
+      cls: 'tc-acr',
+      label: 'ACR',
+      points: acrPts.map((p) => ({
+        date: p.date,
+        value: Math.min(p.value, 100),
+        flag: p.value >= 30,
+        offScale: p.value > 100,
+      })),
+    },
+  ];
+  const acrBands = [
+    { lo: 0, hi: 3, cls: 'tc-a1' },
+    { lo: 3, hi: 30, cls: 'tc-a2' },
+    { lo: 30, hi: 100, cls: 'tc-a3' },
+  ];
+  const acrUnit = acrRow?.unit || 'mg/mmol';
+  const egfrUnit = egfrRow?.unit || 'mL/min/1.73m²';
+
+  return {
+    acrPts,
+    egfrPts,
+    latestAcr,
+    latestEgfr,
+    gs,
+    as,
+    kdigoFreq,
+    referralFlag,
+    doublingFlag,
+    crossingFlag,
+    acrSeries,
+    acrBands,
+    acrUnit,
+    egfrUnit,
+  };
+}
+
+function renderRenal(m) {
+  if (m.state === 'no-data' || !lastData) {
+    return `<div class="trends-msg">No ACR or eGFR data found for this patient.<br><span class="trends-hint">Data is available once the investigation dashboard has been loaded in Medicus.</span></div>`;
+  }
+  const rm = buildRenalModel(lastData);
+  if (!rm.acrPts.length && !rm.egfrPts.length) {
+    return `<div class="trends-msg">No ACR or eGFR data found for this patient.<br><span class="trends-hint">Data is available once the investigation dashboard has been loaded in Medicus.</span></div>`;
+  }
+
+  void rm.referralFlag;
+  const banners = [];
+  const kdigoHtml = '';
+
+  const latestHtml =
+    rm.acrPts.length || rm.egfrPts.length
+      ? `
+    <div class="acrt-head">
+      ${
+        rm.latestAcr != null
+          ? `<div class="acrt-val"><span class="acrt-num">${rm.latestAcr > 100 ? '>100' : rm.latestAcr.toFixed(1)}</span> <span class="acrt-unit">${esc(rm.acrUnit)} ACR</span></div>`
+          : `<div class="acrt-val acrt-no-val">No ACR data</div>`
+      }
+      ${
+        rm.latestEgfr != null
+          ? `<div class="acrt-val"><span class="acrt-num">${Math.round(rm.latestEgfr)}</span> <span class="acrt-unit">${esc(rm.egfrUnit)} eGFR</span></div>`
+          : `<div class="acrt-val acrt-no-val">No eGFR data</div>`
+      }
+      ${kdigoHtml}
+    </div>`
+      : '';
+
+  const acrChart = rm.acrPts.length
+    ? `<div class="acrt-section-lbl">ACR trend (mg/mmol) — values above 100 plotted at 100</div>` +
+      lineChart({
+        series: rm.acrSeries,
+        bands: rm.acrBands,
+        yMin: 0,
+        yMax: 100,
+        unit: rm.acrUnit,
+        title: 'ACR trend',
+      }) +
+      `<div class="acrt-band-legend"><span class="acrt-band-a1">A1 &lt;3</span><span class="acrt-band-a2">A2 3–30</span><span class="acrt-band-a3">A3 &gt;30</span></div>`
+    : `<div class="trends-msg" style="padding:10px 12px">No ACR readings available.</div>`;
+
+  const egfrBands = [
+    { lo: 90, hi: 200, cls: 'tc-g1' },
+    { lo: 60, hi: 90, cls: 'tc-g2' },
+    { lo: 45, hi: 60, cls: 'tc-g3a' },
+    { lo: 30, hi: 45, cls: 'tc-g3b' },
+    { lo: 15, hi: 30, cls: 'tc-g4' },
+    { lo: 0, hi: 15, cls: 'tc-g5' },
+  ];
+  const egfrChart = rm.egfrPts.length
+    ? `<div class="acrt-section-lbl">eGFR trend (mL/min/1.73m²)</div>` +
+      lineChart({
+        series: [{ cls: 'tc-egfr', label: 'eGFR', points: rm.egfrPts }],
+        bands: egfrBands,
+        yMin: 0,
+        yMax: 120,
+        unit: rm.egfrUnit,
+        title: 'eGFR trend',
+      })
+    : '';
+
+  const countBits = [
+    rm.acrPts.length ? `${rm.acrPts.length} ACR reading${rm.acrPts.length !== 1 ? 's' : ''}` : '',
+    rm.egfrPts.length ? `${rm.egfrPts.length} eGFR reading${rm.egfrPts.length !== 1 ? 's' : ''}` : '',
+  ].filter(Boolean);
+
+  return `
+    <div class="acrt-module">
+      ${banners.join('')}
+      ${latestHtml}
+      ${acrChart}
+      ${egfrChart}
+      <div class="acrt-count">${countBits.join(' · ')}</div>
+    </div>`;
+}
+
+// ── Observations (HbA1c / Cholesterol / Weight) ────────────────────────────────
+function seriesFor(metric, data) {
+  const history = data.observationHistory || [];
+  const row = history.find((o) => {
+    const name = (o.name || '').toLowerCase();
+    return metric.match.some((n) => name.includes(n)) && !metric.exclude.some((x) => name.includes(x));
+  });
+  const pts = (row?.history || [])
+    .filter((h) => Number.isFinite(h.value))
+    .slice()
+    .reverse()
+    .map((h) => ({ date: h.date, value: h.value }));
+  return { pts, unit: row?.unit || metric.unit };
+}
+
+function round(v) {
+  return Math.round(v * 10) / 10;
+}
+
+function renderObs(m) {
+  const metric = OBS_METRICS.find((x) => x.key === activeView()) || OBS_METRICS[0];
+  if (m.state === 'no-data' || !lastData) {
+    return `<div class="trends-msg">No observation data found for this patient.<br><span class="trends-hint">Data is available once the investigation dashboard has been loaded in Medicus.</span></div>`;
+  }
+  const { pts, unit } = seriesFor(metric, lastData);
+  if (!pts.length) {
+    return `<div class="trends-msg trends-msg-inline">No ${esc(metric.label)} readings recorded for this patient.</div>`;
+  }
+
+  const latest = pts[pts.length - 1];
+  const prev = pts.length > 1 ? pts[pts.length - 2] : null;
+  const delta = prev ? latest.value - prev.value : null;
+  const arrow = delta == null ? '' : delta > 0 ? '▲' : delta < 0 ? '▼' : '▬';
+  const deltaCls = delta == null ? '' : delta > 0 ? 'trends-up' : delta < 0 ? 'trends-down' : 'trends-flat';
+  const first = pts[0],
+    last = pts[pts.length - 1];
+  const chart = lineChart({
+    series: [{ cls: 'tc-trend', label: metric.label, points: pts }],
+    unit,
+    title: `${metric.label} trend`,
+  });
+
+  return `
+    <div class="trends-head">
+      <div class="trends-val">
+        <span class="trends-num">${esc(round(latest.value))}</span>
+        <span class="trends-unit">${esc(unit)}</span>
+        ${delta != null ? `<span class="trends-delta ${deltaCls}">${arrow} ${esc(round(Math.abs(delta)))}</span>` : ''}
+      </div>
+      <div class="trends-latest-date">latest ${esc(fmtDate(latest.date))}</div>
+    </div>
+    <div class="trends-section-lbl">${esc(metric.label)} (${esc(unit)})</div>
+    ${chart}
+    <div class="trends-count">${pts.length} reading${pts.length !== 1 ? 's' : ''} · ${esc(fmtDate(first.date))} – ${esc(fmtDate(last.date))}</div>`;
+}

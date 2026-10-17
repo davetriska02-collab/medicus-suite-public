@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Build artefacts (the GitHub Actions workflow creates these).
+# No exception: a tracked zip fails test-no-tracked-zips.js.
+*.zip
+
+# Local dev scratch (both forms: the directory AND a symlink to one — the
+# trailing-slash pattern alone lets a symlinked node_modules get committed)
+node_modules/
+node_modules
+*.log
+
+# Patient / sensitive data — NEVER commit
+data/sars/
+uploads/
+output/
+
+# Cowork skill staging — for the medicus-suite-deploy skill, copied to
+# /mnt/skills/user/ during repo setup. Not part of the repo itself.
+_skill/
+
+# Claude Code agent worktrees (scratch, never commit)
+.claude/worktrees/
+
+# design-sync (Claude Design) — transient build artifacts & deps; durable
+# inputs (design-system/ src, .design-sync/{config.json,conventions.md,previews})
+# ARE committed.
+.ds-sync/
+ds-bundle/
+/_screenshots/
+design-system/node_modules/
+design-system/dist/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+presence-config.json
+
+# StackChan device secrets (copy firmware/stackchan/secrets.h.example)
+firmware/stackchan/secrets.h
+firmware/stackchan/.pio/
