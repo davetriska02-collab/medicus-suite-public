@@ -11,7 +11,7 @@ All notable changes to Medicus Suite are documented here.
 - A green Pharmacy First chip is not shown when the same row already has a red-flag keyword chip.
 - The queue status bar (`0 red · 0 amber · checking N…`) is not painted. This version does not compute that severity. Options no longer says the queue shows red, amber or clear counts.
 
-H-026 and H-100 addenda in `docs/HAZARD-LOG.md` are unsigned. The signature lines are blank for Dr D. Triska, CSO, to sign at merge. The hazard-log product pin stays 4.0.0 until that signature. Document version stays 3.110.
+H-026 and H-100 addenda in `docs/HAZARD-LOG.md` are signed: Dr D. Triska, CSO, GMC 6159481, 1 Nov 2026. Residuals are unchanged. The hazard-log product pin moves to 4.0.1. `last_cso_review_version` does not move. Document version moves to 3.111.
 
 ## [v4.0.0] — 2026-10-16
 

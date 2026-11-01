@@ -98,16 +98,19 @@ const options = read('options/options.html');
 check(/no red, amber or clear count/.test(options), 'Options does not promise red/amber/clear counts');
 check(!/Queue status bar: red\/amber\/clear counts/.test(options), 'the old Options promise is gone');
 
-console.log('\n--- unsigned hazard addenda ---');
+console.log('\n--- signed hazard addenda ---');
 const hazard = read('docs/HAZARD-LOG.md');
 const h026 = hazard.split('### H-026 —')[1].split('### H-027 —')[0];
 const h100 = hazard.split('### H-100 —')[1].split('## 6. Hazard summary')[0];
-check(/UNSIGNED/.test(h026) && /Pharmacy First/.test(h026), 'H-026 has an unsigned Pharmacy First addendum');
+const signed = 'Dr D. Triska, CSO, GMC 6159481, 1 Nov 2026';
+check(!/UNSIGNED/.test(h026) && /Pharmacy First/.test(h026), 'H-026 Pharmacy First addendum is signed');
 check(/#b91c1c/.test(h026), 'H-026 records the chip ink change');
-check(/Signature: ________________________________/.test(h026), 'H-026 signature line is blank');
-check(/UNSIGNED/.test(h100) && /status bar/.test(h100), 'H-100 has an unsigned status-bar addendum');
-check(/Signature: ________________________________/.test(h100), 'H-100 signature line is blank');
-check(!/Signed: Dr D\. Triska, CSO, GMC 6159481, 1 Nov 2026/.test(h026), 'H-026 addendum is not pre-signed');
+check(h026.includes('Signature: ' + signed), 'H-026 signature line is signed');
+check(!/UNSIGNED/.test(h100) && /status bar/.test(h100), 'H-100 status-bar addendum is signed');
+check(h100.includes('Signature: ' + signed), 'H-100 signature line is signed');
+check(h026.includes('Signed: ' + signed), 'H-026 addendum records the CSO signature');
+check(/^\*\*Product version:\*\* 4\.0\.1/m.test(hazard), 'product pin is 4.0.1');
+check(/^\*\*Document version:\*\* 3\.111/m.test(hazard), 'hazard-log document version is 3.111');
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed === 0 ? 0 : 1);
