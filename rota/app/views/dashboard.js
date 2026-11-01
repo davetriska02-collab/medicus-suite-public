@@ -72,21 +72,30 @@ export default {
     const showChecklist =
       state.staff.length > 0 && !state.settings.checklistDismissed && checklist.some((item) => !item.done);
 
+    const dutyCard = (label, names) => {
+      const uncovered = names.length === 0;
+      const body = uncovered
+        ? '<p class="duty-line"><span class="status-word">Uncovered</span> No clinician assigned</p>'
+        : names.map((n) => `<p class="duty-line">${esc(n)} · ${esc(label)} · duty</p>`).join('');
+      return `<article class="card duty-card${uncovered ? ' card-warn' : ''}"><h2 class="mt0">${esc(label)} duty</h2>${body}</article>`;
+    };
+
     root.innerHTML = `
       <h1>Dashboard — ${esc(fmtDay(today))}</h1>
       ${showChecklist ? checklistHTML(checklist) : ''}
+      <h2>Duty cover</h2>
+      <div class="cards duty-cards">
+        ${dutyCard('AM', dutyToday.am)}
+        ${dutyCard('PM', dutyToday.pm)}
+      </div>
       <div class="cards">
-        <div class="card">
-          <div class="kpi ${dutyToday.am.length && dutyToday.pm.length ? 'good' : 'bad'}">${dutyToday.am.length && dutyToday.pm.length ? 'OK' : 'Gap'}</div>
-          <div class="sub">Duty today — AM: ${esc(dutyToday.am.join(', ') || 'nobody')} · PM: ${esc(dutyToday.pm.join(', ') || 'nobody')}</div>
-        </div>
         <div class="card"><div class="kpi ${high.length ? 'bad' : 'good'}">${high.length}</div><div class="sub">High-priority warnings this week</div></div>
         <div class="card"><div class="kpi ${vacancies.length ? 'bad' : 'good'}">${vacancies.length}</div><div class="sub">Upcoming sessions needing cover</div></div>
         <div class="card"><div class="kpi">${pending.length}</div><div class="sub">Leave requests awaiting decision</div></div>
         <div class="card"><div class="kpi ${cap.estimated >= cap.target ? 'good' : ''}">${cap.estimated}<span class="kpi-unit"> / ${cap.target}</span></div><div class="sub">GP appointments this week vs benchmark</div></div>
       </div>
 
-      ${onLeaveToday.length ? `<div class="card"><h2 class="mt0">On leave today</h2>${esc(onLeaveToday.join(', '))}</div>` : ''}
+      ${onLeaveToday.length ? `<div class="card"><h2 class="mt0">On leave today</h2>${onLeaveToday.map((n) => `<p class="duty-line">${esc(n)} · leave</p>`).join('')}</div>` : ''}
       ${
         sfe.length || fitFlags.length || bradfordFlagged.length
           ? `<div class="card">

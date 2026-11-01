@@ -1,8 +1,7 @@
 /* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
 /* Medicus Suite — Rota status module styles */
 /* Design tokens only (canon: .claude/skills/ui-design/TOKENS.md). The full rota
-   app has its own dark Atelier theme; this compact module must look like the
-   rest of the side panel, so nothing here is a raw hex value. */
+   app uses the same slate tokens, in light and dark. Nothing here is a raw hex. */
 
 .rota-module {
   font-family: var(--sans);

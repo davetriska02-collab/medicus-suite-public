@@ -264,8 +264,9 @@ assert(UC.isNewer('', '1.3.0') === false, 'empty latest never newer');
     'README download link is the public releases page'
   );
 
-  // The public tree omits GitHub workflows. When the file is present, it must
-  // address the repository it runs in and must not hardcode a slug.
+  // The public tree does not ship CI workflows. When release.yml is present it
+  // must address the repository it runs in, and must not name a private slug.
+  // When it is absent, record that and do not throw.
   const releasePath = './.github/workflows/release.yml';
   if (fs.existsSync(releasePath)) {
     const releaseYml = fs.readFileSync(releasePath, 'utf8');
@@ -274,6 +275,8 @@ assert(UC.isNewer('', '1.3.0') === false, 'empty latest never newer');
       !releaseYml.includes('davetriska02-collab/medicus-suite'),
       'release workflow does not hardcode a repository slug'
     );
+  } else {
+    assert(true, 'release workflow is not in this tree');
   }
 
   console.log(`\n--- Results: ${passed} passed, ${failed} failed ---\n`);

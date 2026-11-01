@@ -1,0 +1,119 @@
+/* Medicus Suite slate tokens — the side-panel canon, without the panel layout.
+   Values match side-panel/panel.css :root and html[data-theme='dark'].
+   Import this file. Do not restate the hex in a component rule.
+   Light is the default. Dark applies when the suite sets data-theme="dark"
+   (shared/display-prefs.js, the same path as the side panel) or, when no
+   theme has been chosen, when the system prefers dark. */
+
+:root {
+  --bg-deep: #f8fafc;
+  --bg-mid: #f1f5f9;
+  --bg-elev: #ffffff;
+  --bg-hover: #e2eaf5;
+  --border: #cbd5e1;
+  --border-hi: #94a3b8;
+  --text-1: #0f172a;
+  --text-2: #1e3a5f;
+  --text-3: #475569;
+  --text-4: #556377;
+  --text-5: #5f6f85;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-dim: rgba(37, 99, 235, 0.09);
+  --accent-line: rgba(37, 99, 235, 0.3);
+  --green: #166534;
+  --green-dim: rgba(22, 101, 52, 0.09);
+  --green-line: rgba(22, 101, 52, 0.3);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
+  --red: #b91c1c;
+  --red-dim: rgba(185, 28, 28, 0.08);
+  --red-line: rgba(185, 28, 28, 0.3);
+  --violet: #7c3aed;
+  --violet-dim: rgba(124, 58, 237, 0.09);
+  --violet-line: rgba(124, 58, 237, 0.3);
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-pill: 999px;
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-2: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.14);
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --med: 200ms;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --scrim: rgba(15, 23, 42, 0.55);
+}
+
+html[data-theme='dark'] {
+  --bg-deep: #050a14;
+  --bg-mid: #0b1424;
+  --bg-elev: #131e34;
+  --bg-hover: #1a2a44;
+  --border: #1c2e4e;
+  --border-hi: #2a4060;
+  --text-1: #f1f5f9;
+  --text-2: #cfe1ff;
+  --text-3: #93a8c5;
+  --text-4: #7d97b5;
+  --text-5: #6c89ac;
+  --accent: #5b8fc7;
+  --accent-hover: #7eaad6;
+  --accent-dim: rgba(91, 143, 199, 0.14);
+  --accent-line: rgba(91, 143, 199, 0.35);
+  --green: #4ade80;
+  --green-dim: rgba(74, 222, 128, 0.12);
+  --green-line: rgba(74, 222, 128, 0.32);
+  --amber: #fbbf24;
+  --amber-dim: rgba(251, 191, 36, 0.16);
+  --amber-line: rgba(251, 191, 36, 0.32);
+  --red: #f87171;
+  --red-dim: rgba(248, 113, 113, 0.17);
+  --red-line: rgba(248, 113, 113, 0.34);
+  --violet: #a78bfa;
+  --violet-dim: rgba(167, 139, 250, 0.14);
+  --violet-line: rgba(167, 139, 250, 0.35);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 10px 32px rgba(0, 0, 0, 0.55);
+  --scrim: rgba(0, 0, 0, 0.66);
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme='light']):not([data-theme='dark']) {
+    --bg-deep: #050a14;
+    --bg-mid: #0b1424;
+    --bg-elev: #131e34;
+    --bg-hover: #1a2a44;
+    --border: #1c2e4e;
+    --border-hi: #2a4060;
+    --text-1: #f1f5f9;
+    --text-2: #cfe1ff;
+    --text-3: #93a8c5;
+    --text-4: #7d97b5;
+    --text-5: #6c89ac;
+    --accent: #5b8fc7;
+    --accent-hover: #7eaad6;
+    --accent-dim: rgba(91, 143, 199, 0.14);
+    --accent-line: rgba(91, 143, 199, 0.35);
+    --green: #4ade80;
+    --green-dim: rgba(74, 222, 128, 0.12);
+    --green-line: rgba(74, 222, 128, 0.32);
+    --amber: #fbbf24;
+    --amber-dim: rgba(251, 191, 36, 0.16);
+    --amber-line: rgba(251, 191, 36, 0.32);
+    --red: #f87171;
+    --red-dim: rgba(248, 113, 113, 0.17);
+    --red-line: rgba(248, 113, 113, 0.34);
+    --violet: #a78bfa;
+    --violet-dim: rgba(167, 139, 250, 0.14);
+    --violet-line: rgba(167, 139, 250, 0.35);
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-3: 0 10px 32px rgba(0, 0, 0, 0.55);
+    --scrim: rgba(0, 0, 0, 0.66);
+  }
+}
