@@ -19,15 +19,15 @@
   --accent-hover: #1d4ed8;
   --accent-dim: rgba(37, 99, 235, 0.09);
   --accent-line: rgba(37, 99, 235, 0.3);
-  --green: #16a34a;
-  --green-dim: rgba(22, 163, 74, 0.09);
-  --green-line: rgba(22, 163, 74, 0.3);
-  --amber: #b45309;
-  --amber-dim: rgba(180, 83, 9, 0.09);
-  --amber-line: rgba(180, 83, 9, 0.32);
-  --red: #dc2626;
-  --red-dim: rgba(220, 38, 38, 0.08);
-  --red-line: rgba(220, 38, 38, 0.3);
+  --green: #166534;
+  --green-dim: rgba(22, 101, 52, 0.09);
+  --green-line: rgba(22, 101, 52, 0.3);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
+  --red: #b91c1c;
+  --red-dim: rgba(185, 28, 28, 0.08);
+  --red-line: rgba(185, 28, 28, 0.3);
   --violet: #7c3aed;
   --violet-dim: rgba(124, 58, 237, 0.09);
   --violet-line: rgba(124, 58, 237, 0.3);
@@ -98,9 +98,9 @@
 
 #ms-wl.ms-wl-colorblind,
 #ms-wl[data-colorblind='true'] {
-  --red: #ea580c;
-  --red-dim: rgba(234, 88, 12, 0.08);
-  --red-line: rgba(234, 88, 12, 0.3);
+  --red: #9a3412;
+  --red-dim: rgba(154, 52, 18, 0.08);
+  --red-line: rgba(154, 52, 18, 0.3);
   --green: #2563eb;
   --green-dim: rgba(37, 99, 235, 0.09);
   --green-line: rgba(37, 99, 235, 0.3);

@@ -1362,8 +1362,14 @@ console.log('--- source of truth: row tokens reuse banner pipeline, not a second
   );
   check(/resetPresenceInjectState\(\)/.test(src), 'href change resets wipe counters and overlay mode');
   check(
-    /\.ms-tp-chips \.ms-tp-token[\s\S]*background:\s*var\(--ms-tp-wash/.test(css),
-    'list token uses the fluoro wash'
+    /\.ms-tp-chips \.ms-tp-token[\s\S]*background:\s*var\(--amber-dim\)/.test(css),
+    'list token uses the amber wash'
+  );
+  check(/\.ms-tp-chips \.ms-tp-token[\s\S]*color:\s*var\(--amber\)/.test(css), 'list token ink is amber');
+  check(/font-size:\s*12px/.test(css), 'presence text has a 12px size');
+  check(
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*transition-duration:\s*0s/.test(css),
+    'presence motion is zero under reduced motion'
   );
   check(/ms-tp-token-status/.test(css), 'list token status word is styled');
   check(!/\.ms-tp-chips[\s\S]{0,80}ch-queue-chips/.test(src), 'presence inject does not target triage chips');

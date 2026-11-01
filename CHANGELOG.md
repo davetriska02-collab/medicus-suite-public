@@ -2,6 +2,17 @@
 
 All notable changes to Medicus Suite are documented here.
 
+## [v4.0.1] — 2026-11-01
+
+### Request row ink, Pharmacy First next to a red flag, and the stuck count bar
+
+- Light status ink is green `#166534`, red `#b91c1c` and amber `#9a3412`, in the panel and on the injected queue, presence and workload surfaces, and in the design-system tokens. Dark ink is unchanged. Colour-blind red is `#9a3412`. Design-system `--text-4` and `--text-5` match the panel (`#556377`, `#5f6f85`).
+- The request-row presence token uses the amber wash and that amber ink, pill radius, label 12px/600, initials at 12px. The row token sizes to that label (the shared token is an inline-size container, which had been clipping "Open" and the name). Chips are 12px/600. A red-flag chip keeps a triangle and the word. Colour transitions are 120ms and opacity 200ms, both zero when reduced motion is requested.
+- A green Pharmacy First chip is not shown when the same row already has a red-flag keyword chip.
+- The queue status bar (`0 red · 0 amber · checking N…`) is not painted. This version does not compute that severity. Options no longer says the queue shows red, amber or clear counts.
+
+H-026 and H-100 addenda in `docs/HAZARD-LOG.md` are unsigned. The signature lines are blank for Dr D. Triska, CSO, to sign at merge. The hazard-log product pin stays 4.0.0 until that signature. Document version stays 3.110.
+
 ## [v4.0.0] — 2026-10-16
 
 ### Clinical judgements, recommendations and calculations withdrawn
