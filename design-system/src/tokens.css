@@ -14,8 +14,8 @@
   --text-1: #0f172a;
   --text-2: #1e3a5f;
   --text-3: #475569;
-  --text-4: #64748b;
-  --text-5: #94a3b8;
+  --text-4: #556377;
+  --text-5: #5f6f85;
   --scrim: rgba(15, 23, 42, 0.55);
 
   /* Accent & status triads — ink / wash / line */
@@ -23,15 +23,15 @@
   --accent-dim: rgba(37, 99, 235, 0.09);
   --accent-line: rgba(37, 99, 235, 0.3);
   --accent-hover: #1d4ed8;
-  --green: #16a34a;
-  --green-dim: rgba(22, 163, 74, 0.09);
-  --green-line: rgba(22, 163, 74, 0.3);
-  --amber: #b45309;
-  --amber-dim: rgba(180, 83, 9, 0.09);
-  --amber-line: rgba(180, 83, 9, 0.32);
-  --red: #dc2626;
-  --red-dim: rgba(220, 38, 38, 0.08);
-  --red-line: rgba(220, 38, 38, 0.3);
+  --green: #166534;
+  --green-dim: rgba(22, 101, 52, 0.09);
+  --green-line: rgba(22, 101, 52, 0.3);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
+  --red: #b91c1c;
+  --red-dim: rgba(185, 28, 28, 0.08);
+  --red-line: rgba(185, 28, 28, 0.3);
   --violet: #7c3aed;
   --violet-dim: rgba(124, 58, 237, 0.09);
   --violet-line: rgba(124, 58, 237, 0.3);
@@ -82,12 +82,12 @@ html[data-theme='dark'] {
   --violet-line: rgba(167, 139, 250, 0.35);
 }
 
-/* Colorblind mode re-points the whole red and green triads (red→orange,
+/* Colorblind mode re-points the whole red and green triads (red→#9a3412,
    green→blue). Components built from triads inherit the swap for free. */
 html[data-colorblind='true'] {
-  --red: #ea580c;
-  --red-dim: rgba(234, 88, 12, 0.1);
-  --red-line: rgba(234, 88, 12, 0.32);
+  --red: #9a3412;
+  --red-dim: rgba(154, 52, 18, 0.1);
+  --red-line: rgba(154, 52, 18, 0.32);
   --green: #2563eb;
   --green-dim: rgba(37, 99, 235, 0.09);
   --green-line: rgba(37, 99, 235, 0.3);

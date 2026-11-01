@@ -266,6 +266,7 @@ assert(UC.isNewer('', '1.3.0') === false, 'empty latest never newer');
 
   // The public tree does not ship CI workflows. When release.yml is present it
   // must address the repository it runs in, and must not name a private slug.
+  // When it is absent, record that and do not throw.
   const releasePath = './.github/workflows/release.yml';
   if (fs.existsSync(releasePath)) {
     const releaseYml = fs.readFileSync(releasePath, 'utf8');

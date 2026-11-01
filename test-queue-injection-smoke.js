@@ -1631,11 +1631,11 @@ if (sandbox) {
   }
 
   // ============================================================
-  // Layer 11 — queue status bar: create-once/mutate-in-place, de-dupe,
-  // omitted-zero-segments text, "still checking" indicator, PREF gate,
-  // tooltip carries the honesty line, rAF-coalesced updateQueueStatusBar.
+  // Layer 11 — queue status bar is not painted. v4.0.0 never writes a
+  // severity, so the old "0 red · 0 amber · checking N…" line implied a
+  // grade that does not run (H-100).
   // ============================================================
-  console.log('\nLayer 11: queue status bar — render, de-dupe, update-in-place, omitted segments, PREF gate');
+  console.log('\nLayer 11: queue status bar is not rendered');
 
   {
     freshCaches();
@@ -1648,128 +1648,45 @@ if (sandbox) {
     sandbox.queueObservedContainer = gridRoot;
     sandbox._durableRowMap.set(0, rowIdRed);
     sandbox._queueResultCache.set(rowIdRed, { sev: redSev, ts: Date.now() });
+    sandbox._durableRowMap.set(1, 'b0000000-0000-4000-8000-000000000003');
 
-    sandbox.renderQueueStatusBar();
-    const bar1 = sandbox.document.getElementById('ch-q-status-bar');
-    check(!!bar1, 'renderQueueStatusBar: bar element created and appended');
-    check(bar1 && bar1.classes.includes('ch-q-status'), 'bar carries the ch-q-status class');
-    check(bar1 && bar1.attrs.role === 'status', 'bar has role="status"');
-    check(bar1 && bar1.attrs['aria-live'] === 'off', 'bar has aria-live="off" (counts change too often for "polite")');
-    check(
-      bar1 && /not been assessed as normal/.test(bar1.title || ''),
-      "bar tooltip carries the old legend's honesty line"
-    );
-    const countsEl1 = bar1 && bar1.querySelector('.ch-q-status-counts');
-    check(
-      countsEl1 && countsEl1.textContent === '1 red · 0 amber',
-      `bar text with only a red present, zero everything else: "1 red · 0 amber", zero segments omitted (got: ${countsEl1 && countsEl1.textContent})`
-    );
-    check(
-      !bar1.classes.includes('ch-q-status--checking'),
-      'no checking rows: the "still working" indicator class is absent'
-    );
-
-    sandbox.renderQueueStatusBar();
-    const bar2 = sandbox.document.getElementById('ch-q-status-bar');
-    check(bar2 === bar1, 'de-dupe: calling renderQueueStatusBar again does not create a second bar node');
-    check(
-      sandbox.document.querySelectorAll('.ch-q-status').length === 1,
-      'de-dupe: exactly one .ch-q-status element exists in the document'
-    );
-
-    // ---- update-in-place: same node reference, text mutates to reflect a new picture ----
-    const rowIdAmber = 'b0000000-0000-4000-8000-000000000002';
-    const rowAmber = buildPreviewRowPair({ rowIndex: 1, rowId: rowIdAmber, dob: '01 Jan 1980 (46y)' });
-    gridRoot.appendChild(rowAmber.master);
-    gridRoot.appendChild(rowAmber.detail);
-    sandbox._durableRowMap.set(1, rowIdAmber);
-    sandbox._queueResultCache.set(rowIdAmber, { sev: null, error: true, ts: Date.now() }); // "couldn't check"
-    sandbox.renderQueueStatusBar();
-    const bar3 = sandbox.document.getElementById('ch-q-status-bar');
-    check(bar3 === bar1, 'update-in-place: still the SAME node reference after the underlying counts changed');
-    const countsEl3 = bar3.querySelector('.ch-q-status-counts');
-    check(
-      countsEl3.textContent === '1 red · 0 amber · 1 ?',
-      `bar text updates in place to include the new "?" segment, clear stays omitted (got: ${countsEl3.textContent})`
-    );
-
-    // ---- "still checking" — a known row with no live cache entry ----
-    const rowIdChecking = 'b0000000-0000-4000-8000-000000000003';
-    const rowChecking = buildPreviewRowPair({ rowIndex: 2, rowId: rowIdChecking, dob: '01 Jan 1980 (46y)' });
-    gridRoot.appendChild(rowChecking.master);
-    gridRoot.appendChild(rowChecking.detail);
-    sandbox._durableRowMap.set(2, rowIdChecking); // no cache entry at all yet
-    sandbox.renderQueueStatusBar();
-    const bar4 = sandbox.document.getElementById('ch-q-status-bar');
-    const countsEl4 = bar4.querySelector('.ch-q-status-counts');
-    check(
-      countsEl4.textContent === '1 red · 0 amber · 1 ? · checking 1…',
-      `"checking" segment appended last, with the ellipsis (got: ${countsEl4.textContent})`
-    );
-    check(
-      bar4.classes.includes('ch-q-status--checking'),
-      'checking > 0: the "still working" indicator class is present'
-    );
-
-    // ---- PREF gate: prefs.queueStatusBar=false removes the bar ----
-    sandbox.CONFIG = { prefs: { queueStatusBar: false } };
     sandbox.renderQueueStatusBar();
     check(
       sandbox.document.getElementById('ch-q-status-bar') === null,
-      'prefs.queueStatusBar=false: renderQueueStatusBar removes any existing bar and renders nothing'
+      'renderQueueStatusBar does not create the status bar, even with a cached red and an uncached row'
+    );
+    check(
+      sandbox.document.querySelectorAll('.ch-q-status').length === 0,
+      'no .ch-q-status element is in the document'
+    );
+    check(
+      !/checking \d|0 red · 0 amber/.test(sandbox.document.body.textContent || ''),
+      'the body does not contain a red/amber/checking count'
+    );
+
+    sandbox.ensureQueueStatusBarEl();
+    check(
+      sandbox.document.getElementById('ch-q-status-bar') === null,
+      'ensureQueueStatusBarEl does not insert the bar either'
+    );
+
+    sandbox.CONFIG = { prefs: { queueStatusBar: true } };
+    sandbox.renderQueueStatusBar();
+    sandbox.updateQueueStatusBar();
+    check(
+      sandbox.document.getElementById('ch-q-status-bar') === null,
+      'prefs.queueStatusBar=true still does not paint the bar'
     );
     sandbox.CONFIG = {};
-
-    // ---- updateQueueStatusBar: rAF-coalesced — N calls in one frame render ONCE ----
-    freshCaches();
-    const rowIdCoalesce = 'b0000000-0000-4000-8000-000000000004';
-    const rowCoalesce = buildPreviewRowPair({ rowIndex: 0, rowId: rowIdCoalesce, dob: '01 Jan 1980 (46y)' });
-    const gridRootC = new El('div', {});
-    gridRootC.appendChild(rowCoalesce.master);
-    gridRootC.appendChild(rowCoalesce.detail);
-    sandbox.document = makeDocument(gridRootC);
-    sandbox.queueObservedContainer = gridRootC;
-    sandbox._durableRowMap.set(0, rowIdCoalesce);
-    sandbox._queueResultCache.set(rowIdCoalesce, { sev: redSev, ts: Date.now() });
-
-    let rafCalls = 0;
-    const queuedRaf = [];
-    sandbox.requestAnimationFrame = (fn) => {
-      rafCalls++;
-      queuedRaf.push(fn);
-    };
-    sandbox.updateQueueStatusBar();
-    sandbox.updateQueueStatusBar();
-    sandbox.updateQueueStatusBar();
-    check(
-      rafCalls === 1,
-      `three updateQueueStatusBar() calls before a frame runs schedule only ONE rAF (got ${rafCalls})`
-    );
-    check(
-      sandbox.document.getElementById('ch-q-status-bar') === null,
-      'nothing rendered yet — the coalesced render is still pending the (stubbed) animation frame'
-    );
-    queuedRaf.forEach((fn) => fn());
-    check(
-      !!sandbox.document.getElementById('ch-q-status-bar'),
-      'once the frame runs, the coalesced render has happened'
-    );
-    sandbox.updateQueueStatusBar();
-    check(
-      rafCalls === 2,
-      'after the pending flag is cleared, a further call schedules a new rAF (not swallowed forever)'
-    );
-    queuedRaf.pop()();
-    sandbox.requestAnimationFrame = (fn) => fn(); // restore the synchronous stub for later layers
+    sandbox.requestAnimationFrame = (fn) => fn();
   }
 
   // ============================================================
-  // Layer 12 — focus-alerts toggle (item 1.2): class on document.body (the
-  // stable element, per applyQueueFocusClass's own reasoning), button
-  // ARIA/visual state, OFF by default, and the class-composition proof that
-  // the dim CSS rule excludes tinted rows (including preview rows).
+  // Layer 12 — the focus-alerts button lived on the status bar. The bar
+  // is not painted, so render does not add the dim class, and a cached
+  // result still does not tint the row.
   // ============================================================
-  console.log('\nLayer 12: focus-alerts toggle — body class, button ARIA state, OFF by default, tint-class exclusion');
+  console.log('\nLayer 12: status bar gone — no focus button, no dim class from render');
 
   {
     freshCaches();
@@ -1786,34 +1703,19 @@ if (sandbox) {
     sandbox.queueObservedContainer = gridRoot;
     sandbox._durableRowMap.set(0, rowIdRed);
     sandbox._queueResultCache.set(rowIdRed, { sev: redSev, ts: Date.now() });
-    sandbox.reapplyQueueRowTint(); // rowRed (+ its preview row) now carries ch-row-sev-red; rowCalm carries neither
+    sandbox.reapplyQueueRowTint();
 
     sandbox.renderQueueStatusBar();
-    const bar = sandbox.document.getElementById('ch-q-status-bar');
-    const focusBtn = bar.querySelector('.ch-q-status-focus');
-    check(!!focusBtn, 'status bar has a focus-alerts button');
-    check(focusBtn.attrs['aria-pressed'] === 'false', 'focus-alerts starts OFF (aria-pressed=false) by default');
+    check(sandbox.document.getElementById('ch-q-status-bar') === null, 'no status bar, so no focus-alerts button');
     check(
       !sandbox.document.body.classes.includes('ch-q-focus-alerts'),
-      'OFF by default: document.body does not carry the focus class yet'
+      'render does not put the focus-dim class on document.body'
     );
-
-    sandbox.onQueueStatusFocusClick({ currentTarget: focusBtn });
-    check(
-      sandbox.document.body.classes.includes('ch-q-focus-alerts'),
-      'clicking focus-alerts adds the class to document.body — the stable element, not the (re-buildable) grid container'
-    );
-    check(focusBtn.attrs['aria-pressed'] === 'true', 'button aria-pressed flips to true');
-    check(focusBtn.classes.includes('ch-q-status-btn-active'), 'button gets the active visual class');
-
-    // ---- class-composition proof for the dim CSS rule ----
-    // `.ch-q-focus-alerts .ag-row:not(.ch-row-sev-red):not(.ch-row-sev-amber)` —
-    // assert the class SETS the rule keys off, not computed opacity (per task).
     check(
       rowCalm.master.classes.includes('ag-row') &&
         !rowCalm.master.classes.includes('ch-row-sev-red') &&
         !rowCalm.master.classes.includes('ch-row-sev-amber'),
-      'untinted row: carries neither tint class, so the :not()/:not() dim selector MATCHES it (would be dimmed)'
+      'untinted row carries neither tint class'
     );
     check(
       !rowRed.master.classes.includes('ch-row-sev-red'),
@@ -1823,143 +1725,37 @@ if (sandbox) {
       !rowRed.detail.classes.includes('ch-row-sev-red'),
       'result tint is not in this build: the preview row is not marked either'
     );
-
-    sandbox.onQueueStatusFocusClick({ currentTarget: focusBtn });
-    check(
-      !sandbox.document.body.classes.includes('ch-q-focus-alerts'),
-      'clicking again removes the class from document.body'
-    );
-    check(focusBtn.attrs['aria-pressed'] === 'false', 'button aria-pressed flips back to false');
-    check(!focusBtn.classes.includes('ch-q-status-btn-active'), 'button loses the active visual class');
-
-    // A brand-new bar element (bar torn down + recreated across a queue re-visit)
-    // must reflect the CURRENT toggle state on its own fresh button, not always
-    // default to OFF — renderQueueStatusBar syncs this every render.
-    sandbox.onQueueStatusFocusClick({ currentTarget: focusBtn }); // toggle back ON
-    sandbox.removeQueueStatusBar();
-    sandbox.renderQueueStatusBar();
-    const bar2 = sandbox.document.getElementById('ch-q-status-bar');
-    const focusBtn2 = bar2.querySelector('.ch-q-status-focus');
-    check(
-      focusBtn2.attrs['aria-pressed'] === 'true',
-      'a freshly (re)created bar syncs its focus button to the still-ON session-local toggle state'
-    );
-    sandbox.onQueueStatusFocusClick({ currentTarget: focusBtn2 }); // leave state OFF for later layers
-
-    // ---- practice-packs gate (a colleague's request, 2026-09-10; corrected same
-    // day to cover the WHOLE bar, not just this button): with no
-    // window.PracticePacks (this harness's default sandbox), _focusAlertsPackOn
-    // stays at its grandfathered-ON fallback for the process lifetime — the
-    // real bindInjector on/off lifecycle only runs behind `window.PracticePacks
-    // && window.PracticePacks.bindInjector`, which is deliberately not stubbed
-    // here (this harness tests injection mechanics, not the pack plumbing
-    // itself — that's covered by source-pattern checks in
-    // test-practice-features.js, matching every other bindInjector-gated
-    // pack in this codebase). This just confirms the default-ON fallback
-    // leaves the whole bar intact.
-    check(!!bar2, 'default sandbox (no window.PracticePacks): the status bar still renders — grandfathered ON');
-    check(!focusBtn2.hidden, 'and the focus button within it is visible');
   }
 
   // ============================================================
-  // Layer 13 — jump-to-next-alert button (item 1.2): scrollIntoView + flash
-  // on the right row (and its preview row), ascending cycle order, wrap,
-  // jump-cycle reset when the aggregate red/amber picture materially changes,
-  // disabled/label state.
+  // Layer 13 — the jump button lived on the status bar. Rendering does
+  // not create it and does not flash a row.
   // ============================================================
-  console.log(
-    '\nLayer 13: jump-to-next-alert — scrollIntoView + flash, ascending cycle, wrap, reset-on-material-change'
-  );
+  console.log('\nLayer 13: status bar gone — no jump button, no flash');
 
   {
     freshCaches();
-    const rowIdRedA = 'd0000000-0000-4000-8000-000000000001'; // row-index 0
-    const rowIdAmber = 'd0000000-0000-4000-8000-000000000002'; // row-index 1
-    const rowIdRedB = 'd0000000-0000-4000-8000-000000000003'; // row-index 2
+    const rowIdRedA = 'd0000000-0000-4000-8000-000000000001';
     const rowRedA = buildPreviewRowPair({ rowIndex: 0, rowId: rowIdRedA, dob: '01 Jan 1980 (46y)' });
-    const rowAmber = buildPreviewRowPair({ rowIndex: 1, rowId: rowIdAmber, dob: '01 Jan 1980 (46y)' });
-    const rowRedB = buildPreviewRowPair({ rowIndex: 2, rowId: rowIdRedB, dob: '01 Jan 1980 (46y)' });
     const gridRoot = new El('div', {});
-    [rowRedA, rowAmber, rowRedB].forEach(({ master, detail }) => {
-      gridRoot.appendChild(master);
-      gridRoot.appendChild(detail);
-    });
+    gridRoot.appendChild(rowRedA.master);
+    gridRoot.appendChild(rowRedA.detail);
     sandbox.document = makeDocument(gridRoot);
     sandbox.queueObservedContainer = gridRoot;
     sandbox._durableRowMap.set(0, rowIdRedA);
-    sandbox._durableRowMap.set(1, rowIdAmber);
-    sandbox._durableRowMap.set(2, rowIdRedB);
     sandbox._queueResultCache.set(rowIdRedA, { sev: redSev, ts: Date.now() });
-    sandbox._queueResultCache.set(rowIdAmber, { sev: amberSev, ts: Date.now() });
-    sandbox._queueResultCache.set(rowIdRedB, { sev: redSev, ts: Date.now() });
-    sandbox.reapplyQueueRowTint();
-
-    const scrollCalls = { a: [], b: [] };
-    rowRedA.master.scrollIntoView = (opts) => scrollCalls.a.push(opts);
-    rowRedB.master.scrollIntoView = (opts) => scrollCalls.b.push(opts);
-
-    sandbox.renderQueueStatusBar();
-    const jumpBtn = sandbox.document.getElementById('ch-q-status-bar').querySelector('.ch-q-status-jump');
-    check(jumpBtn.disabled, 'cached result severities do not enable jump (result tint is not in this build)');
-    check(
-      jumpBtn.textContent === '▶ red',
-      'the jump label can still name red from the count, but the button stays disabled'
-    );
-
-    sandbox.onQueueStatusJumpClick();
-    sandbox.onQueueStatusJumpClick();
-    sandbox.onQueueStatusJumpClick();
-    check(scrollCalls.a.length === 0 && scrollCalls.b.length === 0, 'jump does not scroll a row that was not tinted');
-    check(!rowRedA.master.classes.includes('ch-q-status-flash'), 'an untinted cached-red row is not flashed');
-    check(!rowRedA.detail.classes.includes('ch-q-status-flash'), 'the preview row is not flashed either');
-
-    // ---- reset-on-material-change: a new red row changes the aggregate picture ----
-    const rowIdRedC = 'd0000000-0000-4000-8000-000000000004';
-    const rowRedC = buildPreviewRowPair({ rowIndex: 3, rowId: rowIdRedC, dob: '01 Jan 1980 (46y)' });
-    gridRoot.appendChild(rowRedC.master);
-    gridRoot.appendChild(rowRedC.detail);
-    sandbox._durableRowMap.set(3, rowIdRedC);
-    sandbox._queueResultCache.set(rowIdRedC, { sev: redSev, ts: Date.now() });
-    sandbox.reapplyQueueRowTint();
-    const scrollCallsC = [];
-    rowRedC.master.scrollIntoView = (opts) => scrollCallsC.push(opts);
-
-    // Without a render in between, the cycle would simply continue (row 0 was
-    // the last jump target -> next ascending red is row 2). Rendering first is
-    // what detects the red-count change (3 -> 4) and resets the cycle.
-    sandbox.renderQueueStatusBar();
-    sandbox.onQueueStatusJumpClick();
-    check(
-      scrollCalls.a.length === 0 && scrollCalls.b.length === 0 && scrollCallsC.length === 0,
-      'a newly cached red row is still not jumped to'
-    );
-
-    // ---- zero alerts: button disabled, safe no-op click ----
-    freshCaches();
-    const rowIdCalm = 'd0000000-0000-4000-8000-000000000005';
-    const rowCalm = buildPreviewRowPair({ rowIndex: 0, rowId: rowIdCalm, dob: '01 Jan 1980 (46y)' });
-    const gridRoot2 = new El('div', {});
-    gridRoot2.appendChild(rowCalm.master);
-    gridRoot2.appendChild(rowCalm.detail);
-    sandbox.document = makeDocument(gridRoot2);
-    sandbox.queueObservedContainer = gridRoot2;
-    sandbox._durableRowMap.set(0, rowIdCalm);
-    sandbox._queueResultCache.set(rowIdCalm, { sev: noneSev, ts: Date.now() });
     sandbox.reapplyQueueRowTint();
     sandbox.renderQueueStatusBar();
-    const jumpBtn2 = sandbox.document.getElementById('ch-q-status-bar').querySelector('.ch-q-status-jump');
-    check(jumpBtn2.disabled, 'no red or amber rows: jump button is disabled');
+    check(sandbox.document.getElementById('ch-q-status-bar') === null, 'no jump button, because there is no status bar');
+    check(!rowRedA.master.classes.includes('ch-q-status-flash'), 'render does not flash a cached-red row');
     let threw = false;
     try {
       sandbox.onQueueStatusJumpClick();
     } catch (e) {
       threw = true;
     }
-    check(
-      !threw,
-      'clicking the (disabled, but content.js does not rely on the DOM disabled attribute alone) jump handler with nothing to jump to is a safe no-op'
-    );
-    check(!rowCalm.master.classes.includes('ch-q-status-flash'), 'no-op click: the calm row is never flashed');
+    check(!threw, 'the jump handler with nothing tinted is a safe no-op');
+    check(!rowRedA.master.classes.includes('ch-q-status-flash'), 'the no-op does not flash the row');
   }
 
   // ============================================================
@@ -3656,6 +3452,39 @@ if (sandbox) {
     check(
       !wrapE.querySelectorAll('.ch-q-rule-chip').some((c) => /Pharmacy First|Ask-back/.test(c.textContent)),
       '_receptionPathwaysData still null (fetch not yet resolved): pathway-chip block is a safe no-op, no throw'
+    );
+
+    // ---- a red-flag keyword chip on the same row suppresses the green
+    //      Pharmacy First chip. An amber keyword chip does not. ----
+    freshCaches();
+    mockClipboard();
+    sandbox.matchRules = () => [mkRule('chest-pain', 'red', 'Chest pain', ['chest pain'])];
+    sandbox._receptionPathwaysData = receptionPathwaysData;
+    const rowIdF = 'e0000000-0000-4000-8000-000000000006';
+    const { wrap: wrapF } = setupRow({ rowId: rowIdF, dob: '01 Jan 2018 (8y)' });
+    sandbox.decorateOneRow(sandbox.document.querySelector(`[row-id="${rowIdF}"]`));
+    const ruleChipsF = wrapF.querySelectorAll('.ch-q-rule-chip');
+    check(
+      ruleChipsF.some((c) => c.textContent.includes('Chest pain')) &&
+        !ruleChipsF.some((c) => c.textContent.includes('Pharmacy First')),
+      `red-flag keyword chip suppresses Pharmacy First (got ${ruleChipsF.map((c) => c.textContent).join(' | ')})`
+    );
+    check(
+      sandbox.document.getElementById('ch-q-status-bar') === null,
+      'decorating the red-flag row does not paint the queue status bar'
+    );
+
+    freshCaches();
+    mockClipboard();
+    sandbox.matchRules = () => [mkRule('uti-query', 'amber', 'UTI query', ['waterworks'])];
+    sandbox._receptionPathwaysData = receptionPathwaysData;
+    const rowIdG = 'e0000000-0000-4000-8000-000000000007';
+    const { wrap: wrapG } = setupRow({ rowId: rowIdG, dob: '01 Jan 2018 (8y)' });
+    sandbox.decorateOneRow(sandbox.document.querySelector(`[row-id="${rowIdG}"]`));
+    const ruleChipsG = wrapG.querySelectorAll('.ch-q-rule-chip');
+    check(
+      ruleChipsG.some((c) => c.textContent.includes('Pharmacy First')),
+      `an amber keyword chip does not suppress Pharmacy First (got ${ruleChipsG.map((c) => c.textContent).join(' | ')})`
     );
 
     sandbox._receptionPathwaysData = null;

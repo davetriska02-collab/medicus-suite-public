@@ -632,8 +632,11 @@ updateNavOverflow();
   el.style.setProperty('pointer-events', 'auto');
   el.style.setProperty('cursor', 'pointer');
 });
-navIndicatorRight?.addEventListener('click', () => navTabsEl?.scrollBy({ left: 120, behavior: 'smooth' }));
-navIndicatorLeft?.addEventListener('click', () => navTabsEl?.scrollBy({ left: -120, behavior: 'smooth' }));
+function navScrollBehavior() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+}
+navIndicatorRight?.addEventListener('click', () => navTabsEl?.scrollBy({ left: 120, behavior: navScrollBehavior() }));
+navIndicatorLeft?.addEventListener('click', () => navTabsEl?.scrollBy({ left: -120, behavior: navScrollBehavior() }));
 
 // ── Slots nav badge ───────────────────────────────────────────────────────────
 document.addEventListener('suite:slots:count', (e) => {
