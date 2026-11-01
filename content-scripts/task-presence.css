@@ -24,9 +24,9 @@
   --accent: #2563eb;
   --accent-dim: rgba(37, 99, 235, 0.09);
   --accent-line: rgba(37, 99, 235, 0.3);
-  --amber: #b45309;
-  --amber-dim: rgba(180, 83, 9, 0.09);
-  --amber-line: rgba(180, 83, 9, 0.32);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
   --r-sm: 4px;
   --r-pill: 999px;
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -47,10 +47,10 @@
   margin-right: 5px;
   vertical-align: middle;
   overflow: hidden;
-  --ms-tp-wash: #fff44a;
-  --ms-tp-border: #c9b400;
-  --ms-tp-text: #1a1600;
-  --ms-tp-quiet: #3d3400;
+  --ms-tp-wash: var(--amber-dim);
+  --ms-tp-border: var(--amber-line);
+  --ms-tp-text: var(--amber);
+  --ms-tp-quiet: var(--amber);
 }
 /* Same-line as triage chips: PREPEND in DOM, CSS order after the name so
    presence does not sit in front of it on flat queues. */
@@ -79,10 +79,15 @@
   white-space: nowrap;
   padding: 0 6px;
   border-radius: var(--r-pill);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
-  line-height: 15px;
+  line-height: 16px;
   letter-spacing: 0.01em;
+  transition:
+    color var(--fast) var(--ease),
+    background-color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    opacity var(--med) var(--ease);
 }
 
 /* Presence — a colleague is IN the request right now. Amber: this is the
@@ -99,10 +104,10 @@
    the icon and the name hides when the container is tight. */
 .ms-tp-token-host,
 .ms-tp-token {
-  --ms-tp-wash: #fff44a;
-  --ms-tp-border: #c9b400;
-  --ms-tp-text: #1a1600;
-  --ms-tp-quiet: #3d3400;
+  --ms-tp-wash: var(--amber-dim);
+  --ms-tp-border: var(--amber-line);
+  --ms-tp-text: var(--amber);
+  --ms-tp-quiet: var(--amber);
 }
 
 #ms-tp-msg,
@@ -132,15 +137,16 @@
 }
 
 .ms-tp-token-icon {
-  width: 18px;
-  height: 18px;
-  font-size: 8px;
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
+  line-height: 1;
 }
 
 .ms-tp-token-who {
   min-width: 0;
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--ms-tp-text, var(--amber));
   white-space: nowrap;
   overflow: hidden;
@@ -157,33 +163,48 @@
    ellipsises; Open and the initials stay. Look vars inherit from the
    chip host (applyLookToEl), so a practice colour still lands here. */
 .ms-tp-chips .ms-tp-token {
-  --ms-tp-wash: inherit;
-  --ms-tp-border: inherit;
-  --ms-tp-text: inherit;
-  --ms-tp-quiet: inherit;
+  /* The shared token is an inline-size container, which sizes as if it had
+     no label. The row pill must keep "Open" and the name; the 62% cap on
+     .ms-tp-chips still ellipsises a long name. */
+  container-type: normal;
+  width: max-content;
+  max-width: 100%;
   gap: 4px;
-  padding: 1px 7px 1px 2px;
-  background: var(--ms-tp-wash, #fff44a);
-  border: 1px solid var(--ms-tp-border, #c9b400);
+  padding: 1px 8px 1px 2px;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber-line);
   border-radius: var(--r-pill);
-  color: var(--ms-tp-text, #1a1600);
-  font-weight: 800;
-  line-height: 16px;
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  transition:
+    color var(--fast) var(--ease),
+    background-color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    opacity var(--med) var(--ease);
+}
+
+.ms-tp-chips .ms-tp-token-icon {
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
+  line-height: 1;
 }
 
 .ms-tp-chips .ms-tp-token-who {
   flex: 1 1 auto;
   min-width: 0;
-  color: var(--ms-tp-text, #1a1600);
-  font-weight: 800;
+  color: var(--amber);
+  font-weight: 600;
   font-size: 12px;
 }
 
 .ms-tp-token-status {
   flex: 0 0 auto;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   line-height: 1;
 }
@@ -611,5 +632,16 @@
     50% {
       box-shadow: inset 0 0 0 2px var(--ms-tp-border);
     }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ms-tp-chip,
+  .ms-tp-token,
+  .ms-tp-chips .ms-tp-token,
+  .ms-tp-token-who,
+  .ms-tp-token-icon {
+    transition-duration: 0s;
+    animation-duration: 0s;
   }
 }
