@@ -227,7 +227,7 @@ assert(/does not save/.test(optionsHtml), 'help text says the button does not sa
 assert(/Save monitor settings/.test(optionsHtml), 'help text still points at Save');
 
 console.log('\n--- hazard log H-045 addendum ---');
-assert(manifest.version === '4.0.0', 'manifest is 4.0.0 (next release after 3.269.6)');
+assert(manifest.version === '4.0.3', 'manifest is 4.0.3');
 assert(/^## \[v4\.0\.0\]/m.test(changelog), 'changelog opens at 4.0.0');
 assert(/^\*\*Document version:\*\* 3\.110/m.test(hazard), 'hazard-log document version is 3.110');
 assert(/\*\*Product version:\*\* 4\.0\.0/.test(hazard), 'product pin is 4.0.0');

@@ -2,6 +2,14 @@
 
 All notable changes to Medicus Suite are documented here.
 
+## [v4.0.3] — 2026-11-01
+
+### Rota manager uses the side panel slate, in light and dark
+
+The full Rota manager leaves the dark glass screen. Page, cards, type and motion follow the side panel: light slate by default, the panel's dark slate when the suite theme is dark, and the system dark theme when no theme has been stored. A duty period with nobody rostered says Uncovered on the amber wash. The entrance is a 200ms fade, and it is instant when reduced motion is on.
+
+No rota rules or stored data changed.
+
 ## [v4.0.0] — 2026-10-16
 
 ### Clinical judgements, recommendations and calculations withdrawn

@@ -259,23 +259,23 @@ function openCellMenu(ctx, cell, person, date, period) {
     <div class="who">${esc(person.name)} — ${esc(fmtDay(date))} ${period.toUpperCase()}</div>
     ${SESSION_TYPES.map(
       (t) => `
-      <button data-type="${esc(t.id)}"><span class="chip" style="background:${esc(t.colour)}">${esc(t.short)}</span>${esc(t.name)}</button>
+      <button data-type="${esc(t.id)}"><span class="chip" style="--chip:${esc(t.colour)}">${esc(t.short)}</span>${esc(t.name)}</button>
     `
     ).join('')}
     ${
       entry && rooms.length
         ? `
       <div class="who">Room</div>
-      ${rooms.map((r) => `<button data-room="${esc(r.id)}"><span class="chip" style="background:${entry.roomId === r.id ? '#0d9488' : '#64748b'}">RM</span>${esc(r.name)}${entry.roomId === r.id ? ' ✓' : ''}</button>`).join('')}
-      ${entry.roomId ? '<button data-room=""><span class="chip" style="background:#94a3b8">×</span>No room</button>' : ''}
+      ${rooms.map((r) => `<button data-room="${esc(r.id)}"><span class="chip">RM</span>${esc(r.name)}${entry.roomId === r.id ? ' ✓' : ''}</button>`).join('')}
+      ${entry.roomId ? '<button data-room=""><span class="chip">×</span>No room</button>' : ''}
     `
         : ''
     }
-    ${entry ? '<button data-act="note"><span class="chip" style="background:#64748b">…</span>Edit note</button>' : ''}
-    <button data-act="copy"><span class="chip" style="background:#64748b">⧉</span>Copy${(state.ui.selected || []).length > 1 ? ` ${(state.ui.selected || []).length} cells` : ''}</button>
-    ${clipboard ? `<button data-act="paste"><span class="chip" style="background:#0ea5e9">⤓</span>Paste ${esc(`${clipboard.rows}×${clipboard.cols}`)} here</button>` : ''}
-    ${entry && entry.status === 'vacancy' ? '<button data-act="covered"><span class="chip covered" style="background:#059669">LOC</span>Mark covered (locum)</button>' : ''}
-    ${entry ? '<button data-act="clear"><span class="chip" style="background:#94a3b8">×</span>Clear session</button>' : ''}
+    ${entry ? '<button data-act="note"><span class="chip">…</span>Edit note</button>' : ''}
+    <button data-act="copy"><span class="chip">⧉</span>Copy${(state.ui.selected || []).length > 1 ? ` ${(state.ui.selected || []).length} cells` : ''}</button>
+    ${clipboard ? `<button data-act="paste"><span class="chip">⤓</span>Paste ${esc(`${clipboard.rows}×${clipboard.cols}`)} here</button>` : ''}
+    ${entry && entry.status === 'vacancy' ? '<button data-act="covered"><span class="chip covered">LOC</span>Mark covered (locum)</button>' : ''}
+    ${entry ? '<button data-act="clear"><span class="chip">×</span>Clear session</button>' : ''}
   `;
   document.body.appendChild(menu);
   positionMenu(menu, cell);
@@ -349,10 +349,10 @@ function openRoomMenu(ctx, anchorEl, entry) {
     ${rooms
       .map(
         (r) =>
-          `<button data-room="${esc(r.id)}"><span class="chip" style="background:${entry.roomId === r.id ? '#0d9488' : '#64748b'}">RM</span>${esc(r.name)}${entry.roomId === r.id ? ' ✓' : ''}</button>`
+          `<button data-room="${esc(r.id)}"><span class="chip">RM</span>${esc(r.name)}${entry.roomId === r.id ? ' ✓' : ''}</button>`
       )
       .join('')}
-    ${entry.roomId ? '<button data-room=""><span class="chip" style="background:#94a3b8">×</span>No room</button>' : ''}
+    ${entry.roomId ? '<button data-room=""><span class="chip">×</span>No room</button>' : ''}
   `;
   document.body.appendChild(menu);
   positionMenu(menu, anchorEl);
@@ -1422,7 +1422,7 @@ function roomGrid(state, rooms, showDates, today, readOnly) {
                       const tip = readOnly
                         ? `${person.name} — ${t.name}`
                         : `${person.name} — ${t.name} — click to reassign, drag to another room`;
-                      return `<span class="chip roomchip"${readOnly ? '' : ' draggable="true"'} data-entry="${esc(e.id)}" style="background:${esc(t.colour)}" title="${esc(tip)}">${esc(shortName(person.name))}</span>`;
+                      return `<span class="chip roomchip"${readOnly ? '' : ' draggable="true"'} data-entry="${esc(e.id)}" style="--chip:${esc(t.colour)}" title="${esc(tip)}">${esc(shortName(person.name))}</span>`;
                     })
                     .join(' ');
                   const clash = room.id && here.length > 1;

@@ -95,7 +95,7 @@ export default {
               const t = typeById(e.typeId);
               const room = (state.rooms || []).find((r) => r.id === e.roomId);
               return `<tr><td>${esc(fmtDay(e.date))} ${e.period.toUpperCase()}</td>
-              <td><span class="chip" style="background:${esc(t ? t.colour : '#64748b')}">${esc(t ? t.short : '?')}</span> ${esc(t ? t.name : e.typeId)}${e.status === 'covered' ? ' <span class="pill approved">covered</span>' : ''}</td>
+              <td><span class="chip"${t ? ` style="--chip:${esc(t.colour)}"` : ''}>${esc(t ? t.short : '?')}</span> ${esc(t ? t.name : e.typeId)}${e.status === 'covered' ? ' <span class="pill approved">covered</span>' : ''}</td>
               <td>${esc(room ? room.name : '—')}</td><td class="sub">${esc(e.note || '')}</td></tr>`;
             })
             .join('')}</tbody>
