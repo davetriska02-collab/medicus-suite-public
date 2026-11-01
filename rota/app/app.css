@@ -1,7 +1,8 @@
 /* © 2026 Graysbrook Ltd. Proprietary — all rights reserved. See LICENSE. */
 /* Rota manager — side-panel slate, light and dark. Tokens live in
-   shared/slate-tokens.css (the panel canon). This file only overrides the
-   light status inks that fail WCAG AA as text, and the control border. */
+   shared/slate-tokens.css (the panel canon). This file sets the light
+   status inks to the panel AA values, with a slightly stronger wash,
+   and the control border. */
 
 @import url('../../shared/slate-tokens.css');
 
@@ -11,8 +12,9 @@
 
 :root {
   color-scheme: light;
-  /* Panel light green #16a34a is 3.30:1 on white. Text uses the passing inks.
-     Dark keeps the panel inks from the imported dark block (they already pass). */
+  /* Light status ink matches the panel (#166534 / #9a3412 / #b91c1c).
+     These washes are a step stronger than the panel wash. Dark keeps the
+     imported dark block. */
   --green: #166534;
   --green-dim: rgba(22, 101, 52, 0.1);
   --green-line: rgba(22, 101, 52, 0.32);
