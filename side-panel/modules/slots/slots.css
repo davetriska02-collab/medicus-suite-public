@@ -5,11 +5,17 @@
   font-family: var(--sans);
 }
 
+/* Shared ghost buttons are 9px. Inside Slots the label floor is 12px. */
+.slots-module .ghost-btn {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
 /* Date zone: presets + date input + refresh all on one row (Decision C) */
 .date-presets {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   margin-bottom: 12px;
 }
 
@@ -44,12 +50,12 @@
   border: 1px solid var(--border);
   color: var(--text-4);
   font-family: var(--sans);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0;
   text-transform: none;
   cursor: pointer;
   border-radius: var(--r-md);
-  padding: 4px 10px;
+  padding: 4px 8px;
   transition:
     border-color var(--fast) var(--ease),
     background var(--fast) var(--ease),
@@ -76,18 +82,18 @@
 
 .section-label {
   font-family: var(--sans);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
   color: var(--text-2);
-  margin-bottom: 6px;
+  margin-bottom: 8px;
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border);
 }
 
 .section-hint {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-3);
   margin-top: 4px;
 }
@@ -149,7 +155,7 @@
 }
 
 .slot-type {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-2);
   white-space: nowrap;
   overflow: hidden;
@@ -182,7 +188,7 @@
 /* Chevron via CSS ::after — toggled by open state */
 .slot-types-summary::after {
   content: '▸';
-  font-size: 9px;
+  font-size: 12px;
   color: var(--text-5);
   transition: transform var(--fast) var(--ease);
 }
@@ -209,15 +215,15 @@ details[open] > .slot-types-summary::after {
 .staff-toggle {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   width: 100%;
-  padding: 5px 8px;
+  padding: 8px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   cursor: pointer;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: 12px;
   text-align: left;
   position: relative;
   overflow: hidden;
@@ -280,7 +286,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .staff-chevron {
-  font-size: 9px;
+  font-size: 12px;
   color: var(--text-5);
   flex-shrink: 0;
 }
@@ -330,9 +336,9 @@ html[data-theme='dark'] .staff-split .split-pm {
 .staff-type-row {
   display: flex;
   justify-content: space-between;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-4);
-  padding: 2px 0;
+  padding: 4px 0;
 }
 
 .staff-type-row span:last-child {
@@ -389,20 +395,20 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 .slots-empty-label {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-4);
 }
 .slots-empty-sub {
   font-family: var(--sans);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-4);
 }
 
 .foot {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   color: var(--text-4);
   letter-spacing: 0.06em;
   text-align: right;
@@ -413,19 +419,19 @@ html[data-theme='dark'] .staff-split .split-pm {
 .excluded-toggle {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   width: 100%;
-  padding: 5px 8px;
-  font-size: 10px;
-  font-family: var(--mono);
+  padding: 8px;
   letter-spacing: 0.06em;
   color: var(--text-4);
   cursor: pointer;
   border-radius: var(--r-md);
-  margin-top: 2px;
+  margin-top: 4px;
   background: transparent;
   border: none;
   font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
   text-align: left;
   transition:
     color var(--fast) var(--ease),
@@ -473,17 +479,17 @@ html[data-theme='dark'] .staff-split .split-pm {
 .slots-hero-main {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 8px;
 }
 .slots-hero-right {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
 }
 
 .slots-count-hero {
-  font-size: 40px;
+  font-size: 32px;
   font-weight: 700;
   color: var(--text-1);
   line-height: 1;
@@ -493,22 +499,22 @@ html[data-theme='dark'] .staff-split .split-pm {
   flex-shrink: 0;
 }
 
-/* slots-count-label: mono, uppercase, letterspaced, machine-voice label (Decision H) */
+/* Free caption. Light ink is --green-ink (#166534). Dark keeps --green. */
 .slots-count-label {
   font-family: var(--sans);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: none;
   letter-spacing: 0;
-  color: var(--green);
+  color: var(--green-ink);
 }
 .slots-count-label.zero {
   color: var(--text-4);
 }
 .slots-taken-line {
-  margin-top: 2px;
+  margin-top: 0;
   font-family: var(--sans);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--text-2);
 }
@@ -516,9 +522,9 @@ html[data-theme='dark'] .staff-split .split-pm {
    capacity to partners needs to know it is the whole practice and "as at when".
    (Practice appraisal, Slots re-run 2026-06-21.) */
 .slots-hero-asat {
-  margin-top: 3px;
+  margin-top: 0;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.04em;
   color: var(--text-3);
 }
@@ -534,16 +540,16 @@ html[data-theme='dark'] .staff-split .split-pm {
 .slots-pill-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
   border-top: 1px solid var(--border);
 }
 .slot-pill {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 9px 3px 7px;
+  gap: 8px;
+  padding: 4px 8px;
   background: var(--bg-mid);
   border: 1px solid var(--border);
   border-radius: var(--r-pill);
@@ -557,7 +563,7 @@ html[data-theme='dark'] .staff-split .split-pm {
   flex-shrink: 0;
 }
 .slot-pill-name {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-2);
   white-space: nowrap;
   overflow: hidden;
@@ -642,13 +648,13 @@ html[data-theme='dark'] .staff-split .split-pm {
   justify-content: center;
   min-width: 24px;
   height: 24px;
-  padding: 0 7px;
+  padding: 0 8px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--r-pill);
   color: var(--text-4);
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   cursor: pointer;
   transition:
     color var(--fast) var(--ease),
@@ -668,7 +674,7 @@ html[data-theme='dark'] .staff-split .split-pm {
   color: var(--text-3);
   text-transform: none;
   letter-spacing: 0;
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 600;
 }
 .pill-organise-btn:active {
@@ -699,7 +705,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 .pill-palette-label {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-4);
@@ -740,9 +746,9 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .pill-organise-hint {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-3);
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
 /* AM/PM split below the hero number */
@@ -756,7 +762,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 .ampm-chip {
   display: inline-flex;
   align-items: baseline;
-  gap: 6px;
+  gap: 8px;
   padding: 4px 8px;
   border-radius: var(--r-pill);
   background: var(--bg-elev);
@@ -764,7 +770,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 .ampm-tag {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--text-4);
@@ -809,10 +815,10 @@ html[data-theme='dark'] .staff-split .split-pm {
 
 /* ampm-tag-inline (Decision H) */
 .ampm-tag-inline {
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   color: var(--text-4);
-  margin-left: 1px;
+  margin-left: 4px;
 }
 .slot-count-sep {
   color: var(--text-5);
@@ -924,7 +930,7 @@ html[data-theme='dark'] .staff-split .split-pm {
   border: none;
   padding: 0;
   font-family: var(--sans);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0;
   text-transform: none;
   color: inherit;
@@ -979,8 +985,8 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .slots-alert-editor-close {
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .slots-alert-editor-note {
@@ -992,7 +998,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 
 .slots-alert-editor-empty {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-4);
   padding: 8px 0;
 }
@@ -1030,7 +1036,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 .slots-alert-rule-row .sar-lte,
 .slots-alert-rule-row .sar-unit {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-4);
   white-space: nowrap;
 }
@@ -1053,8 +1059,8 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .slots-alert-rule-row .sar-delete {
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 4px 8px;
+  font-size: 12px;
   flex-shrink: 0;
 }
 
@@ -1104,7 +1110,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .bk-toggle-chevron {
-  font-size: 9px;
+  font-size: 12px;
   color: var(--text-5);
   flex-shrink: 0;
 }
@@ -1115,13 +1121,13 @@ html[data-theme='dark'] .staff-split .split-pm {
 
 .bk-pt-badge {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   color: var(--text-4);
   background: var(--bg-mid);
   border: 1px solid var(--border);
   border-radius: var(--r-pill);
-  padding: 1px 6px;
+  padding: 4px 8px;
   flex-shrink: 0;
 }
 
@@ -1143,7 +1149,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 
 .bk-label {
   font-family: var(--sans);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-3);
   min-width: 36px;
@@ -1241,7 +1247,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 .bk-loading,
 .bk-no-slots {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   color: var(--text-4);
   padding: 8px 0;
@@ -1319,7 +1325,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .bk-slot-site {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
@@ -1327,7 +1333,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .bk-slot-type {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-4);
   white-space: nowrap;
   overflow: hidden;
@@ -1336,7 +1342,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 
 .bk-slot-dur {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 12px;
   color: var(--text-4);
   flex-shrink: 0;
 }
@@ -1361,7 +1367,7 @@ html[data-theme='dark'] .staff-split .split-pm {
 }
 
 .bk-confirm-label {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-4);
   min-width: 32px;
   flex-shrink: 0;

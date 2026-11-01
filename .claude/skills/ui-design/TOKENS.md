@@ -38,6 +38,9 @@ wash as text = bug.
 | `--accent` / `--accent-dim` / `--accent-line` | `#2563eb` / `rgba(37,99,235,.09)` / `rgba(37,99,235,.30)`   | `#5b8fc7` / `rgba(91,143,199,.14)` / `rgba(91,143,199,.35)`   |
 | `--accent-hover`                              | `#1d4ed8`                                                   | `#7eaad6`                                                     |
 | `--green` / `--green-dim` / `--green-line`    | `#166534` / `rgba(22,101,52,.09)` / `rgba(22,101,52,.30)`   | `#4ade80` / `rgba(74,222,128,.12)` / `rgba(74,222,128,.32)`   |
+| `--green-ink`                                 | `#166534`                                                    | `var(--green)` (`#4ade80`)                                    |
+
+`--green-ink` is the Slots free-caption text. Light `--green` is the same `#166534`. The caption uses `--green-ink`, not the wash. Colour-blind mode sets `--green-ink` to `var(--accent)` (`#2563eb` on white, 5.17:1; `#5b8fc7` on the dark card, 4.91:1). Do not paint `#2563eb` on the dark card.
 | `--amber` / `--amber-dim` / `--amber-line`    | `#9a3412` / `rgba(154,52,18,.09)` / `rgba(154,52,18,.32)`   | `#fbbf24` / `rgba(251,191,36,.16)` / `rgba(251,191,36,.32)`   |
 | `--red` / `--red-dim` / `--red-line`          | `#b91c1c` / `rgba(185,28,28,.08)` / `rgba(185,28,28,.30)`   | `#f87171` / `rgba(248,113,113,.17)` / `rgba(248,113,113,.34)` |
 | `--violet` / `--violet-dim` / `--violet-line` | `#7c3aed` / `rgba(124,58,237,.09)` / `rgba(124,58,237,.30)` | `#a78bfa` / `rgba(167,139,250,.14)` / `rgba(167,139,250,.35)` |

@@ -47,6 +47,8 @@
   --green: #166534;
   --green-dim: rgba(22, 101, 52, 0.09);
   --green-line: rgba(22, 101, 52, 0.3);
+  /* Slots free caption. Same light ink as --green (#166534). */
+  --green-ink: #166534;
   --amber: #9a3412;
   --amber-dim: rgba(154, 52, 18, 0.09);
   --amber-line: rgba(154, 52, 18, 0.32);
@@ -122,6 +124,8 @@ html[data-theme='dark'] {
   --green: #4ade80;
   --green-dim: rgba(74, 222, 128, 0.12);
   --green-line: rgba(74, 222, 128, 0.32);
+  /* Dark --green already passes on the card (9.54:1). Keep it for the free caption. */
+  --green-ink: var(--green);
   --amber: #fbbf24;
   --amber-dim: rgba(251, 191, 36, 0.16);
   --amber-line: rgba(251, 191, 36, 0.32);
@@ -181,6 +185,9 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+  .nav-tabs {
+    scroll-behavior: auto;
+  }
 }
 
 /* ── Shell layout ─────────────────────────────────────────────────────────── */
@@ -206,35 +213,8 @@ body {
   position: relative;
 }
 
-/* Fade gradients on edges when nav tabs overflow */
-.suite-nav::after,
-.suite-nav::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 28px;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity var(--med) var(--ease);
-  z-index: 1;
-}
-.suite-nav::after {
-  right: 38px;
-  background: linear-gradient(to right, transparent, var(--bg-mid));
-}
-.suite-nav::before {
-  left: 110px;
-  background: linear-gradient(to left, transparent, var(--bg-mid));
-}
-.suite-nav.has-overflow-right::after {
-  opacity: 1;
-}
-.suite-nav.has-overflow-left::before {
-  opacity: 1;
-}
-
-/* Scroll arrows */
+/* Scroll arrows. A thin scrollbar on .nav-tabs is the other overflow cue.
+   Edge fades used to cover the last letters of a tab, so they are gone. */
 .nav-scroll-indicator {
   position: absolute;
   top: 50%;
@@ -377,37 +357,37 @@ body {
 .nav-tabs {
   display: flex;
   align-items: center;
-  gap: 2px;
+  align-self: stretch;
+  gap: 4px;
   flex: 1;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-4) transparent;
   scroll-behavior: smooth;
-  /* The overflow fade hints "more tabs that way" but must never eat a tab label:
-     an 8% fade clipped the active tab to "TODA". Keep it to a narrow 3% so the
-     hint stays without truncating the busiest control. (Practice/Vogue 10-review,
-     2026-06-21.) */
-  -webkit-mask-image: linear-gradient(to right, black 97%, transparent 100%);
-  mask-image: linear-gradient(to right, black 97%, transparent 100%);
 }
 .nav-tabs::-webkit-scrollbar {
-  display: none;
+  height: 8px;
 }
-.suite-nav:not(.has-overflow) .nav-tabs {
-  -webkit-mask-image: none;
-  mask-image: none;
+.nav-tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+.nav-tabs::-webkit-scrollbar-thumb {
+  background: var(--text-4);
+  border-radius: 4px;
 }
 
 .nav-tab {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
+  gap: 4px;
+  padding: 4px 8px;
   background: transparent;
   border: 1px solid transparent; /* reserved so .active never shifts layout */
   color: var(--text-3);
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1785,6 +1765,9 @@ html[data-colorblind='true'] {
   --green: #2563eb;
   --green-dim: rgba(37, 99, 235, 0.09);
   --green-line: rgba(37, 99, 235, 0.3);
+  /* Blue, not green. Light --accent is #2563eb (5.17:1 on white). Dark --accent
+     is #5b8fc7 (4.91:1 on the card); #2563eb on the dark card is 3.22:1. */
+  --green-ink: var(--accent);
 }
 
 /* Colorblind badge overrides (hard-coded rgba fills need explicit override) */

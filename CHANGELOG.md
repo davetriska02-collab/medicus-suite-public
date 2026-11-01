@@ -2,6 +2,19 @@
 
 All notable changes to Medicus Suite are documented here.
 
+## [v4.0.2] — 2026-11-01
+
+### Slots counts and the side-panel tab strip are easier to read
+
+The free-slot caption was 11px in `#16a34a` (3.30:1 on white). The hero count was 40px. Nav tabs were 10px, and the strip hid its scrollbar, so later tabs were cut off.
+
+- The Slots hero count is 32px / 700, tabular figures, light ink `#0f172a` (`--text-1`).
+- The free caption is 12px / 600. Light ink is `#166534` (`--green-ink`, 7.13:1 on white). Dark theme keeps `#4ade80`. Colour-blind mode uses the accent blue, which passes on both themes.
+- Other Slots labels that were 9–11px are at least 12px. The gap between the hero number and the caption is 8px.
+- Side-panel nav tabs are 12px mono uppercase. The strip shows a thin scrollbar. Reduced motion scrolls without smoothing.
+
+No change to which tabs a preset shows. No clinical logic change. Rota manager is unchanged.
+
 ## [v4.0.1] — 2026-11-01
 
 ### Request row ink, Pharmacy First next to a red flag, and the stuck count bar
