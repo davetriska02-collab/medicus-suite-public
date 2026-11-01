@@ -5952,44 +5952,10 @@
   // interactive controls. Appended to document.body (not the AG-Grid
   // container), so it never triggers the queue MutationObserver itself.
   const ensureQueueStatusBarEl = () => {
-    let el = document.getElementById(QUEUE_STATUS_BAR_ID);
-    if (el) return el;
-    el = document.createElement('div');
-    el.id = QUEUE_STATUS_BAR_ID;
-    el.className = 'ch-q-status';
-    el.setAttribute('role', 'status');
-    // aria-live deliberately 'off', not 'polite': counts can change multiple
-    // times a second while the fetch pass runs — a polite live region would
-    // spam a screen reader far faster than the numbers are meaningful.
-    el.setAttribute('aria-live', 'off');
-    el.setAttribute('aria-label', 'Triage Lens queue triage status');
-    el.title = QUEUE_STATUS_TOOLTIP;
-
-    const counts = document.createElement('span');
-    counts.className = 'ch-q-status-counts';
-    el.appendChild(counts);
-
-    const spinner = document.createElement('span');
-    spinner.className = 'ch-q-status-spinner';
-    spinner.setAttribute('aria-hidden', 'true');
-    el.appendChild(spinner);
-
-    const jumpBtn = document.createElement('button');
-    jumpBtn.type = 'button';
-    jumpBtn.className = 'ch-q-status-btn ch-q-status-jump';
-    jumpBtn.addEventListener('click', onQueueStatusJumpClick);
-    el.appendChild(jumpBtn);
-
-    const focusBtn = document.createElement('button');
-    focusBtn.type = 'button';
-    focusBtn.className = 'ch-q-status-btn ch-q-status-focus';
-    focusBtn.setAttribute('aria-pressed', 'false');
-    focusBtn.textContent = 'Focus alerts';
-    focusBtn.addEventListener('click', onQueueStatusFocusClick);
-    el.appendChild(focusBtn);
-
-    document.body.appendChild(el);
-    return el;
+    // The bar is not painted. v4.0.0 never writes a severity onto the cache,
+    // so the old element stayed on "0 red · 0 amber · checking N…".
+    removeQueueStatusBar();
+    return null;
   };
 
   const removeQueueStatusBar = () => {
@@ -6015,55 +5981,8 @@
       removeQueueStatusBar();
       return;
     }
-    const el = ensureQueueStatusBarEl();
-    const now = Date.now();
-    const visible = new Set();
-    queueScope()
-      .querySelectorAll('.ag-row[row-index]:not(.ag-full-width-row)')
-      .forEach((row) => {
-        const ri = row.getAttribute('row-index');
-        if (ri != null) visible.add(Number(ri));
-      });
-    const counts = computeQueueTriageCounts(_durableRowMap, _queueResultCache, visible, now);
-
-    const parts = [counts.red + ' red', counts.amber + ' amber'];
-    if (counts.clear > 0) parts.push(counts.clear + ' clear');
-    if (counts.error > 0) parts.push(counts.error + ' ?');
-    let text = parts.join(' · ');
-    if (counts.checking > 0) text += (text ? ' · ' : '') + 'checking ' + counts.checking + '…';
-
-    const countsEl = el.querySelector('.ch-q-status-counts');
-    if (countsEl) countsEl.textContent = text;
-    el.classList.toggle('ch-q-status--checking', counts.checking > 0);
-
-    // "Material" change = the aggregate red/amber picture actually moved (a new
-    // alert appeared/resolved) — NOT virtualisation-driven scroll churn, which
-    // constantly changes which row-indexes are on-screen without changing what's
-    // wrong with the queue. Only the former should discard the jump cycle.
-    if (counts.red !== _queueStatusLastRed || counts.amber !== _queueStatusLastAmber) {
-      _queueStatusJumpPos = null;
-      _queueStatusLastRed = counts.red;
-      _queueStatusLastAmber = counts.amber;
-    }
-
-    const { red: redIdx, amber: amberIdx } = getQueueTintedRowIndexes();
-    const jumpBtn = el.querySelector('.ch-q-status-jump');
-    if (jumpBtn) {
-      const hasRed = redIdx.length > 0;
-      const hasAmber = amberIdx.length > 0;
-      jumpBtn.disabled = !hasRed && !hasAmber;
-      jumpBtn.textContent = hasRed ? '▶ red' : hasAmber ? '▶ amber' : '▶ red';
-    }
-
-    // Sync the focus button's visual/ARIA state from the session-local toggle on
-    // every render — covers the bar being torn down and recreated (leave/re-enter
-    // the queue) while `_queueFocusAlertsOn` stayed true, which the click handler
-    // alone would never re-apply to a brand-new button element.
-    const focusBtn = el.querySelector('.ch-q-status-focus');
-    if (focusBtn) {
-      focusBtn.setAttribute('aria-pressed', String(_queueFocusAlertsOn));
-      if (focusBtn.classList) focusBtn.classList.toggle('ch-q-status-btn-active', _queueFocusAlertsOn);
-    }
+    // Severity is not computed in this version. Never paint the counts bar.
+    removeQueueStatusBar();
   };
 
   // rAF-coalesced wrapper: refreshQueueChips fires on every grid mutation and the
@@ -6826,7 +6745,10 @@
         const closingQuestions = _receptionPathwaysData.closingQuestions;
         const hasEscalation = gapsData.flaggedInText.length > 0;
         const hasAskBack = gapsData.gaps.length > 0 || hasEscalation;
-        if (pfElig.eligible === true) {
+        // A red-flag keyword chip already on this row must not sit next to a
+        // green Pharmacy First chip. The green chip reads as "go" (H-026).
+        const hasRedKeywordChip = ruleMatches.some((r) => r && r.kind === 'red');
+        if (pfElig.eligible === true && !hasRedKeywordChip) {
           const pfIdx = ruleMatchActivators.push(
             (el) => showPathwayMenu(el, topPathway, previewText, pfElig, gapsData, closingQuestions)
           ) - 1;

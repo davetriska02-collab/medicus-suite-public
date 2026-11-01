@@ -44,17 +44,17 @@
   --accent-dim: rgba(37, 99, 235, 0.09);
   --accent-line: rgba(37, 99, 235, 0.3);
   /* Status triads: ink / wash / line */
-  --green: #16a34a;
-  --green-dim: rgba(22, 163, 74, 0.09);
-  --green-line: rgba(22, 163, 74, 0.3);
-  /* Slots free caption. Light --green is 3.30:1 on white, so text uses a darker ink. */
+  --green: #166534;
+  --green-dim: rgba(22, 101, 52, 0.09);
+  --green-line: rgba(22, 101, 52, 0.3);
+  /* Slots free caption. Same light ink as --green (#166534). */
   --green-ink: #166534;
-  --amber: #b45309;
-  --amber-dim: rgba(180, 83, 9, 0.09);
-  --amber-line: rgba(180, 83, 9, 0.32);
-  --red: #dc2626;
-  --red-dim: rgba(220, 38, 38, 0.08);
-  --red-line: rgba(220, 38, 38, 0.3);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
+  --red: #b91c1c;
+  --red-dim: rgba(185, 28, 28, 0.08);
+  --red-line: rgba(185, 28, 28, 0.3);
   /* Violet triad — custom/user-defined rule accent. NOT a clinical status;
      deliberately outside the RAG set and untouched by colorblind mode. */
   --violet: #7c3aed;
@@ -1755,12 +1755,13 @@ html[data-size='large'] {
   zoom: 1.25;
 }
 
-/* Colorblind-friendly palette: swap red→orange, green→blue (whole triads,
-   so components built from ink/wash/line inherit the swap for free) */
+/* Colorblind-friendly palette: red ink is #9a3412 (passes AA; the old
+   orange #ea580c did not), green→blue. Whole triads, so components built
+   from ink/wash/line inherit the swap. */
 html[data-colorblind='true'] {
-  --red: #ea580c;
-  --red-dim: rgba(234, 88, 12, 0.08);
-  --red-line: rgba(234, 88, 12, 0.3);
+  --red: #9a3412;
+  --red-dim: rgba(154, 52, 18, 0.08);
+  --red-line: rgba(154, 52, 18, 0.3);
   --green: #2563eb;
   --green-dim: rgba(37, 99, 235, 0.09);
   --green-line: rgba(37, 99, 235, 0.3);
@@ -1771,17 +1772,17 @@ html[data-colorblind='true'] {
 
 /* Colorblind badge overrides (hard-coded rgba fills need explicit override) */
 html[data-colorblind='true'] .sent-chip-red {
-  border-left-color: #ea580c;
-  background: rgba(234, 88, 12, 0.06);
+  border-left-color: #9a3412;
+  background: rgba(154, 52, 18, 0.06);
 }
 html[data-colorblind='true'] .sent-chip-green {
   border-left-color: #2563eb;
   background: rgba(37, 99, 235, 0.06);
 }
 html[data-colorblind='true'] .sent-badge-red {
-  background: rgba(234, 88, 12, 0.18);
-  color: #ea580c;
-  border-color: rgba(234, 88, 12, 0.3);
+  background: rgba(154, 52, 18, 0.18);
+  color: #9a3412;
+  border-color: rgba(154, 52, 18, 0.3);
 }
 html[data-colorblind='true'] .sent-badge-green {
   background: rgba(37, 99, 235, 0.12);
@@ -1789,13 +1790,13 @@ html[data-colorblind='true'] .sent-badge-green {
   border-color: rgba(37, 99, 235, 0.25);
 }
 html[data-colorblind='true'] .sent-test-red {
-  color: #ea580c !important;
+  color: #9a3412 !important;
 }
 html[data-colorblind='true'] .sent-test-green {
   color: #2563eb !important;
 }
 html[data-colorblind='true'] .ampm-am .ampm-num {
-  color: #ea580c;
+  color: #9a3412;
 }
 html[data-colorblind='true'] .ampm-pm .ampm-num {
   color: #2563eb;

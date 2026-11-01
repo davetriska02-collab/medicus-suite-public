@@ -229,8 +229,8 @@ assert(/Save monitor settings/.test(optionsHtml), 'help text still points at Sav
 console.log('\n--- hazard log H-045 addendum ---');
 assert(manifest.version === '4.0.2', 'manifest is 4.0.2');
 assert(/^## \[v4\.0\.0\]/m.test(changelog), 'changelog opens at 4.0.0');
-assert(/^\*\*Document version:\*\* 3\.110/m.test(hazard), 'hazard-log document version is 3.110');
-assert(/\*\*Product version:\*\* 4\.0\.0/.test(hazard), 'product pin is 4.0.0');
+assert(/^\*\*Document version:\*\* 3\.111/m.test(hazard), 'hazard-log document version is 3.111');
+assert(/\*\*Product version:\*\* 4\.0\.1/.test(hazard), 'product pin is 4.0.1');
 const h045 = hazard.split('### H-045 —')[1].split('### H-046 —')[0];
 assert(!/UNSIGNED/.test(h045), 'H-045 addendum is signed');
 assert(/Dr D\. Triska, CSO, GMC 6159481, 6 Oct 2026/.test(h045), 'H-045 addendum is signed by Dr D. Triska');

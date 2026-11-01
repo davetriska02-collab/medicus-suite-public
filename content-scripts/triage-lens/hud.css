@@ -59,15 +59,15 @@
   --accent-dim: rgba(37, 99, 235, 0.09);
   --accent-line: rgba(37, 99, 235, 0.3);
   /* Status triads: ink / wash / line */
-  --green: #16a34a;
-  --green-dim: rgba(22, 163, 74, 0.09);
-  --green-line: rgba(22, 163, 74, 0.3);
-  --amber: #b45309;
-  --amber-dim: rgba(180, 83, 9, 0.09);
-  --amber-line: rgba(180, 83, 9, 0.32);
-  --red: #dc2626;
-  --red-dim: rgba(220, 38, 38, 0.08);
-  --red-line: rgba(220, 38, 38, 0.3);
+  --green: #166534;
+  --green-dim: rgba(22, 101, 52, 0.09);
+  --green-line: rgba(22, 101, 52, 0.3);
+  --amber: #9a3412;
+  --amber-dim: rgba(154, 52, 18, 0.09);
+  --amber-line: rgba(154, 52, 18, 0.32);
+  --red: #b91c1c;
+  --red-dim: rgba(185, 28, 28, 0.08);
+  --red-line: rgba(185, 28, 28, 0.3);
   /* Shape */
   --r-sm: 4px;
   --r-md: 6px;
@@ -97,12 +97,17 @@
   display: inline-block;
   padding: 2px 7px;
   border-radius: var(--r-sm);
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 600;
   line-height: 1.4;
   border: 1px solid transparent;
   font-family: var(--sans);
   white-space: nowrap;
+  transition:
+    color var(--fast) var(--ease),
+    background-color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    opacity var(--med) var(--ease);
 }
 /* Status chip triads — aligned to canon (heals mismatch vs sidebar chips) */
 .ch-chip-red {
@@ -215,8 +220,16 @@
 }
 .ch-queue-chips .ch-chip {
   padding: 1px 6px;
-  font-size: 10px;
+  font-size: 12px;
+  font-weight: 600;
   border-radius: var(--r-pill);
+}
+/* Red-flag keyword chips keep a triangle and the word, so red is never the only signal. */
+.ch-queue-chips .ch-chip-red::before,
+.ch-q-result .ch-chip-red:not(.ch-chip-meta)::before {
+  content: '▲ ';
+  font-size: 12px;
+  font-weight: 600;
 }
 /* Ranked/collapsed rule-match chips (item 2.5, TRIAGE-LENS-2026-07-02.md) —
    top rule + "+N" overflow only, replacing "one chip per matched rule".
@@ -1654,4 +1667,16 @@
   font-size: 11px;
   color: var(--text-3);
   padding: 4px 0 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ch-chip,
+  .ch-queue-chips,
+  .ch-q-status,
+  .ch-q-status-spinner,
+  .ch-q-status-flash {
+    transition-duration: 0s;
+    animation-duration: 0s;
+    animation-iteration-count: 1;
+  }
 }
